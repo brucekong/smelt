@@ -467,11 +467,183 @@ pub(crate) enum SectionKind {
     Archive,
 }
 
-/// 拖侧栏分段之间的分隔条：在两个展开段之间调节相对权重分配。
+/// 板块布局特征，用于统一判断板块高度和弹性主项。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SectionLayoutSpec {
+    pub id: String,
+    pub kind: SectionKind,
+    pub is_compact_empty: bool,
+    pub natural_h: f32,
+    pub max_cap: f32,
+}
+
+/// 判定展开板块中哪些作为弹性主项（flex_master）。
+///
+/// 规则：
+/// - 优先本机（RuntimeKey::Local）作为唯一弹性主体，吸收视口剩余空间并将远程机与归档平滑推到底部贴底；
+///   即使用户曾调整过高度，本机依然负责吸收上方全部剩余视口，确保下方板块永不浮空；
+/// - 若本机未展开或为空，则未手动定高且内容超出容量上限（natural_h > max_cap）的首个远程机器可作为弹性主体；
+/// - 子集内容较少（natural_h <= max_cap，如只有 1~2 个项目）的机器板块绝不作为 flex_master，
+///   与对话、归档一样基于真实内容自适应高度，少内容绝不多占，展开时保持平滑过渡。
+pub(crate) fn select_flex_master_indices(
+    active_indices: &[usize],
+    specs: &[SectionLayoutSpec],
+    has_custom_h: impl Fn(&str) -> bool,
+) -> Vec<usize> {
+    let local_master = active_indices.iter().copied().find(|&i| {
+        !specs[i].is_compact_empty
+            && specs[i].kind == SectionKind::Runtime(crate::RuntimeKey::Local)
+    });
+    if let Some(idx) = local_master {
+        vec![idx]
+    } else {
+        active_indices
+            .iter()
+            .copied()
+            .find(|&i| {
+                !has_custom_h(&specs[i].id)
+                    && !specs[i].is_compact_empty
+                    && matches!(specs[i].kind, SectionKind::Runtime(_))
+                    && specs[i].natural_h > specs[i].max_cap
+            })
+            .into_iter()
+            .collect()
+    }
+}
+
+/// 计算应吸附在侧栏底部的板块起始索引（远程机器与归档）。
+///
+/// 侧栏架构设计：
+/// - 顶部工作区：对话（Conversations）与本机（Local）；
+/// - 中间弹性占位：当本机折叠或内容未占满时，由位于分界点的 Spacer 吸收剩余高度；
+/// - 底部停靠区：所有远程机器（Remote）与归档（Archive）。
+/// 无论本机如何展开、折叠或动画过渡，远程机器与归档始终吸附在最底部，绝不向上收缩，
+/// 展开时多余空间全部留给本机，保证各板块稳定可预期。
+pub(crate) fn sidebar_bottom_sections_start_index(specs: &[SectionLayoutSpec]) -> usize {
+    let has_local = specs
+        .iter()
+        .any(|s| s.kind == SectionKind::Runtime(crate::RuntimeKey::Local));
+    if has_local {
+        specs
+            .iter()
+            .position(|s| match s.kind {
+                SectionKind::Runtime(crate::RuntimeKey::Remote(_)) | SectionKind::Archive => true,
+                _ => false,
+            })
+            .unwrap_or(specs.len())
+    } else {
+        // 没有本机时，首个机器栏目作为主要工作区留在顶部，其余远程机与归档贴底
+        let first_machine_idx = specs
+            .iter()
+            .position(|s| matches!(s.kind, SectionKind::Runtime(_)));
+        if let Some(m_idx) = first_machine_idx {
+            specs
+                .iter()
+                .enumerate()
+                .position(|(i, s)| {
+                    i > m_idx
+                        && match s.kind {
+                            SectionKind::Runtime(crate::RuntimeKey::Remote(_))
+                            | SectionKind::Archive => true,
+                            _ => false,
+                        }
+                })
+                .unwrap_or(specs.len())
+        } else {
+            specs
+                .iter()
+                .position(|s| s.kind == SectionKind::Archive)
+                .unwrap_or(specs.len())
+        }
+    }
+}
+
+/// 侧栏分割条描述符，定义分割条插入位置及所关联的上下板块。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SashSpec {
+    pub insert_before_idx: usize,
+    pub above_idx: Option<usize>,
+    pub below_idx: Option<usize>,
+}
+
+/// 计算侧栏各板块之间及与 Spacer 之间需要插入的分割条（Sash）。
+pub(crate) fn compute_sidebar_sashes(
+    expanded_indices: &[usize],
+    split_idx: usize,
+    has_spacer: bool,
+) -> Vec<SashSpec> {
+    let mut sashes = Vec::new();
+    let mut prev_expanded_idx: Option<usize> = None;
+
+    for &ix in expanded_indices {
+        if ix < split_idx {
+            if let Some(above_idx) = prev_expanded_idx {
+                sashes.push(SashSpec {
+                    insert_before_idx: ix,
+                    above_idx: Some(above_idx),
+                    below_idx: Some(ix),
+                });
+            }
+            prev_expanded_idx = Some(ix);
+        } else {
+            if let Some(above_idx) = prev_expanded_idx {
+                if above_idx < split_idx {
+                    if has_spacer {
+                        sashes.push(SashSpec {
+                            insert_before_idx: split_idx,
+                            above_idx: Some(above_idx),
+                            below_idx: None,
+                        });
+                        sashes.push(SashSpec {
+                            insert_before_idx: ix,
+                            above_idx: None,
+                            below_idx: Some(ix),
+                        });
+                    } else {
+                        sashes.push(SashSpec {
+                            insert_before_idx: ix,
+                            above_idx: Some(above_idx),
+                            below_idx: Some(ix),
+                        });
+                    }
+                } else {
+                    sashes.push(SashSpec {
+                        insert_before_idx: ix,
+                        above_idx: Some(above_idx),
+                        below_idx: Some(ix),
+                    });
+                }
+            } else if has_spacer {
+                sashes.push(SashSpec {
+                    insert_before_idx: ix,
+                    above_idx: None,
+                    below_idx: Some(ix),
+                });
+            }
+            prev_expanded_idx = Some(ix);
+        }
+    }
+
+    if has_spacer {
+        if let Some(above_idx) = prev_expanded_idx {
+            if above_idx < split_idx {
+                sashes.push(SashSpec {
+                    insert_before_idx: split_idx,
+                    above_idx: Some(above_idx),
+                    below_idx: None,
+                });
+            }
+        }
+    }
+
+    sashes
+}
+
+/// 拖侧栏分段之间的分隔条：在两个展开段之间调节相对权重分配，或在展开段与空白之间调节高度。
 #[derive(Clone)]
 struct SectionSplitDrag {
-    above_id: String,
-    below_id: String,
+    above_id: Option<String>,
+    below_id: Option<String>,
     start_h_above: f32,
     start_h_below: f32,
     w_total: f32,
@@ -484,7 +656,7 @@ impl Render for SectionSplitDrag {
 }
 
 /// 拖分隔条时每段正文至少留这么高（像素）。
-const SECTION_MIN_BODY: f32 = 60.;
+const SECTION_MIN_BODY: f32 = 32.;
 
 use machines::machine_menu;
 use new_session::new_session_picker;
@@ -653,9 +825,9 @@ impl Workspace {
             })
     }
 
-    /// 是否存在远程机器分段（当有远程机器时，侧栏拆分为多段手风琴独立滚动）。
+    /// 侧栏统一拆分为手风琴独立滚动板块（对话、本机及各远程机、归档）。
     pub(crate) fn runtime_sections(&self) -> bool {
-        self.spaces.iter().any(|space| !space.runtime.is_local())
+        true
     }
 
     /// 对话所在分段的滚动句柄：分段模式下为独立对话滚动区，单段模式下回退为全局侧栏滚动。
@@ -2244,10 +2416,16 @@ impl Workspace {
         }
 
         let machine_sections_view = if runtime_sections {
+            let vh = f32::from(window.viewport_size().height);
+            let conv_max_cap = (vh * 0.35).clamp(160.0, 360.0);
+            let archive_max_cap = (vh * 0.35).clamp(160.0, 360.0);
+
             struct UnifiedSection {
                 id: String,
                 kind: SectionKind,
                 progress: f32,
+                natural_h: f32,
+                max_cap: f32,
                 is_compact_empty: bool,
                 header: AnyElement,
                 body: AnyElement,
@@ -2268,6 +2446,9 @@ impl Workspace {
                 cx,
             );
 
+            let conv_count = self.sidebar_conversation_order(cx).len();
+            let conv_natural_h = (conv_count as f32 * 33.0 + 16.0).max(32.0);
+
             if let Some((header, body)) = self.render_product_conversation_parts(
                 this.clone(),
                 statuses,
@@ -2280,6 +2461,8 @@ impl Workspace {
                         id: "conversations".to_string(),
                         kind: SectionKind::Conversations,
                         progress: conv_progress,
+                        natural_h: conv_natural_h,
+                        max_cap: conv_max_cap,
                         is_compact_empty: false,
                         header,
                         body,
@@ -2313,6 +2496,23 @@ impl Workspace {
                 }
                 let has_items = !machine_items.is_empty();
                 let is_compact_empty = !has_items;
+
+                let total_rows = row_counts_by_runtime.get(&key).copied().unwrap_or(0)
+                    + if key == RuntimeKey::Local && hidden_empty > 0 {
+                        1
+                    } else {
+                        0
+                    };
+                let runtime_natural_h = if is_compact_empty {
+                    28.0
+                } else {
+                    (total_rows as f32 * 33.0 + 16.0).max(32.0)
+                };
+                let runtime_max_cap = if is_compact_empty {
+                    28.0
+                } else {
+                    (vh * 0.55).clamp(180.0, 600.0)
+                };
 
                 let body = if has_items {
                     div()
@@ -2350,6 +2550,8 @@ impl Workspace {
                     id: format!("runtime-{key:?}"),
                     kind: SectionKind::Runtime(key.clone()),
                     progress,
+                    natural_h: runtime_natural_h,
+                    max_cap: runtime_max_cap,
                     is_compact_empty,
                     header: machine_header.into_any_element(),
                     body,
@@ -2368,14 +2570,17 @@ impl Workspace {
                 cx,
             );
 
-            if let Some((header, body, _count)) =
+            if let Some((header, body, count)) =
                 self.render_archive_parts(this.clone(), archive_progress * 90.0, cx)
             {
                 if let Some(body) = body {
+                    let archive_natural_h = (count as f32 * 45.0 + 16.0).max(44.0);
                     sections.push(UnifiedSection {
                         id: "archive".to_string(),
                         kind: SectionKind::Archive,
                         progress: archive_progress,
+                        natural_h: archive_natural_h,
+                        max_cap: archive_max_cap,
                         is_compact_empty: false,
                         header,
                         body,
@@ -2403,17 +2608,53 @@ impl Workspace {
                 .iter()
                 .any(|s| s.progress > 0.001 && s.progress < 0.999);
 
-            // 基础权重字典（用户可拖动分割条调整相对比例，默认本机 1.0，其余 0.5）
-            let get_base_weight = |id: &str, kind: &SectionKind| -> f32 {
-                let weights = self.sidebar_section_weights.borrow();
-                if let Some(&w) = weights.get(id) {
-                    w.max(0.1)
-                } else if matches!(kind, SectionKind::Runtime(RuntimeKey::Local)) {
-                    1.0
+            let has_custom_h =
+                |id: &str| -> bool { self.sidebar_section_heights.borrow().contains_key(id) };
+
+            // 基础像素高度获取（优先用户手动拖拽调整的高度，否则按内容量 natural_h 和 max_cap 计算）
+            let get_base_h = |id: &str, natural_h: f32, max_cap: f32| -> f32 {
+                let heights = self.sidebar_section_heights.borrow();
+                if let Some(&h) = heights.get(id) {
+                    h.max(SECTION_MIN_BODY)
                 } else {
-                    0.5
+                    natural_h.min(max_cap)
                 }
             };
+
+            // 识别当前处于展开/动画中的板块
+            let active_indices: Vec<usize> = sections
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.progress > 0.001)
+                .map(|(i, _)| i)
+                .collect();
+
+            let specs: Vec<SectionLayoutSpec> = sections
+                .iter()
+                .map(|s| SectionLayoutSpec {
+                    id: s.id.clone(),
+                    kind: s.kind.clone(),
+                    is_compact_empty: s.is_compact_empty,
+                    natural_h: s.natural_h,
+                    max_cap: s.max_cap,
+                })
+                .collect();
+
+            let split_idx = sidebar_bottom_sections_start_index(&specs);
+            let master_indices = select_flex_master_indices(&active_indices, &specs, has_custom_h);
+
+            let num_masters = master_indices.len();
+            let master_weight = if num_masters > 0 {
+                1.0 / (num_masters as f32)
+            } else {
+                0.0
+            };
+
+            let total_master_progress: f32 = master_indices
+                .iter()
+                .map(|&i| sections[i].progress.clamp(0.0, 1.0) * master_weight)
+                .sum();
+            let spacer_weight = (1.0 - total_master_progress).clamp(0.0, 1.0);
 
             let mut container = div()
                 .size_full()
@@ -2424,62 +2665,95 @@ impl Workspace {
                 .overflow_hidden()
                 .on_drag_move({
                     let this = this.clone();
-                    move |ev: &DragMoveEvent<SectionSplitDrag>, _window, cx| {
+                    move |ev: &DragMoveEvent<SectionSplitDrag>, window, cx| {
                         let drag = ev.drag(cx).clone();
                         let y = f32::from(ev.event.position.y);
+                        let vh = f32::from(window.viewport_size().height);
+                        let max_allowed_h = (vh - 120.0).clamp(SECTION_MIN_BODY, 1200.0);
                         this.update(cx, |ws, cx| {
-                            let (y0, a0, b0, w_total) =
-                                *ws.sidebar_split_drag.get_or_insert_with(|| {
-                                    (y, drag.start_h_above, drag.start_h_below, drag.w_total)
-                                });
+                            let (y0, a0, b0, _) = *ws.sidebar_split_drag.get_or_insert_with(|| {
+                                (y, drag.start_h_above, drag.start_h_below, drag.w_total)
+                            });
 
                             let delta = y - y0;
-                            let sum_h = a0 + b0;
-                            if sum_h <= SECTION_MIN_BODY * 1.5 {
-                                return;
+                            match (&drag.above_id, &drag.below_id) {
+                                (Some(a_id), Some(b_id)) => {
+                                    let sum_h = a0 + b0;
+                                    if sum_h <= SECTION_MIN_BODY * 1.5 {
+                                        return;
+                                    }
+                                    let new_a =
+                                        (a0 + delta).clamp(SECTION_MIN_BODY, sum_h - SECTION_MIN_BODY);
+                                    let new_b = (sum_h - new_a).max(SECTION_MIN_BODY);
+                                    ws.sidebar_section_heights
+                                        .borrow_mut()
+                                        .insert(a_id.clone(), new_a);
+                                    ws.sidebar_section_heights
+                                        .borrow_mut()
+                                        .insert(b_id.clone(), new_b);
+                                    cx.notify();
+                                }
+                                (None, Some(b_id)) => {
+                                    let new_b = (b0 - delta).clamp(SECTION_MIN_BODY, max_allowed_h);
+                                    ws.sidebar_section_heights
+                                        .borrow_mut()
+                                        .insert(b_id.clone(), new_b);
+                                    cx.notify();
+                                }
+                                (Some(a_id), None) => {
+                                    let new_a = (a0 + delta).clamp(SECTION_MIN_BODY, max_allowed_h);
+                                    ws.sidebar_section_heights
+                                        .borrow_mut()
+                                        .insert(a_id.clone(), new_a);
+                                    cx.notify();
+                                }
+                                (None, None) => {}
                             }
-                            let new_a =
-                                (a0 + delta).clamp(SECTION_MIN_BODY, sum_h - SECTION_MIN_BODY);
-                            let new_b = (sum_h - new_a).max(SECTION_MIN_BODY);
-                            let ratio_a = new_a / (new_a + new_b);
-                            let new_w_a = (w_total * ratio_a).max(0.1);
-                            let new_w_b = (w_total * (1.0 - ratio_a)).max(0.1);
-                            ws.sidebar_section_weights
-                                .borrow_mut()
-                                .insert(drag.above_id.clone(), new_w_a);
-                            ws.sidebar_section_weights
-                                .borrow_mut()
-                                .insert(drag.below_id.clone(), new_w_b);
-                            cx.notify();
                         });
                     }
                 });
 
-            let make_sash = |ix: usize, above_idx: usize, below_idx: usize| -> AnyElement {
-                let h_a =
-                    f32::from(metas[above_idx].scroll.bounds().size.height).max(SECTION_MIN_BODY);
-                let h_b =
-                    f32::from(metas[below_idx].scroll.bounds().size.height).max(SECTION_MIN_BODY);
-                let w_a = get_base_weight(&metas[above_idx].id, &metas[above_idx].kind);
-                let w_b = get_base_weight(&metas[below_idx].id, &metas[below_idx].kind);
+            let make_sash = |above_idx: Option<usize>, below_idx: Option<usize>| -> AnyElement {
+                let get_h = |idx: usize| -> f32 {
+                    let bounds_h = f32::from(metas[idx].scroll.bounds().size.height);
+                    if bounds_h > 1.0 {
+                        bounds_h
+                    } else if let Some(&custom) = self.sidebar_section_heights.borrow().get(&metas[idx].id) {
+                        custom.max(SECTION_MIN_BODY)
+                    } else {
+                        get_base_h(&metas[idx].id, specs[idx].natural_h, specs[idx].max_cap).max(SECTION_MIN_BODY)
+                    }
+                };
+
+                let h_a = above_idx.map(get_h).unwrap_or(0.0);
+                let h_b = below_idx.map(get_h).unwrap_or(0.0);
 
                 let payload = SectionSplitDrag {
-                    above_id: metas[above_idx].id.clone(),
-                    below_id: metas[below_idx].id.clone(),
+                    above_id: above_idx.map(|idx| metas[idx].id.clone()),
+                    below_id: below_idx.map(|idx| metas[idx].id.clone()),
                     start_h_above: h_a,
                     start_h_below: h_b,
-                    w_total: w_a + w_b,
+                    w_total: h_a + h_b,
                 };
                 let start_this = this.clone();
+                let click_this = this.clone();
+                let reset_above = above_idx.map(|idx| metas[idx].id.clone());
+                let reset_below = below_idx.map(|idx| metas[idx].id.clone());
+                let sash_tag = match (above_idx, below_idx) {
+                    (Some(a), Some(b)) => format!("split-{a}-{b}"),
+                    (Some(a), None) => format!("split-top-{a}"),
+                    (None, Some(b)) => format!("split-bottom-{b}"),
+                    (None, None) => "split-none".to_string(),
+                };
                 div()
-                    .id(("sidebar-section-split", ix))
+                    .id(ElementId::from(SharedString::from(format!("sidebar-section-split-{}", sash_tag))))
                     .relative()
                     .flex_none()
                     .h(px(0.))
                     .child(
                         deferred(
                             div()
-                                .id(("sidebar-section-split-hit", ix))
+                                .id(ElementId::from(SharedString::from(format!("sidebar-section-split-hit-{}", sash_tag))))
                                 .absolute()
                                 .left_0()
                                 .top(px(-4.))
@@ -2490,6 +2764,23 @@ impl Workspace {
                                 .on_drag(payload, move |drag, _, _, cx| {
                                     start_this.update(cx, |ws, _| ws.sidebar_split_drag = None);
                                     cx.new(|_| drag.clone())
+                                })
+                                .on_click(move |ev, _window, cx| {
+                                    if ev.click_count() >= 2 {
+                                        click_this.update(cx, |ws, cx| {
+                                            if let Some(ref a) = reset_above {
+                                                ws.sidebar_section_heights
+                                                    .borrow_mut()
+                                                    .remove(a);
+                                            }
+                                            if let Some(ref b) = reset_below {
+                                                ws.sidebar_section_heights
+                                                    .borrow_mut()
+                                                    .remove(b);
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
                                 })
                                 .child(
                                     div()
@@ -2509,134 +2800,133 @@ impl Workspace {
                     .into_any_element()
             };
 
-            // 连续权重 Flexbox 手风琴模型：
-            // 1. 各板块（对话、机器、归档）统一参与手风琴空间分配与 Resizer 拖拽调节；
-            // 2. 当有板块完全展开时：所有展开项与动画中项按瞬时权重平滑瓜分 100% 侧栏空间，向下占满视口；
-            // 3. 当所有板块全部收起时：所有标题贴顶吸附，底部由占位 spacer 垫底留白；
-            // 4. 动画期间全程严格数学连续过渡，绝对无两段突变，无空白闪烁与尺寸跳变；
-            // 5. 分割条（Resizer）：在任意两个完全展开的板块之间动态连接，即使中间夹杂折叠板块也能上下拖拽调节高度。
-            let total_instant_w: f32 = sections
+            // 严格基于内容高度与平滑滑动的真正手风琴模型：
+            // 1. 各板块顺序绝对稳定连续，标题永不瞬移，点击位置始终固定；
+            // 2. 顶部工作区（对话、本机）在上方，远程机器与归档作为停靠区吸附在底部；
+            // 3. 中间弹性 Spacer 位于分界点：当本机完全展开时，它让出全部空间使更多空间给本机；
+            //    当本机折叠时，它在中间吸收空余空间，下方远程和归档保持贴底吸附，绝不向上收缩；
+            // 4. 动画期间通过真实像素高度平滑过渡，展开与折叠丝滑顺畅；
+            // 5. 分割条（Sash）可在任意展开板块之间以及展开板块与 Spacer 之间动态插入，支持双向与单向自由调节高度。
+            let expanded_indices: Vec<usize> = sections
                 .iter()
-                .filter(|s| !s.is_compact_empty && s.progress > 0.001)
-                .map(|s| get_base_weight(&s.id, &s.kind) * s.progress)
-                .sum();
-
-            let has_fully_expanded = sections
-                .iter()
-                .any(|s| !s.is_compact_empty && s.progress > 0.99);
-
-            let total_max_w: f32 = sections
-                .iter()
-                .filter(|s| !s.is_compact_empty && s.progress > 0.001)
-                .map(|s| get_base_weight(&s.id, &s.kind))
-                .sum();
-
-            // 底部弹性占位：
-            // - 全收起时：bottom_spacer = 1.0，所有板块自然贴顶，空白留在最下方；
-            // - 存在完全展开板块时：bottom_spacer = 0.0，展开项占满剩余空间向下延伸；
-            // - 仅有部分板块在展开动画途中时：随着展开进度从 1.0 连续缩至 0.0，单段平滑展开。
-            let bottom_spacer_w = if total_instant_w <= 0.001 {
-                1.0
-            } else if has_fully_expanded {
-                0.0
-            } else if total_max_w > 0.001 {
-                (1.0 - (total_instant_w / total_max_w)).clamp(0.0, 1.0)
+                .enumerate()
+                .filter(|(_, s)| s.progress > 0.99 && !s.is_compact_empty)
+                .map(|(i, _)| i)
+                .collect();
+            let planned_sashes = if !is_animating {
+                compute_sidebar_sashes(&expanded_indices, split_idx, spacer_weight > 0.001)
             } else {
-                0.0
+                Vec::new()
             };
-
-            let mut prev_expanded_idx: Option<usize> = None;
 
             for (ix, section) in sections.into_iter().enumerate() {
                 let UnifiedSection {
                     id,
-                    kind,
+                    kind: _,
                     header,
                     body,
                     scroll,
                     progress,
+                    natural_h,
+                    max_cap,
                     is_compact_empty,
                 } = section;
                 let progress = progress.clamp(0.0, 1.0);
 
-                let is_expanded = progress > 0.99 && !is_compact_empty;
-                if is_expanded && !is_animating {
-                    if let Some(above_idx) = prev_expanded_idx {
-                        // 在下方展开板块上方插入分割条，连接上一个展开板块与当前展开板块
-                        container = container.child(make_sash(ix, above_idx, ix));
+                // 当到达底部贴底板块分界点时，插入中间弹性占位 Spacer：
+                // 当本机完全展开时，spacer_weight 为 0，不占任何空间，下方的远程和归档贴在最底端；
+                // 当本机折叠时，spacer_weight 为 1，在中间吸收全部空余高度，下方的远程和归档保持 100% 贴底吸附，绝不向上收缩！
+                if ix == split_idx && spacer_weight > 0.001 {
+                    for sash in planned_sashes.iter().filter(|s| s.insert_before_idx == split_idx && s.below_idx.is_none()) {
+                        container = container.child(make_sash(sash.above_idx, sash.below_idx));
                     }
-                    prev_expanded_idx = Some(ix);
+                    container = container.child(
+                        div()
+                            .flex_grow(spacer_weight)
+                            .flex_shrink_1()
+                            .flex_basis(px(0.))
+                            .min_h_0(),
+                    );
+                }
+
+                // 在板块 Header 上方插入计划好的分割条
+                for sash in planned_sashes.iter().filter(|s| s.insert_before_idx == ix && s.below_idx.is_some()) {
+                    container = container.child(make_sash(sash.above_idx, sash.below_idx));
                 }
 
                 // 1. 板块 Header
                 container = container.child(div().flex_none().child(header));
 
-                // 2. 板块 Body
-                if is_compact_empty {
-                    // 无项目紧凑占位行（如离线机器显示「暂无项目」）：固定 28px 高度平滑展开/折叠
-                    let cur_h = (28.0 * progress).max(0.0);
+                // 2. 板块 Body（根据角色动态分配：master 弹性吃满空间并驱动下方贴底，辅助项基于内容高度自适应）
+                if progress > 0.001 {
+                    let is_master = master_indices.contains(&ix);
                     let mut body_elem = div()
                         .id(ElementId::from(SharedString::from(format!(
                             "section-body-{}",
                             id
                         ))))
                         .relative()
-                        .flex_none()
-                        .h(px(cur_h))
-                        .overflow_hidden();
-                    if cur_h > 1.0 {
-                        body_elem = body_elem.child(body);
-                    }
-                    container = container.child(body_elem);
-                } else if progress > 0.001 {
-                    let base_w = get_base_weight(&id, &kind);
-                    let instant_w = (base_w * progress).max(0.001);
+                        .overflow_hidden()
+                        .opacity(progress);
 
-                    let flex_w = if has_fully_expanded {
-                        if total_instant_w > 0.001 {
-                            instant_w / total_instant_w
-                        } else {
-                            1.0
-                        }
-                    } else if total_max_w > 0.001 {
-                        instant_w / total_max_w
+                    let base_h = if is_compact_empty {
+                        28.0
                     } else {
-                        progress
+                        get_base_h(&id, natural_h, max_cap)
+                    };
+                    let cur_h = (base_h * progress).max(0.0);
+                    let min_h_val = (SECTION_MIN_BODY * progress).min(cur_h);
+
+                    let should_mount_child = if is_compact_empty {
+                        body_elem = body_elem.flex_none().h(px(cur_h));
+                        cur_h > 1.0
+                    } else if is_master {
+                        body_elem = body_elem
+                            .flex_grow(master_weight * progress)
+                            .flex_shrink_1()
+                            .flex_basis(px(cur_h))
+                            .min_h(px(min_h_val));
+                        cur_h > 1.0
+                    } else {
+                        body_elem = body_elem
+                            .flex_shrink_1()
+                            .flex_basis(px(cur_h))
+                            .max_h(px(cur_h))
+                            .min_h(px(min_h_val));
+                        cur_h > 1.0
                     };
 
-                    let body_elem = div()
-                        .id(ElementId::from(SharedString::from(format!(
-                            "section-body-{}",
-                            id
-                        ))))
-                        .relative()
-                        .flex_grow(flex_w)
-                        .flex_shrink_1()
-                        .flex_basis(px(0.))
-                        .min_h_0()
-                        .overflow_hidden()
-                        .opacity(progress)
-                        .child(
-                            div()
-                                .id(ElementId::from(SharedString::from(format!(
-                                    "section-scroll-{}",
-                                    id
-                                ))))
-                                .size_full()
-                                .overflow_y_scroll()
-                                .track_scroll(&scroll)
-                                .lock_scroll_axis()
-                                .child(body),
-                        )
-                        .vertical_scrollbar(&scroll);
+                    if should_mount_child {
+                        body_elem = body_elem
+                            .child(
+                                div()
+                                    .id(ElementId::from(SharedString::from(format!(
+                                        "section-scroll-{}",
+                                        id
+                                    ))))
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&scroll)
+                                    .lock_scroll_axis()
+                                    .child(body),
+                            )
+                            .vertical_scrollbar(&scroll);
+                    }
                     container = container.child(body_elem);
                 }
             }
 
-            if bottom_spacer_w > 0.001 {
+            // 若所有板块都在顶部（无贴底板块），则将 spacer 置于末尾
+            if split_idx >= n && spacer_weight > 0.001 {
+                for sash in planned_sashes
+                    .iter()
+                    .filter(|s| s.insert_before_idx == split_idx && s.below_idx.is_none())
+                {
+                    container = container.child(make_sash(sash.above_idx, sash.below_idx));
+                }
                 container = container.child(
                     div()
-                        .flex_grow(bottom_spacer_w)
+                        .flex_grow(spacer_weight)
                         .flex_shrink_1()
                         .flex_basis(px(0.))
                         .min_h_0(),
