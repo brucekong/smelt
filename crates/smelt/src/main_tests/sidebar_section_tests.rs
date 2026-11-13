@@ -359,6 +359,34 @@ fn local_expanded_preserves_sashes_between_bottom_sections() {
 }
 
 #[test]
+fn local_expanded_allows_archive_to_be_dragged_when_intermediate_remote_is_folded() {
+    // 场景：对应用户反馈 bug 截图（CleanShot 2026-11-13 at 11.11.02.png）：
+    // 对话(0)展开，本机(1)展开，远程机(2)折叠，归档(3)展开且有内容。
+    let expanded = vec![0, 1, 3];
+    let split_idx = 2;
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, false, true);
+
+    // 1. 对话(0)与本机(1)之间有调节 Sash；
+    // 2. 本机(1)底部（分界点 split_idx = 2 处）不显示任何悬空 handler；
+    // 3. 展开且有内容的归档(3)顶部（insert_before_idx = 3 处）必须拥有单向向上调节的 Sash！
+    assert_eq!(
+        sashes,
+        vec![
+            SashSpec {
+                insert_before_idx: 1,
+                above_idx: Some(0),
+                below_idx: Some(1),
+            },
+            SashSpec {
+                insert_before_idx: 3,
+                above_idx: None,
+                below_idx: Some(3),
+            },
+        ]
+    );
+}
+
+#[test]
 fn expanded_sections_across_spacer_get_independent_sashes() {
     // 场景：对话(0)展开，远程机(2)展开，中间被 Spacer 隔开
     let expanded = vec![0, 2];

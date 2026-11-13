@@ -638,8 +638,14 @@ pub(crate) struct SashSpec {
 
 /// 计算侧栏各板块之间及与 Spacer 之间需要插入的分割条（Sash）。
 ///
-/// 当本机处于展开状态（`local_expanded == true`）时，本机作为主要弹性工作区，
-/// 底部不需要显示拖拽分割条（handler），以保证界面整洁且避免高度冲突。
+/// 规则：
+/// 1. 顶部工作区各板块之间（如对话与本机）正常生成双向调节 Sash；
+/// 2. 当本机处于展开状态（`local_expanded == true`）时，本机作为主要弹性工作区，
+///    其底部边界（即 `split_idx` 处）不显示拖拽分割条（handler）；
+/// 3. 底部停靠区（远程机器与归档）展开且有内容时，必须允许拖拽调整高度：
+///    - 若上方相邻板块同样在底部且已展开，生成两板块之间的双向调节 Sash；
+///    - 若上方板块未展开（如远程机折叠时归档展开），在板块顶部生成单向向上生长的调节 Sash；
+///    - 仅当该板块位于 `split_idx` 且本机展开时，才因贴紧本机底部而省略该分界处的 handler。
 pub(crate) fn compute_sidebar_sashes(
     expanded_indices: &[usize],
     split_idx: usize,
@@ -660,42 +666,47 @@ pub(crate) fn compute_sidebar_sashes(
             }
             prev_expanded_idx = Some(ix);
         } else {
+            // ix >= split_idx: 底部停靠区板块（远程机器或归档）
             if let Some(above_idx) = prev_expanded_idx {
                 if above_idx < split_idx {
-                    // 当本机展开时，本机底部不显示拖拽分割条（无论下方是 Spacer 还是贴底板块）
+                    // ix 是底部停靠区首个展开的板块（上方是顶部工作区）
                     if !local_expanded {
+                        // 本机折叠时，若有弹性 Spacer，顶部展开项可向下调节
                         if has_spacer {
                             sashes.push(SashSpec {
                                 insert_before_idx: split_idx,
                                 above_idx: Some(above_idx),
                                 below_idx: None,
                             });
-                            sashes.push(SashSpec {
-                                insert_before_idx: ix,
-                                above_idx: None,
-                                below_idx: Some(ix),
-                            });
-                        } else {
-                            sashes.push(SashSpec {
-                                insert_before_idx: ix,
-                                above_idx: Some(above_idx),
-                                below_idx: Some(ix),
-                            });
                         }
                     }
+                    // 为 ix 生成向上调节的 Sash：
+                    // 当本机展开且 ix 紧贴本机底部（ix == split_idx）时省略 handler；
+                    // 其余情况（如 ix > split_idx，即归档展开而上方远程机折叠）必须生成允许拖拽的 Sash！
+                    if !(local_expanded && ix == split_idx) {
+                        sashes.push(SashSpec {
+                            insert_before_idx: ix,
+                            above_idx: None,
+                            below_idx: Some(ix),
+                        });
+                    }
                 } else {
+                    // 底部停靠区两个相邻展开的板块之间（如远程机与归档，或两台远程机之间）
                     sashes.push(SashSpec {
                         insert_before_idx: ix,
                         above_idx: Some(above_idx),
                         below_idx: Some(ix),
                     });
                 }
-            } else if has_spacer {
-                sashes.push(SashSpec {
-                    insert_before_idx: ix,
-                    above_idx: None,
-                    below_idx: Some(ix),
-                });
+            } else {
+                // 上方没有任何展开项（顶部全折叠）
+                if !(local_expanded && ix == split_idx) {
+                    sashes.push(SashSpec {
+                        insert_before_idx: ix,
+                        above_idx: None,
+                        below_idx: Some(ix),
+                    });
+                }
             }
             prev_expanded_idx = Some(ix);
         }
