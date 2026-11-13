@@ -520,6 +520,32 @@ pub(crate) fn compute_section_flex_policy(
     }
 }
 
+/// 计算上方对话栏目折叠释放出的可用高度。
+pub(crate) fn compute_conversation_freed_height(
+    conv_count: usize,
+    conv_base_h: f32,
+    conv_progress: f32,
+) -> f32 {
+    if conv_count > 0 {
+        (conv_base_h * (1.0 - conv_progress.clamp(0.0, 1.0))).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// 计算顶部工作区机器板块吸收对话释放空间后的有效基准高度。
+pub(crate) fn compute_effective_machine_base_h(
+    raw_base_h: f32,
+    natural_h: f32,
+    conv_freed_h: f32,
+) -> f32 {
+    if conv_freed_h > 0.001 {
+        (raw_base_h + conv_freed_h).min(natural_h.max(raw_base_h))
+    } else {
+        raw_base_h
+    }
+}
+
 /// 判定展开板块中哪些作为弹性主项（flex_master）。
 ///
 /// 规则：
@@ -2655,6 +2681,12 @@ impl Workspace {
                 }
             };
 
+            let conv_freed_h = compute_conversation_freed_height(
+                conv_count,
+                get_base_h("conversations", conv_natural_h, conv_max_cap),
+                conv_progress,
+            );
+
             // 识别当前处于展开/动画中的板块
             let active_indices: Vec<usize> = sections
                 .iter()
@@ -2719,26 +2751,46 @@ impl Workspace {
                                     let new_a =
                                         (a0 + delta).clamp(SECTION_MIN_BODY, sum_h - SECTION_MIN_BODY);
                                     let new_b = (sum_h - new_a).max(SECTION_MIN_BODY);
+                                    let saved_a = if a_id == "runtime-Local" && conv_freed_h > 0.001 {
+                                        (new_a - conv_freed_h).max(SECTION_MIN_BODY)
+                                    } else {
+                                        new_a
+                                    };
+                                    let saved_b = if b_id == "runtime-Local" && conv_freed_h > 0.001 {
+                                        (new_b - conv_freed_h).max(SECTION_MIN_BODY)
+                                    } else {
+                                        new_b
+                                    };
                                     ws.sidebar_section_heights
                                         .borrow_mut()
-                                        .insert(a_id.clone(), new_a);
+                                        .insert(a_id.clone(), saved_a);
                                     ws.sidebar_section_heights
                                         .borrow_mut()
-                                        .insert(b_id.clone(), new_b);
+                                        .insert(b_id.clone(), saved_b);
                                     cx.notify();
                                 }
                                 (None, Some(b_id)) => {
                                     let new_b = (b0 - delta).clamp(SECTION_MIN_BODY, max_allowed_h);
+                                    let saved_b = if b_id == "runtime-Local" && conv_freed_h > 0.001 {
+                                        (new_b - conv_freed_h).max(SECTION_MIN_BODY)
+                                    } else {
+                                        new_b
+                                    };
                                     ws.sidebar_section_heights
                                         .borrow_mut()
-                                        .insert(b_id.clone(), new_b);
+                                        .insert(b_id.clone(), saved_b);
                                     cx.notify();
                                 }
                                 (Some(a_id), None) => {
                                     let new_a = (a0 + delta).clamp(SECTION_MIN_BODY, max_allowed_h);
+                                    let saved_a = if a_id == "runtime-Local" && conv_freed_h > 0.001 {
+                                        (new_a - conv_freed_h).max(SECTION_MIN_BODY)
+                                    } else {
+                                        new_a
+                                    };
                                     ws.sidebar_section_heights
                                         .borrow_mut()
-                                        .insert(a_id.clone(), new_a);
+                                        .insert(a_id.clone(), saved_a);
                                     cx.notify();
                                 }
                                 (None, None) => {}
@@ -2753,9 +2805,20 @@ impl Workspace {
                     if bounds_h > 1.0 {
                         bounds_h
                     } else if let Some(&custom) = self.sidebar_section_heights.borrow().get(&metas[idx].id) {
-                        custom.max(SECTION_MIN_BODY)
+                        let base = if metas[idx].id == "runtime-Local" && conv_freed_h > 0.001 {
+                            compute_effective_machine_base_h(custom, specs[idx].natural_h, conv_freed_h)
+                        } else {
+                            custom
+                        };
+                        base.max(SECTION_MIN_BODY)
                     } else {
-                        get_base_h(&metas[idx].id, specs[idx].natural_h, specs[idx].max_cap).max(SECTION_MIN_BODY)
+                        let raw = get_base_h(&metas[idx].id, specs[idx].natural_h, specs[idx].max_cap);
+                        let base = if metas[idx].id == "runtime-Local" && conv_freed_h > 0.001 {
+                            compute_effective_machine_base_h(raw, specs[idx].natural_h, conv_freed_h)
+                        } else {
+                            raw
+                        };
+                        base.max(SECTION_MIN_BODY)
                     }
                 };
 
@@ -2903,10 +2966,15 @@ impl Workspace {
                         .overflow_hidden()
                         .opacity(progress);
 
-                    let base_h = if is_compact_empty {
+                    let raw_base_h = if is_compact_empty {
                         28.0
                     } else {
                         get_base_h(&id, natural_h, max_cap)
+                    };
+                    let base_h = if ix < split_idx && matches!(kind, SectionKind::Runtime(_)) {
+                        compute_effective_machine_base_h(raw_base_h, natural_h, conv_freed_h)
+                    } else {
+                        raw_base_h
                     };
                     let cur_h = (base_h * progress).max(0.0);
                     let min_h_val = (SECTION_MIN_BODY * progress).min(cur_h);

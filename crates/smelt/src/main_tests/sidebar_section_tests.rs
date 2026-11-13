@@ -1,6 +1,7 @@
 use crate::session_list::{
-    SashSpec, SectionFlexPolicy, SectionKind, SectionLayoutSpec, compute_section_flex_policy,
-    compute_sidebar_sashes, select_flex_master_indices, sidebar_bottom_sections_start_index,
+    SashSpec, SectionFlexPolicy, SectionKind, SectionLayoutSpec, compute_conversation_freed_height,
+    compute_effective_machine_base_h, compute_section_flex_policy, compute_sidebar_sashes,
+    select_flex_master_indices, sidebar_bottom_sections_start_index,
 };
 use crate::RuntimeKey;
 
@@ -521,4 +522,34 @@ fn section_flex_policy_compact_empty_is_compact() {
         28.0,
     );
     assert_eq!(policy, SectionFlexPolicy::CompactEmpty);
+}
+
+#[test]
+fn conversation_freed_height_when_expanded_is_zero() {
+    // 对话展开时，不释放任何额外高度
+    let freed = compute_conversation_freed_height(5, 150.0, 1.0);
+    assert_eq!(freed, 0.0);
+}
+
+#[test]
+fn conversation_freed_height_when_collapsed_is_full_base_height() {
+    // 对话收起后，释放全部原本占据的高度
+    let freed = compute_conversation_freed_height(5, 150.0, 0.0);
+    assert_eq!(freed, 150.0);
+}
+
+#[test]
+fn local_machine_absorbs_conversation_freed_space_without_bottom_gap() {
+    // 对话收起后释放 150px，本机设定高度 300px，内容丰富 (natural_h = 600px)
+    // 本机有效基准高度自动扩大到 450px，完全吸收利用释放出的空间，保证本机下方绝不出现多余留白！
+    let h = compute_effective_machine_base_h(300.0, 600.0, 150.0);
+    assert_eq!(h, 450.0);
+}
+
+#[test]
+fn local_machine_with_few_items_does_not_overstretch_when_conversation_collapsed() {
+    // 本机仅有 2 个项目 (natural_h = 80px)，对话收起释放 150px
+    // 本机内容已完全展示，不再多占空间撑大空白，避免内部出现无意义空高
+    let h = compute_effective_machine_base_h(80.0, 80.0, 150.0);
+    assert_eq!(h, 80.0);
 }
