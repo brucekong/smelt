@@ -2583,14 +2583,12 @@ impl Workspace {
 
             struct SectionMeta {
                 id: String,
-                kind: SectionKind,
                 scroll: ScrollHandle,
             }
             let metas: Vec<SectionMeta> = sections
                 .iter()
                 .map(|s| SectionMeta {
                     id: s.id.clone(),
-                    kind: s.kind.clone(),
                     scroll: s.scroll.clone(),
                 })
                 .collect();

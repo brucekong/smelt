@@ -2149,9 +2149,6 @@ struct Workspace {
     /// 各分段正文的高度分配缓存。
     pub(crate) sidebar_section_heights:
         std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, f32>>>,
-    /// 各分段正文的相对权重，>=2 个分段展开时按权重通过 flex_grow 分配高度。
-    pub(crate) sidebar_section_weights:
-        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, f32>>>,
     /// 正在拖的分隔条：(起点 y, 上方分段起始像素高度, 下方分段起始像素高度, 两者权重之和)。
     pub(crate) sidebar_split_drag: Option<(f32, f32, f32, f32)>,
     /// 整个工作台：一块 Dock，会话列表、舞台、文件这些都是里面的面板（见 `workspace_shell`）。
@@ -2663,7 +2660,6 @@ impl Workspace {
             delete_branch_target: None,
             git_log_resize,
             sidebar_section_heights: Default::default(),
-            sidebar_section_weights: Default::default(),
             sidebar_split_drag: None,
             shell_dock,
             shell_view: Default::default(),
