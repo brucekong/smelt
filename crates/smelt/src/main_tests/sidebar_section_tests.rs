@@ -90,7 +90,7 @@ fn remote_machine_with_many_items_when_local_is_folded() {
 }
 
 #[test]
-fn local_machine_remains_flex_master_to_absorb_space_for_remote_sticky_bottom() {
+fn local_machine_with_custom_height_disables_flex_master() {
     let specs = vec![
         SectionLayoutSpec {
             id: "runtime-Local".to_string(),
@@ -109,11 +109,11 @@ fn local_machine_remains_flex_master_to_absorb_space_for_remote_sticky_bottom() 
     ];
 
     let active = vec![0, 1];
-    // 即使曾经拖动过 sash 使得 runtime-Local 具有记录高度，
-    // 本机依然作为 flex master 吸收剩余空间，将下方远程机推至底部贴底吸附
+    // 当本机被用户手动拖拽定高后，不再作为 flex master（禁止 flex_grow 强行撑高），
+    // 严格按拖拽的高度展示，剩余视口由分界点的 Spacer 吸收，远程机依然贴底吸附
     let masters = select_flex_master_indices(&active, &specs, |id| id == "runtime-Local");
 
-    assert_eq!(masters, vec![0]);
+    assert_eq!(masters, Vec::<usize>::new());
 }
 
 #[test]

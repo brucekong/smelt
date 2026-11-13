@@ -480,8 +480,8 @@ pub(crate) struct SectionLayoutSpec {
 /// 判定展开板块中哪些作为弹性主项（flex_master）。
 ///
 /// 规则：
-/// - 优先本机（RuntimeKey::Local）作为唯一弹性主体，吸收视口剩余空间并将远程机与归档平滑推到底部贴底；
-///   即使用户曾调整过高度，本机依然负责吸收上方全部剩余视口，确保下方板块永不浮空；
+/// - 未手动调整高度时，优先本机（RuntimeKey::Local）作为唯一弹性主体，吸收视口剩余空间并将远程机与归档平滑推到底部贴底；
+/// - 若用户已手动拖拽定高，则严格尊重用户设定高度（禁止 flex_grow 强行撑大），由分界点处的弹性 Spacer 吸收剩余高度，保证下方板块贴底；
 /// - 若本机未展开或为空，则未手动定高且内容超出容量上限（natural_h > max_cap）的首个远程机器可作为弹性主体；
 /// - 子集内容较少（natural_h <= max_cap，如只有 1~2 个项目）的机器板块绝不作为 flex_master，
 ///   与对话、归档一样基于真实内容自适应高度，少内容绝不多占，展开时保持平滑过渡。
@@ -491,7 +491,8 @@ pub(crate) fn select_flex_master_indices(
     has_custom_h: impl Fn(&str) -> bool,
 ) -> Vec<usize> {
     let local_master = active_indices.iter().copied().find(|&i| {
-        !specs[i].is_compact_empty
+        !has_custom_h(&specs[i].id)
+            && !specs[i].is_compact_empty
             && specs[i].kind == SectionKind::Runtime(crate::RuntimeKey::Local)
     });
     if let Some(idx) = local_master {
