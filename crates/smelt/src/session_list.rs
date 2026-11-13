@@ -637,10 +637,14 @@ pub(crate) struct SashSpec {
 }
 
 /// 计算侧栏各板块之间及与 Spacer 之间需要插入的分割条（Sash）。
+///
+/// 当本机处于展开状态（`local_expanded == true`）时，本机作为主要弹性工作区，
+/// 底部不需要显示拖拽分割条（handler），以保证界面整洁且避免高度冲突。
 pub(crate) fn compute_sidebar_sashes(
     expanded_indices: &[usize],
     split_idx: usize,
     has_spacer: bool,
+    local_expanded: bool,
 ) -> Vec<SashSpec> {
     let mut sashes = Vec::new();
     let mut prev_expanded_idx: Option<usize> = None;
@@ -658,23 +662,26 @@ pub(crate) fn compute_sidebar_sashes(
         } else {
             if let Some(above_idx) = prev_expanded_idx {
                 if above_idx < split_idx {
-                    if has_spacer {
-                        sashes.push(SashSpec {
-                            insert_before_idx: split_idx,
-                            above_idx: Some(above_idx),
-                            below_idx: None,
-                        });
-                        sashes.push(SashSpec {
-                            insert_before_idx: ix,
-                            above_idx: None,
-                            below_idx: Some(ix),
-                        });
-                    } else {
-                        sashes.push(SashSpec {
-                            insert_before_idx: ix,
-                            above_idx: Some(above_idx),
-                            below_idx: Some(ix),
-                        });
+                    // 当本机展开时，本机底部不显示拖拽分割条（无论下方是 Spacer 还是贴底板块）
+                    if !local_expanded {
+                        if has_spacer {
+                            sashes.push(SashSpec {
+                                insert_before_idx: split_idx,
+                                above_idx: Some(above_idx),
+                                below_idx: None,
+                            });
+                            sashes.push(SashSpec {
+                                insert_before_idx: ix,
+                                above_idx: None,
+                                below_idx: Some(ix),
+                            });
+                        } else {
+                            sashes.push(SashSpec {
+                                insert_before_idx: ix,
+                                above_idx: Some(above_idx),
+                                below_idx: Some(ix),
+                            });
+                        }
                     }
                 } else {
                     sashes.push(SashSpec {
@@ -694,7 +701,7 @@ pub(crate) fn compute_sidebar_sashes(
         }
     }
 
-    if has_spacer {
+    if has_spacer && !local_expanded {
         if let Some(above_idx) = prev_expanded_idx {
             if above_idx < split_idx {
                 sashes.push(SashSpec {
@@ -2910,8 +2917,19 @@ impl Workspace {
                 .filter(|(_, s)| s.progress > 0.99 && !s.is_compact_empty)
                 .map(|(i, _)| i)
                 .collect();
+            let local_idx = specs
+                .iter()
+                .position(|s| s.kind == SectionKind::Runtime(crate::RuntimeKey::Local));
+            let local_expanded = local_idx
+                .map(|idx| sections[idx].progress > 0.99)
+                .unwrap_or(false);
             let planned_sashes = if !is_animating {
-                compute_sidebar_sashes(&expanded_indices, split_idx, spacer_weight > 0.001)
+                compute_sidebar_sashes(
+                    &expanded_indices,
+                    split_idx,
+                    spacer_weight > 0.001,
+                    local_expanded,
+                )
             } else {
                 Vec::new()
             };

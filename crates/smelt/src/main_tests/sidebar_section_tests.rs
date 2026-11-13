@@ -284,7 +284,7 @@ fn remote_machine_drag_sash_generated_when_local_is_folded() {
     // 场景：对话(0)和本机(1)折叠，远程机(2)和归档(3)展开，中间由 Spacer 隔开
     let expanded = vec![2, 3];
     let split_idx = 2;
-    let sashes = compute_sidebar_sashes(&expanded, split_idx, true);
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, true, false);
 
     // 1. 远程机顶部必须生成一个允许向上自由拉伸的单向 Sash（above: None, below: Some(2)）
     // 2. 远程机与归档之间生成常规的双向分配 Sash（above: Some(2), below: Some(3)）
@@ -307,17 +307,53 @@ fn remote_machine_drag_sash_generated_when_local_is_folded() {
 
 #[test]
 fn adjacent_expanded_sections_without_spacer_have_joint_sash() {
-    // 场景：本机(1)展开，远程机(2)展开，无 Spacer
-    let expanded = vec![1, 2];
+    // 场景：两个贴底板块相邻展开：远程机(2)展开，归档(3)展开，无 Spacer
+    let expanded = vec![2, 3];
     let split_idx = 2;
-    let sashes = compute_sidebar_sashes(&expanded, split_idx, false);
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, false, false);
 
     assert_eq!(
         sashes,
         vec![SashSpec {
-            insert_before_idx: 2,
-            above_idx: Some(1),
-            below_idx: Some(2),
+            insert_before_idx: 3,
+            above_idx: Some(2),
+            below_idx: Some(3),
+        }]
+    );
+}
+
+#[test]
+fn local_expanded_hides_bottom_resize_sash() {
+    // 场景：对话(0)、本机(1)、远程机(2)均展开，无 Spacer，local_expanded = true
+    let expanded = vec![0, 1, 2];
+    let split_idx = 2;
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, false, true);
+
+    // 对话(0)与本机(1)之间有调节 Sash，但本机(1)底部不显示拖拽 handler（不生成与远程机之间的 Sash）
+    assert_eq!(
+        sashes,
+        vec![SashSpec {
+            insert_before_idx: 1,
+            above_idx: Some(0),
+            below_idx: Some(1),
+        }]
+    );
+}
+
+#[test]
+fn local_expanded_preserves_sashes_between_bottom_sections() {
+    // 场景：本机(1)展开，远程机(2)展开，归档(3)展开，local_expanded = true
+    let expanded = vec![1, 2, 3];
+    let split_idx = 2;
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, false, true);
+
+    // 本机(1)底部不显示 Sash，但贴底区域内的远程机(2)与归档(3)之间保留调节 Sash
+    assert_eq!(
+        sashes,
+        vec![SashSpec {
+            insert_before_idx: 3,
+            above_idx: Some(2),
+            below_idx: Some(3),
         }]
     );
 }
@@ -327,7 +363,7 @@ fn expanded_sections_across_spacer_get_independent_sashes() {
     // 场景：对话(0)展开，远程机(2)展开，中间被 Spacer 隔开
     let expanded = vec![0, 2];
     let split_idx = 2;
-    let sashes = compute_sidebar_sashes(&expanded, split_idx, true);
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, true, false);
 
     // 对话底部与 Spacer 之间有一个向下扩展 Sash，远程机顶部有一个向上扩展 Sash
     assert_eq!(
@@ -352,7 +388,7 @@ fn only_top_section_expanded_has_sash_before_spacer() {
     // 场景：仅对话(0)展开，其余全部折叠
     let expanded = vec![0];
     let split_idx = 2;
-    let sashes = compute_sidebar_sashes(&expanded, split_idx, true);
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, true, false);
 
     assert_eq!(
         sashes,
@@ -368,7 +404,7 @@ fn only_top_section_expanded_has_sash_before_spacer() {
 fn all_folded_generates_no_sashes() {
     let expanded = vec![];
     let split_idx = 2;
-    let sashes = compute_sidebar_sashes(&expanded, split_idx, true);
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, true, false);
 
     assert_eq!(sashes, Vec::<SashSpec>::new());
 }
@@ -378,7 +414,7 @@ fn multiple_remote_machines_expanded_at_bottom() {
     // 场景：Local 折叠 (has_spacer = true)，远程机 A(2) 和 远程机 B(4) 展开，远程机(3) 折叠
     let expanded = vec![2, 4];
     let split_idx = 2;
-    let sashes = compute_sidebar_sashes(&expanded, split_idx, true);
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, true, false);
 
     // 远程机 A 顶部有向上扩大的独立 Sash (None, Some(2))
     // 远程机 A 与 远程机 B 之间有相互调节的 Sash (Some(2), Some(4))
@@ -404,7 +440,7 @@ fn multiple_remote_machines_and_archive_expanded_at_bottom() {
     // 场景：Local 折叠 (split_idx = 2)，nb-space-x(2)、staging-k8s(3)、archive(5) 展开
     let expanded = vec![2, 3, 5];
     let split_idx = 2;
-    let sashes = compute_sidebar_sashes(&expanded, split_idx, true);
+    let sashes = compute_sidebar_sashes(&expanded, split_idx, true, false);
 
     assert_eq!(
         sashes,
