@@ -1,6 +1,6 @@
 use crate::session_list::{
-    SashSpec, SectionKind, SectionLayoutSpec, compute_sidebar_sashes, select_flex_master_indices,
-    sidebar_bottom_sections_start_index,
+    SashSpec, SectionFlexPolicy, SectionKind, SectionLayoutSpec, compute_section_flex_policy,
+    compute_sidebar_sashes, select_flex_master_indices, sidebar_bottom_sections_start_index,
 };
 use crate::RuntimeKey;
 
@@ -425,4 +425,100 @@ fn multiple_remote_machines_and_archive_expanded_at_bottom() {
             },
         ]
     );
+}
+
+#[test]
+fn section_flex_policy_conversations_is_locked_to_prevent_header_jump() {
+    // 对话栏目无论何时都保持确定高度，禁止 flex_shrink，保证下方本机 Header 坐标绝不上下跳动
+    let policy = compute_section_flex_policy(
+        0,
+        2,
+        &SectionKind::Conversations,
+        false,
+        false,
+        0.0,
+        1.0,
+        60.0,
+    );
+    assert_eq!(policy, SectionFlexPolicy::LockedHeight { h: 60.0 });
+}
+
+#[test]
+fn section_flex_policy_local_custom_height_yields_space_for_bottom_dock() {
+    // 本机在用户拖拽定高后（ix = 1 < split_idx = 2），不是 master，但必须为 TopWorkspaceYielding
+    // 限制最大高度为设定值（禁止随意撑大），但允许 flex_shrink，在底部远程机或归档展开时向上让出空间
+    let policy = compute_section_flex_policy(
+        1,
+        2,
+        &SectionKind::Runtime(RuntimeKey::Local),
+        false,
+        false,
+        0.0,
+        1.0,
+        500.0,
+    );
+    assert_eq!(
+        policy,
+        SectionFlexPolicy::TopWorkspaceYielding { max_h: 500.0 }
+    );
+}
+
+#[test]
+fn section_flex_policy_local_master_fills_and_shrinks() {
+    // 本机未定高时作为 master，撑满剩余空间并将下方贴底，展开底部板块时也能响应式缩减
+    let policy = compute_section_flex_policy(
+        1,
+        2,
+        &SectionKind::Runtime(RuntimeKey::Local),
+        false,
+        true,
+        1.0,
+        1.0,
+        400.0,
+    );
+    assert_eq!(policy, SectionFlexPolicy::Master { grow_weight: 1.0 });
+}
+
+#[test]
+fn section_flex_policy_bottom_dock_sections_are_locked_to_grow_upwards() {
+    // 远程机器（ix = 2 >= split_idx = 2）展开时必须锁定高度，由上方 Spacer 或本机让出空间，沿底部向上生长
+    let remote_policy = compute_section_flex_policy(
+        2,
+        2,
+        &SectionKind::Runtime(RuntimeKey::Remote("r1".to_string())),
+        false,
+        false,
+        0.0,
+        1.0,
+        150.0,
+    );
+    assert_eq!(remote_policy, SectionFlexPolicy::LockedHeight { h: 150.0 });
+
+    // 归档（ix = 3 >= split_idx = 2）展开时同样锁定高度，向上生长且贴底吸附
+    let archive_policy = compute_section_flex_policy(
+        3,
+        2,
+        &SectionKind::Archive,
+        false,
+        false,
+        0.0,
+        1.0,
+        120.0,
+    );
+    assert_eq!(archive_policy, SectionFlexPolicy::LockedHeight { h: 120.0 });
+}
+
+#[test]
+fn section_flex_policy_compact_empty_is_compact() {
+    let policy = compute_section_flex_policy(
+        1,
+        2,
+        &SectionKind::Runtime(RuntimeKey::Local),
+        true,
+        false,
+        0.0,
+        1.0,
+        28.0,
+    );
+    assert_eq!(policy, SectionFlexPolicy::CompactEmpty);
 }

@@ -477,6 +477,49 @@ pub(crate) struct SectionLayoutSpec {
     pub max_cap: f32,
 }
 
+/// 板块内容主体（Body）的弹性与高度分配策略。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SectionFlexPolicy {
+    /// 紧凑空板块：固定 28px 高度，禁止伸缩。
+    CompactEmpty,
+    /// 弹性主项：根据可用视口空间弹性撑满 (`flex_grow`)，并将下方停靠区板块平滑推到底部贴底。
+    Master { grow_weight: f32 },
+    /// 顶部工作区定高机器（如手动拖拽调整高度后的本机）：
+    /// 基准与最大高度锁定为设定值（禁止 flex_grow 随意撑大），但允许 flex_shrink_1。
+    /// 当底部停靠区（远程机器、归档）展开需要空间且中间 Spacer 耗尽时，本机向下让出空间（内容通过内部滚动条浏览），
+    /// 使底部板块沿底端向上生长，绝不被挤出屏幕。
+    TopWorkspaceYielding { max_h: f32 },
+    /// 锁定高度项（对话 Conversations、底部远程机器与归档）：
+    /// 1. 对话板块：位于最顶端，严格禁止 flex_shrink 挤压，保证下方本机 Header 坐标恒定，折叠/展开本机时头部绝不上下跳动；
+    /// 2. 底部停靠区（远程机器与归档）：基于真实内容或设定高度展示，由中间 Spacer 或上方本机让出空间，
+    ///    确保展开时沿底部向上生长，闭合时吸附贴底。
+    LockedHeight { h: f32 },
+}
+
+/// 根据板块特征与所处分界位置判定其 Body 的弹性策略。
+pub(crate) fn compute_section_flex_policy(
+    ix: usize,
+    split_idx: usize,
+    kind: &SectionKind,
+    is_compact_empty: bool,
+    is_master: bool,
+    master_weight: f32,
+    progress: f32,
+    cur_h: f32,
+) -> SectionFlexPolicy {
+    if is_compact_empty {
+        SectionFlexPolicy::CompactEmpty
+    } else if is_master {
+        SectionFlexPolicy::Master {
+            grow_weight: master_weight * progress,
+        }
+    } else if ix < split_idx && matches!(kind, SectionKind::Runtime(_)) {
+        SectionFlexPolicy::TopWorkspaceYielding { max_h: cur_h }
+    } else {
+        SectionFlexPolicy::LockedHeight { h: cur_h }
+    }
+}
+
 /// 判定展开板块中哪些作为弹性主项（flex_master）。
 ///
 /// 规则：
@@ -2813,7 +2856,7 @@ impl Workspace {
             for (ix, section) in sections.into_iter().enumerate() {
                 let UnifiedSection {
                     id,
-                    kind: _,
+                    kind,
                     header,
                     body,
                     scroll,
@@ -2868,23 +2911,49 @@ impl Workspace {
                     let cur_h = (base_h * progress).max(0.0);
                     let min_h_val = (SECTION_MIN_BODY * progress).min(cur_h);
 
-                    let should_mount_child = if is_compact_empty {
-                        body_elem = body_elem.flex_none().h(px(cur_h));
-                        cur_h > 1.0
-                    } else if is_master {
-                        body_elem = body_elem
-                            .flex_grow(master_weight * progress)
-                            .flex_shrink_1()
-                            .flex_basis(px(cur_h))
-                            .min_h(px(min_h_val));
-                        cur_h > 1.0
-                    } else {
-                        // 非弹性主项（自适应内容高度或用户手动定高）保持确定高度，禁止 flex_shrink 挤压；
-                        // 避免因其他板块展开导致上方板块高度被压缩、下方板块 Header 产生上下跳动。
-                        body_elem = body_elem
-                            .flex_none()
-                            .h(px(cur_h));
-                        cur_h > 1.0
+                    let policy = compute_section_flex_policy(
+                        ix,
+                        split_idx,
+                        &kind,
+                        is_compact_empty,
+                        is_master,
+                        master_weight,
+                        progress,
+                        cur_h,
+                    );
+
+                    let should_mount_child = match policy {
+                        SectionFlexPolicy::CompactEmpty => {
+                            body_elem = body_elem.flex_none().h(px(cur_h));
+                            cur_h > 1.0
+                        }
+                        SectionFlexPolicy::Master { grow_weight } => {
+                            body_elem = body_elem
+                                .flex_grow(grow_weight)
+                                .flex_shrink_1()
+                                .flex_basis(px(cur_h))
+                                .min_h(px(min_h_val));
+                            cur_h > 1.0
+                        }
+                        SectionFlexPolicy::TopWorkspaceYielding { max_h } => {
+                            // 顶部工作区定高机器（如手动拖拽定高后的本机）：
+                            // 1. 严格锁定最大高度为设定值，禁止随意 flex_grow 撑大，保持定高展示；
+                            // 2. 允许 flex_shrink_1：当底部停靠区（远程机、归档）展开需要空间且 Spacer 耗尽时，
+                            //    本机向下让出空间（内容通过内部滚动条浏览），使底部板块沿底端向上生长，绝不被挤出屏幕！
+                            body_elem = body_elem
+                                .flex_shrink_1()
+                                .flex_basis(px(cur_h))
+                                .max_h(px(max_h))
+                                .min_h(px(min_h_val));
+                            cur_h > 1.0
+                        }
+                        SectionFlexPolicy::LockedHeight { h } => {
+                            // 对话（Conversations）和底部停靠区（远程机与归档）：
+                            // 对话保持绝对锁定不挤压，避免下方本机 Header 跳动；
+                            // 底部停靠区保持内容高度，由上方 Spacer 或本机向下让出空间，沿底端向上生长。
+                            body_elem = body_elem.flex_none().h(px(h));
+                            cur_h > 1.0
+                        }
                     };
 
                     if should_mount_child {
