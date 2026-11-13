@@ -2879,11 +2879,11 @@ impl Workspace {
                             .min_h(px(min_h_val));
                         cur_h > 1.0
                     } else {
+                        // 非弹性主项（自适应内容高度或用户手动定高）保持确定高度，禁止 flex_shrink 挤压；
+                        // 避免因其他板块展开导致上方板块高度被压缩、下方板块 Header 产生上下跳动。
                         body_elem = body_elem
-                            .flex_shrink_1()
-                            .flex_basis(px(cur_h))
-                            .max_h(px(cur_h))
-                            .min_h(px(min_h_val));
+                            .flex_none()
+                            .h(px(cur_h));
                         cur_h > 1.0
                     };
 
