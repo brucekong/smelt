@@ -32,6 +32,7 @@ pub(super) fn organization_menu(
     )
     .item(
         PopupMenuItem::new("归档")
+            .icon(Icon::new(gpui_kit_assets::IconName::Archive))
             .disabled(!archivable)
             .on_click(move |_, _, cx| {
                 workspace.update(cx, |ws, cx| ws.request_archive_conversation_ui(ui_id, cx));
@@ -341,18 +342,22 @@ impl Workspace {
                     let delete_key = menu_key.clone();
                     let delete_id = menu_id.clone();
                     let delete_title = menu_title.clone();
-                    menu.item(PopupMenuItem::new("恢复").on_click(move |_, _, cx| {
-                        e_restore.update(cx, |ws, cx| {
-                            ws.request_conversation_op(
-                                &restore_key,
-                                ConversationOp::Archive {
-                                    id: restore_id.clone(),
-                                    archived: false,
-                                },
-                                cx,
-                            )
-                        });
-                    }))
+                    menu.item(
+                        PopupMenuItem::new("恢复")
+                            .icon(Icon::new(gpui_kit_assets::IconName::RotateCw))
+                            .on_click(move |_, _, cx| {
+                                e_restore.update(cx, |ws, cx| {
+                                    ws.request_conversation_op(
+                                        &restore_key,
+                                        ConversationOp::Archive {
+                                            id: restore_id.clone(),
+                                            archived: false,
+                                        },
+                                        cx,
+                                    )
+                                });
+                            }),
+                    )
                     .item(
                         PopupMenuItem::new("永久删除")
                             .icon(smelt_ui::trash_icon())
