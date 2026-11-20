@@ -1196,8 +1196,8 @@ fn merge_project_order<T: PartialEq + Clone>(stored: &[T], shown: Vec<T>) -> Vec
     out
 }
 
-/// 置顶状态改了之后，把 `item` 挪到组里置顶区和其余之间的交界：新置顶的排在置顶区最后，
-/// 取消置顶的排在其余的最前。不挪的话它会落在按原顺序算出的位置，点完要满屏找。
+/// 置顶状态改了之后，把 `item` 挪到合适位置：新置顶的排在置顶区最前（置顶到最上面），
+/// 取消置顶的排在其余的最后（移出置顶范围）。
 /// `order` 是组里眼下从上到下的顺序，`pinned` 是改过之后的置顶判断。
 fn move_to_pin_boundary<T: PartialEq + Clone>(
     order: &[T],
@@ -1206,11 +1206,18 @@ fn move_to_pin_boundary<T: PartialEq + Clone>(
 ) -> Vec<T> {
     let rest: Vec<&T> = order.iter().filter(|id| *id != item).collect();
     let (head, tail): (Vec<&T>, Vec<&T>) = rest.into_iter().partition(|id| pinned(id));
-    head.into_iter()
-        .cloned()
-        .chain(std::iter::once(item.clone()))
-        .chain(tail.into_iter().cloned())
-        .collect()
+    if pinned(item) {
+        std::iter::once(item.clone())
+            .chain(head.into_iter().cloned())
+            .chain(tail.into_iter().cloned())
+            .collect()
+    } else {
+        head.into_iter()
+            .cloned()
+            .chain(tail.into_iter().cloned())
+            .chain(std::iter::once(item.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1295,17 +1302,24 @@ mod tests {
     #[test]
     fn pinning_lands_on_the_boundary() {
         let order = strings(&["p1", "p2", "a", "b", "c"]);
-        // 置顶 c：排在 p1、p2 之后。
+        // 置顶 c：置顶到最上面。
         let pinned = |id: &String| matches!(id.as_str(), "p1" | "p2" | "c");
         assert_eq!(
             move_to_pin_boundary(&order, &"c".to_string(), pinned),
-            strings(&["p1", "p2", "c", "a", "b"])
+            strings(&["c", "p1", "p2", "a", "b"])
         );
-        // 取消置顶 p1：排在其余的最前。
+        // 取消置顶 p1：移出置顶范围，排在未置顶的最后。
         let pinned = |id: &String| id == "p2";
         assert_eq!(
             move_to_pin_boundary(&order, &"p1".to_string(), pinned),
-            strings(&["p2", "p1", "a", "b", "c"])
+            strings(&["p2", "a", "b", "c", "p1"])
+        );
+
+        // 仅有一项置顶时取消置顶：移出置顶范围（不会留在第 0 位）。
+        let order = strings(&["p", "a", "b"]);
+        assert_eq!(
+            move_to_pin_boundary(&order, &"p".to_string(), |_| false),
+            strings(&["a", "b", "p"])
         );
     }
 

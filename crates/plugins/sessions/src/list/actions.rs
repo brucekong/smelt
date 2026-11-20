@@ -34,7 +34,7 @@ fn project_pin(key: &ProjectKey) -> Pin {
     }
 }
 
-/// 置顶或取消置顶一个项目，并把它挪到置顶区和其余的交界（见 [`move_to_pin_boundary`]）。
+/// 置顶或取消置顶一个项目。新置顶的排在最前（置顶到最上面），取消置顶的排在最后（移出置顶范围）。
 /// 置顶区不分机器：所有机器的项目排在一份列表里。
 pub(super) fn pin_project(machine: &RuntimeKey, root: &str, pinned: bool, cx: &mut App) {
     let item = ProjectKey {
@@ -60,7 +60,7 @@ pub(super) fn pin_project(machine: &RuntimeKey, root: &str, pinned: bool, cx: &m
     });
 }
 
-/// 置顶或取消置顶一段会话。项目里的会话同样挪到交界；「对话」一段按最近动静排，不记手动
+/// 置顶或取消置顶一段会话。项目里的会话新置顶的排在最前，取消置顶的排在最后；「对话」一段按最近动静排，不记手动
 /// 顺序，只改置顶。
 pub(super) fn pin_session(key: &ConversationKey, group: &GroupKey, pinned: bool, cx: &mut App) {
     let sessions = Sessions::global(cx);
