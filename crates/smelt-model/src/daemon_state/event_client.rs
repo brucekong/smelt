@@ -182,32 +182,33 @@ impl ReplacementRevisions {
 pub struct SubscriptionShape {
     /// 运行时的工作区目录（开着的项目和对话）。
     pub workspace: bool,
+    /// 自动化投影。桌面不在核心订阅里收：自动化插件单独订 `automations.changed`。
     pub automations: bool,
-    /// 冷恢复的对话启动规格只在桌面端手里，唤醒请求只能由它兑现。
+    /// 有人要看一段没在跑的对话时，请订阅方把它拉起来。眼下没有一方兑现（桌面不再兑现，
+    /// 运行时自己拉起另做），谁都不订。
     pub conversation_wake: bool,
     /// 外观归桌面端，CLI 发来的外观改动由它来改。
     pub appearance_requests: bool,
     /// 关注的项目里文件变了：重取 git 状态和文件树。
     pub project_changes: bool,
-    /// 关注的智能体的记忆目录里文件变了：记忆页开着就重取。
-    pub agent_memory_changes: bool,
     /// 终端程序发的 OSC 通知，运行时扫好再推过来，桌面不再自己扫字节流。
     pub terminal_notifications: bool,
-    /// 终端程序用 OSC 9;4 报的进度，侧栏画进度条。
+    /// 终端程序用 OSC 9;4 报的进度。眼下桌面没有画它的地方，不订。
     pub terminal_progress: bool,
 }
 
 impl SubscriptionShape {
-    /// 桌面端：全收，并承担唤醒对话、改外观这些只有它能兑现的请求。
+    /// 桌面端：宿主自己要的都收，并承担改外观这种只有它能兑现的请求。自动化投影、智能体
+    /// 记忆变化归插件，单独订阅。不订唤醒请求：桌面不再兑现，订了运行时会以为冷对话拉得
+    /// 起来，让手机干等到超时。
     pub const DESKTOP: Self = Self {
         workspace: true,
-        automations: true,
-        conversation_wake: true,
+        automations: false,
+        conversation_wake: false,
         appearance_requests: true,
         project_changes: true,
-        agent_memory_changes: true,
         terminal_notifications: true,
-        terminal_progress: true,
+        terminal_progress: false,
     };
 
     /// 只看目录（手机）：会话状态、远程目录、工作区目录和自动化投影。不订唤醒请求和外观
@@ -219,7 +220,6 @@ impl SubscriptionShape {
         conversation_wake: false,
         appearance_requests: false,
         project_changes: false,
-        agent_memory_changes: false,
         terminal_notifications: false,
         terminal_progress: false,
     };
@@ -240,10 +240,6 @@ impl SubscriptionShape {
                 CORE_TOPIC_APPEARANCE_CHANGE_REQUESTED,
             ),
             (self.project_changes, CORE_TOPIC_PROJECT_CHANGED),
-            (
-                self.agent_memory_changes,
-                smelt_event_protocol::CORE_TOPIC_AGENT_MEMORY_CHANGED,
-            ),
             (
                 self.terminal_notifications,
                 CORE_TOPIC_TERMINAL_NOTIFICATION,
@@ -502,15 +498,6 @@ impl DaemonStateEventClient {
                     root: changed.root,
                 }))
             }
-            smelt_event_protocol::CORE_TOPIC_AGENT_MEMORY_CHANGED
-                if self.shape.agent_memory_changes =>
-            {
-                let changed: smelt_event_protocol::AgentMemoryChanged =
-                    decode_payload(payload, topic)?;
-                Ok(Some(DaemonStateEvent::AgentMemoryChanged {
-                    agent_id: changed.agent_id,
-                }))
-            }
             CORE_TOPIC_TERMINAL_NOTIFICATION if self.shape.terminal_notifications => {
                 let notification: smelt_event_protocol::TerminalNotification =
                     decode_payload(payload, topic)?;
@@ -675,6 +662,13 @@ fn decode_projection_event<T: serde::de::DeserializeOwned>(
     decode_payload(projection.data, label)
 }
 
+/// 线上的会话状态转成客户端的。运行时自己算提醒时也用这一份，和各端读到的相位、摘要一致。
+impl From<SessionStateChanged> for DaemonSessionState {
+    fn from(state: SessionStateChanged) -> Self {
+        daemon_session_state(state)
+    }
+}
+
 fn daemon_session_state(state: SessionStateChanged) -> DaemonSessionState {
     DaemonSessionState {
         id: state.session_id,
@@ -693,12 +687,17 @@ fn daemon_session_state(state: SessionStateChanged) -> DaemonSessionState {
         },
         pending_question: state.pending_question,
         pending_request: state.pending_request,
+        pending_note: state.pending_note,
+        completed_delivery_id: state.completed_delivery_id,
         title: state.title,
+        conversation_name: state.conversation_name,
+        name: state.name,
         launch: state.launch,
         provider: state.provider,
         conversation_id: state.conversation_id,
         custom_title: state.custom_title,
         cwd: state.cwd,
+        branch: state.branch,
         phase_since: state.phase_since_unix_seconds,
         turn_started_at: state.turn_started_at_unix_seconds,
         updated_at: state.updated_at_unix_seconds,
@@ -740,11 +739,15 @@ mod tests {
             conversation_id: Some(format!("conv-{id}")),
             custom_title: None,
             title: Some(id.to_string()),
+            conversation_name: None,
+            name: None,
             phase: CoreSessionPhase::Thinking,
             phase_since_unix_seconds: 10,
             turn_started_at_unix_seconds: 10,
             pending_question: None,
             pending_request: None,
+            pending_note: None,
+            completed_delivery_id: None,
             tokens_used: None,
             branch: None,
             dirty_files: Vec::new(),
@@ -814,16 +817,24 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        for kind in [CORE_SNAPSHOT_WORKSPACE, CORE_SNAPSHOT_AUTOMATIONS] {
+        let kinds = [
+            (client.shape.workspace, CORE_SNAPSHOT_WORKSPACE),
+            (client.shape.automations, CORE_SNAPSHOT_AUTOMATIONS),
+        ]
+        .into_iter()
+        .filter_map(|(wanted, kind)| wanted.then_some(kind))
+        .collect::<Vec<_>>();
+        let (last, rest) = kinds.split_last().expect("测试用的形状至少订一份投影");
+        for kind in rest {
             let event = client
                 .decode_message(projection_snapshot(kind, 0, serde_json::Value::Null))
                 .unwrap();
-            if kind == CORE_SNAPSHOT_AUTOMATIONS {
-                return event.expect("last expected snapshot completes the batch");
-            }
             assert!(event.is_none());
         }
-        unreachable!()
+        client
+            .decode_message(projection_snapshot(last, 0, serde_json::Value::Null))
+            .unwrap()
+            .expect("last expected snapshot completes the batch")
     }
 
     #[test]
@@ -891,7 +902,7 @@ mod tests {
         let topics = line["request"]["subscription"]["topics"]
             .as_array()
             .unwrap();
-        assert_eq!(topics.len(), 10);
+        assert_eq!(topics.len(), 6);
         assert!(
             topics
                 .iter()
@@ -901,13 +912,15 @@ mod tests {
         assert!(
             topics
                 .iter()
-                .any(|topic| topic == CORE_TOPIC_AUTOMATIONS_CHANGED)
+                .all(|topic| topic != CORE_TOPIC_AUTOMATIONS_CHANGED
+                    && topic != smelt_event_protocol::CORE_TOPIC_AGENT_MEMORY_CHANGED),
+            "自动化投影、记忆变化归插件单独订，核心订阅不收"
         );
         assert!(
             topics
                 .iter()
-                .any(|topic| topic == CORE_TOPIC_CONVERSATION_WAKE_REQUESTED),
-            "桌面端是冷恢复对话的唯一启动方，必须接唤醒请求"
+                .all(|topic| topic != CORE_TOPIC_CONVERSATION_WAKE_REQUESTED),
+            "桌面不兑现唤醒请求，订了运行时会以为冷对话拉得起来"
         );
         assert!(
             topics
@@ -1111,6 +1124,15 @@ mod tests {
         ));
     }
 
+    /// 分支名由运行时维护在会话状态里，侧栏直接读它。
+    #[test]
+    fn session_state_carries_the_branch() {
+        let mut dto = session_dto("a", 1, 1);
+        dto.branch = Some("feat/x".to_string());
+        assert_eq!(daemon_session_state(dto).branch.as_deref(), Some("feat/x"));
+        assert_eq!(daemon_session_state(session_dto("b", 1, 1)).branch, None);
+    }
+
     #[test]
     fn formal_messages_map_snapshot_events_and_revisions() {
         let mut legacy_value = serde_json::to_value(session_dto("legacy", 1, 1)).unwrap();
@@ -1121,7 +1143,7 @@ mod tests {
             "v1 daemon 没有 provider 时必须可读取"
         );
 
-        let mut client = desktop_client();
+        let mut client = DaemonStateEventClient::new(SubscriptionShape::CATALOG);
         let event = complete_snapshot(&mut client, 7, vec![session_dto("session-1", 3, 4)]);
         assert!(matches!(
             event,
@@ -1167,43 +1189,22 @@ mod tests {
     }
 
     #[test]
-    fn desktop_decodes_conversation_wake_requests() {
+    fn wake_subscribers_decode_conversation_wake_requests() {
         let wake = || {
             event_message(
                 CORE_TOPIC_CONVERSATION_WAKE_REQUESTED,
                 serde_json::json!({ "session_id": "acp-dormant" }),
             )
         };
-        let mut desktop = desktop_client();
+        let mut desktop = DaemonStateEventClient::new(SubscriptionShape {
+            conversation_wake: true,
+            ..SubscriptionShape::DESKTOP
+        });
         let _ = complete_snapshot(&mut desktop, 7, vec![]);
         assert!(matches!(
             desktop.decode_message(wake()).unwrap(),
             Some(DaemonStateEvent::ConversationWakeRequested { session_id })
                 if session_id == "acp-dormant"
-        ));
-    }
-
-    #[test]
-    fn desktop_decodes_agent_memory_changes() {
-        let mut desktop = desktop_client();
-        let _ = complete_snapshot(&mut desktop, 7, vec![]);
-        assert!(matches!(
-            desktop
-                .decode_message(event_message(
-                    smelt_event_protocol::CORE_TOPIC_AGENT_MEMORY_CHANGED,
-                    serde_json::json!({ "agent_id": "writer" }),
-                ))
-                .unwrap(),
-            Some(DaemonStateEvent::AgentMemoryChanged { agent_id: Some(id) }) if id == "writer"
-        ));
-        assert!(matches!(
-            desktop
-                .decode_message(event_message(
-                    smelt_event_protocol::CORE_TOPIC_AGENT_MEMORY_CHANGED,
-                    serde_json::json!({ "agent_id": null }),
-                ))
-                .unwrap(),
-            Some(DaemonStateEvent::AgentMemoryChanged { agent_id: None })
         ));
     }
 
@@ -1234,8 +1235,11 @@ mod tests {
     }
 
     #[test]
-    fn desktop_decodes_terminal_progress() {
-        let mut desktop = desktop_client();
+    fn progress_subscribers_decode_terminal_progress() {
+        let mut desktop = DaemonStateEventClient::new(SubscriptionShape {
+            terminal_progress: true,
+            ..SubscriptionShape::DESKTOP
+        });
         let _ = complete_snapshot(&mut desktop, 7, vec![]);
         assert!(matches!(
             desktop
@@ -1404,9 +1408,9 @@ mod tests {
     }
 
     #[test]
-    fn desktop_snapshot_batch_delivers_automation_file() {
+    fn catalog_snapshot_batch_delivers_automation_file() {
         let file = automation_file(1440, "store-a");
-        let mut client = desktop_client();
+        let mut client = DaemonStateEventClient::new(SubscriptionShape::CATALOG);
         assert!(
             client
                 .decode_message(sessions_snapshot(1, vec![session_dto("s1", 1, 1)]))
@@ -1444,7 +1448,7 @@ mod tests {
 
     #[test]
     fn automations_events_are_not_dropped_during_incomplete_snapshot_batch() {
-        let mut client = desktop_client();
+        let mut client = DaemonStateEventClient::new(SubscriptionShape::CATALOG);
         assert!(
             client
                 .decode_message(sessions_snapshot(1, vec![session_dto("s1", 1, 1)]))
@@ -1463,7 +1467,7 @@ mod tests {
 
     #[test]
     fn standalone_automations_snapshot_after_batch_is_an_incremental_event() {
-        let mut client = desktop_client();
+        let mut client = DaemonStateEventClient::new(SubscriptionShape::CATALOG);
         let _ = complete_snapshot(&mut client, 1, vec![session_dto("s1", 1, 1)]);
         let file = automation_file(20, "store-c");
         match client
@@ -1484,6 +1488,8 @@ mod tests {
             epoch: "e".to_string(),
             revision,
             projects: vec!["/workspace".to_string()],
+            repositories: Vec::new(),
+            worksets: Vec::new(),
             conversations: Vec::new(),
         }
     }

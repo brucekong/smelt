@@ -198,27 +198,13 @@ fi
 if [[ -d "$ROOT/target/smelt-agent/skills" ]]; then
   cp -R "$ROOT/target/smelt-agent/skills" "$PI_DIR/skills"
 fi
-# 插件（gpui-shell 脚本应用，见 crates/smelt/src/plugins）：整目录随 App
-# 分发，GUI 从这里只读加载（发布版关掉了 gpui-shell 加载时写编辑器文件的行为，
-# 不会写进已签名的 .app）。
-PLUGINS="$RES/plugins"
-for dir in "$ROOT"/plugins/*/; do
-  # 没有清单的子目录不是插件。
-  [[ -f "${dir}gpui-shell.json" ]] || continue
-  target="$PLUGINS/$(basename "$dir")"
-  mkdir -p "$target"
-  for file in "$dir"*; do
-    case "$(basename "$file")" in
-      # gpui-shell 生成给编辑器用的文件，不是插件内容。
-      gpui-kit.d.ts|jsconfig.json) continue ;;
-      # 测试和它用的宿主模块替身，只在仓库里跑。
-      tests) continue ;;
-    esac
-    cp -R "$file" "$target/"
-  done
-  echo "  … 打包插件：$(basename "$dir")"
-done
-
+# LICENSE、NOTICE、THIRD_PARTY_LICENSES.txt 放 Resources 根。对外分发（CI 发版）必须带，
+# 缺 cargo-about 直接失败；本机 make install 只是自用，没装就跳过。
+if [[ -n "${CI:-}" ]] || command -v cargo-about >/dev/null; then
+  "$ROOT/scripts/third-party-licenses.sh" "$RES"
+else
+  echo "⚠ 没装 cargo-about，App 里不带第三方许可证清单；自用可以，对外分发不行（cargo install cargo-about --locked）" >&2
+fi
 # 可选：把当前包在 GitHub Release 上的更新包地址写进 App（release.yml 按 tag 拼好传进来），
 # 刚装好的包才不会把自己当成新版本再下一遍。updater 认这个地址优先于用户状态里记的。
 # 本地打包不设；这时 updater 退回用成功自更新后写入用户状态的 URL。
@@ -260,17 +246,6 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<string>macosx</string>
 	<key>DTPlatformName</key>
 	<string>macosx</string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleURLName</key>
-			<string>${BUNDLE_ID}.file</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>smelt-file</string>
-			</array>
-		</dict>
-	</array>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<key>NSLocalNetworkUsageDescription</key>
@@ -334,6 +309,12 @@ elif [[ "$IDENTITY" == "Smelt Local Signing" ]] \
   && security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
   # 自签名没有系统信任链，find-identity 可能不列出，但 codesign 仍能用导入的私钥。
   IDENTITY_FOUND=true
+elif [[ "$IDENTITY" =~ ^[0-9A-Fa-f]{40}$ ]] \
+  && security find-certificate -a -c "Smelt Local Signing" -Z 2>/dev/null \
+    | grep -Fqi "SHA-1 hash: $IDENTITY"; then
+  # 自签名证书可能因没有信任链而不出现在 find-identity；按指纹可绕过同名证书歧义。
+  IDENTITY_FOUND=true
+  IDENTITY_NAME="Smelt Local Signing"
 fi
 if [[ "$IDENTITY_FOUND" != true ]]; then
   if [[ "$IDENTITY" == "Developer ID Application"* ]]; then

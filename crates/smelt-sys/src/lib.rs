@@ -6,6 +6,7 @@ pub mod block_on;
 pub mod daemon_image;
 pub mod fd_limit;
 pub mod file_lock;
+pub mod managed_bin;
 #[cfg(windows)]
 pub mod named_pipe;
 pub mod process;
@@ -189,7 +190,7 @@ pub fn set_modified(path: &std::path::Path, when: std::time::SystemTime) -> std:
         let _ = (path, when);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "这个平台不能改修改时间",
+            "can't change modification times on this platform",
         ))
     }
 }

@@ -181,6 +181,7 @@ abstract class RustLibApi extends BaseApi {
   Future<String> crateApiCatalogCreateSession({
     required String runtimeId,
     required String projectRoot,
+    String? worksetId,
     String? agentOptionId,
     String? launchKey,
     String? resumeId,
@@ -1202,6 +1203,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Future<String> crateApiCatalogCreateSession({
     required String runtimeId,
     required String projectRoot,
+    String? worksetId,
     String? agentOptionId,
     String? launchKey,
     String? resumeId,
@@ -1214,6 +1216,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(runtimeId, serializer);
           sse_encode_String(projectRoot, serializer);
+          sse_encode_opt_String(worksetId, serializer);
           sse_encode_opt_String(agentOptionId, serializer);
           sse_encode_opt_String(launchKey, serializer);
           sse_encode_opt_String(resumeId, serializer);
@@ -1234,6 +1237,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         argValues: [
           runtimeId,
           projectRoot,
+          worksetId,
           agentOptionId,
           launchKey,
           resumeId,
@@ -1251,6 +1255,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         argNames: [
           "runtimeId",
           "projectRoot",
+          "worksetId",
           "agentOptionId",
           "launchKey",
           "resumeId",
@@ -3261,6 +3266,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  AskAnswerView dco_decode_ask_answer_view(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return AskAnswerView(
+      question: dco_decode_String(arr[0]),
+      answer: dco_decode_list_String(arr[1]),
+    );
+  }
+
+  @protected
+  AskOutcome dco_decode_ask_outcome(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return AskOutcome.values[raw as int];
+  }
+
+  @protected
+  AskView dco_decode_ask_view(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return AskView(
+      outcome: dco_decode_ask_outcome(arr[0]),
+      answers: dco_decode_list_ask_answer_view(arr[1]),
+    );
+  }
+
+  @protected
   AttentionItem dco_decode_attention_item(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -3462,6 +3497,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   AgentDraft dco_decode_box_autoadd_agent_draft(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_agent_draft(raw);
+  }
+
+  @protected
+  AskView dco_decode_box_autoadd_ask_view(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_ask_view(raw);
   }
 
   @protected
@@ -3721,8 +3762,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ConversationEntry dco_decode_conversation_entry(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 7)
-      throw Exception('unexpected arr length: expect 7 but see ${arr.length}');
+    if (arr.length != 8)
+      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
     return ConversationEntry(
       index: dco_decode_i_64(arr[0]),
       kind: dco_decode_entry_kind(arr[1]),
@@ -3731,6 +3772,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       images: dco_decode_list_conversation_image(arr[4]),
       toolCall: dco_decode_opt_box_autoadd_tool_call_view(arr[5]),
       taskNote: dco_decode_opt_box_autoadd_task_note_view(arr[6]),
+      ask: dco_decode_opt_box_autoadd_ask_view(arr[7]),
     );
   }
 
@@ -3961,7 +4003,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       required_: dco_decode_bool(arr[2]),
       allowCustomInput: dco_decode_bool(arr[3]),
       kind: dco_decode_elicitation_field_kind(arr[4]),
-      options: dco_decode_list_String(arr[5]),
+      options: dco_decode_list_elicitation_option(arr[5]),
       secret: dco_decode_bool(arr[6]),
       url: dco_decode_opt_String(arr[7]),
       chosen: dco_decode_list_prim_u_32_strict(arr[8]),
@@ -3973,6 +4015,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ElicitationFieldKind dco_decode_elicitation_field_kind(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return ElicitationFieldKind.values[raw as int];
+  }
+
+  @protected
+  ElicitationOption dco_decode_elicitation_option(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return ElicitationOption(
+      label: dco_decode_String(arr[0]),
+      description: dco_decode_opt_String(arr[1]),
+    );
   }
 
   @protected
@@ -4252,6 +4306,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<AskAnswerView> dco_decode_list_ask_answer_view(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_ask_answer_view).toList();
+  }
+
+  @protected
   List<AutomationAgentChoice> dco_decode_list_automation_agent_choice(
     dynamic raw,
   ) {
@@ -4339,6 +4399,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   List<ElicitationField> dco_decode_list_elicitation_field(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return (raw as List<dynamic>).map(dco_decode_elicitation_field).toList();
+  }
+
+  @protected
+  List<ElicitationOption> dco_decode_list_elicitation_option(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_elicitation_option).toList();
   }
 
   @protected
@@ -4524,6 +4590,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<WorkspaceWorksetChoice> dco_decode_list_workspace_workset_choice(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>)
+        .map(dco_decode_workspace_workset_choice)
+        .toList();
+  }
+
+  @protected
   McpOption dco_decode_mcp_option(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -4660,6 +4736,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         : dco_decode_box_autoadd_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTextDocument(
             raw,
           );
+  }
+
+  @protected
+  AskView? dco_decode_opt_box_autoadd_ask_view(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_ask_view(raw);
   }
 
   @protected
@@ -5156,8 +5238,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   SessionSummary dco_decode_session_summary(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 18)
-      throw Exception('unexpected arr length: expect 18 but see ${arr.length}');
+    if (arr.length != 21)
+      throw Exception('unexpected arr length: expect 21 but see ${arr.length}');
     return SessionSummary(
       id: dco_decode_String(arr[0]),
       kind: dco_decode_session_kind(arr[1]),
@@ -5177,6 +5259,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       automation: dco_decode_opt_box_autoadd_automation_source(arr[15]),
       agentDefinitionId: dco_decode_opt_String(arr[16]),
       profileId: dco_decode_opt_String(arr[17]),
+      worksetId: dco_decode_opt_String(arr[18]),
+      worksetTask: dco_decode_opt_String(arr[19]),
+      worksetBranch: dco_decode_opt_String(arr[20]),
     );
   }
 
@@ -5396,12 +5481,26 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WorkspaceProject dco_decode_workspace_project(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 3)
-      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
     return WorkspaceProject(
       root: dco_decode_String(arr[0]),
       title: dco_decode_String(arr[1]),
       order: dco_decode_u_32(arr[2]),
+      worksets: dco_decode_list_workspace_workset_choice(arr[3]),
+    );
+  }
+
+  @protected
+  WorkspaceWorksetChoice dco_decode_workspace_workset_choice(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return WorkspaceWorksetChoice(
+      id: dco_decode_String(arr[0]),
+      task: dco_decode_String(arr[1]),
+      branch: dco_decode_String(arr[2]),
     );
   }
 
@@ -5629,6 +5728,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_i_32(deserializer);
     return ApprovalKind.values[inner];
+  }
+
+  @protected
+  AskAnswerView sse_decode_ask_answer_view(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_question = sse_decode_String(deserializer);
+    var var_answer = sse_decode_list_String(deserializer);
+    return AskAnswerView(question: var_question, answer: var_answer);
+  }
+
+  @protected
+  AskOutcome sse_decode_ask_outcome(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return AskOutcome.values[inner];
+  }
+
+  @protected
+  AskView sse_decode_ask_view(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_outcome = sse_decode_ask_outcome(deserializer);
+    var var_answers = sse_decode_list_ask_answer_view(deserializer);
+    return AskView(outcome: var_outcome, answers: var_answers);
   }
 
   @protected
@@ -5878,6 +6000,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   AgentDraft sse_decode_box_autoadd_agent_draft(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_agent_draft(deserializer));
+  }
+
+  @protected
+  AskView sse_decode_box_autoadd_ask_view(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_ask_view(deserializer));
   }
 
   @protected
@@ -6190,6 +6318,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_images = sse_decode_list_conversation_image(deserializer);
     var var_toolCall = sse_decode_opt_box_autoadd_tool_call_view(deserializer);
     var var_taskNote = sse_decode_opt_box_autoadd_task_note_view(deserializer);
+    var var_ask = sse_decode_opt_box_autoadd_ask_view(deserializer);
     return ConversationEntry(
       index: var_index,
       kind: var_kind,
@@ -6198,6 +6327,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       images: var_images,
       toolCall: var_toolCall,
       taskNote: var_taskNote,
+      ask: var_ask,
     );
   }
 
@@ -6452,7 +6582,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_required_ = sse_decode_bool(deserializer);
     var var_allowCustomInput = sse_decode_bool(deserializer);
     var var_kind = sse_decode_elicitation_field_kind(deserializer);
-    var var_options = sse_decode_list_String(deserializer);
+    var var_options = sse_decode_list_elicitation_option(deserializer);
     var var_secret = sse_decode_bool(deserializer);
     var var_url = sse_decode_opt_String(deserializer);
     var var_chosen = sse_decode_list_prim_u_32_strict(deserializer);
@@ -6478,6 +6608,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_i_32(deserializer);
     return ElicitationFieldKind.values[inner];
+  }
+
+  @protected
+  ElicitationOption sse_decode_elicitation_option(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_label = sse_decode_String(deserializer);
+    var var_description = sse_decode_opt_String(deserializer);
+    return ElicitationOption(label: var_label, description: var_description);
   }
 
   @protected
@@ -6750,6 +6890,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<AskAnswerView> sse_decode_list_ask_answer_view(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <AskAnswerView>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_ask_answer_view(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<AutomationAgentChoice> sse_decode_list_automation_agent_choice(
     SseDeserializer deserializer,
   ) {
@@ -6921,6 +7075,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var ans_ = <ElicitationField>[];
     for (var idx_ = 0; idx_ < len_; ++idx_) {
       ans_.add(sse_decode_elicitation_field(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<ElicitationOption> sse_decode_list_elicitation_option(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <ElicitationOption>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_elicitation_option(deserializer));
     }
     return ans_;
   }
@@ -7296,6 +7464,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<WorkspaceWorksetChoice> sse_decode_list_workspace_workset_choice(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <WorkspaceWorksetChoice>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_workspace_workset_choice(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   McpOption sse_decode_mcp_option(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_name = sse_decode_String(deserializer);
@@ -7441,6 +7623,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       return (sse_decode_box_autoadd_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerTextDocument(
         deserializer,
       ));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  AskView? sse_decode_opt_box_autoadd_ask_view(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_ask_view(deserializer));
     } else {
       return null;
     }
@@ -8163,6 +8356,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     );
     var var_agentDefinitionId = sse_decode_opt_String(deserializer);
     var var_profileId = sse_decode_opt_String(deserializer);
+    var var_worksetId = sse_decode_opt_String(deserializer);
+    var var_worksetTask = sse_decode_opt_String(deserializer);
+    var var_worksetBranch = sse_decode_opt_String(deserializer);
     return SessionSummary(
       id: var_id,
       kind: var_kind,
@@ -8182,6 +8378,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       automation: var_automation,
       agentDefinitionId: var_agentDefinitionId,
       profileId: var_profileId,
+      worksetId: var_worksetId,
+      worksetTask: var_worksetTask,
+      worksetBranch: var_worksetBranch,
     );
   }
 
@@ -8412,7 +8611,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_root = sse_decode_String(deserializer);
     var var_title = sse_decode_String(deserializer);
     var var_order = sse_decode_u_32(deserializer);
-    return WorkspaceProject(root: var_root, title: var_title, order: var_order);
+    var var_worksets = sse_decode_list_workspace_workset_choice(deserializer);
+    return WorkspaceProject(
+      root: var_root,
+      title: var_title,
+      order: var_order,
+      worksets: var_worksets,
+    );
+  }
+
+  @protected
+  WorkspaceWorksetChoice sse_decode_workspace_workset_choice(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_id = sse_decode_String(deserializer);
+    var var_task = sse_decode_String(deserializer);
+    var var_branch = sse_decode_String(deserializer);
+    return WorkspaceWorksetChoice(
+      id: var_id,
+      task: var_task,
+      branch: var_branch,
+    );
   }
 
   @protected
@@ -8646,6 +8866,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_ask_answer_view(
+    AskAnswerView self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.question, serializer);
+    sse_encode_list_String(self.answer, serializer);
+  }
+
+  @protected
+  void sse_encode_ask_outcome(AskOutcome self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_ask_view(AskView self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_ask_outcome(self.outcome, serializer);
+    sse_encode_list_ask_answer_view(self.answers, serializer);
+  }
+
+  @protected
   void sse_encode_attention_item(AttentionItem self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.sessionId, serializer);
@@ -8838,6 +9081,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_agent_draft(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_ask_view(AskView self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_ask_view(self, serializer);
   }
 
   @protected
@@ -9166,6 +9415,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_list_conversation_image(self.images, serializer);
     sse_encode_opt_box_autoadd_tool_call_view(self.toolCall, serializer);
     sse_encode_opt_box_autoadd_task_note_view(self.taskNote, serializer);
+    sse_encode_opt_box_autoadd_ask_view(self.ask, serializer);
   }
 
   @protected
@@ -9357,7 +9607,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self.required_, serializer);
     sse_encode_bool(self.allowCustomInput, serializer);
     sse_encode_elicitation_field_kind(self.kind, serializer);
-    sse_encode_list_String(self.options, serializer);
+    sse_encode_list_elicitation_option(self.options, serializer);
     sse_encode_bool(self.secret, serializer);
     sse_encode_opt_String(self.url, serializer);
     sse_encode_list_prim_u_32_strict(self.chosen, serializer);
@@ -9371,6 +9621,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_elicitation_option(
+    ElicitationOption self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.label, serializer);
+    sse_encode_opt_String(self.description, serializer);
   }
 
   @protected
@@ -9602,6 +9862,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_ask_answer_view(
+    List<AskAnswerView> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_ask_answer_view(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_automation_agent_choice(
     List<AutomationAgentChoice> self,
     SseSerializer serializer,
@@ -9754,6 +10026,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
       sse_encode_elicitation_field(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_elicitation_option(
+    List<ElicitationOption> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_elicitation_option(item, serializer);
     }
   }
 
@@ -10102,6 +10386,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_workspace_workset_choice(
+    List<WorkspaceWorksetChoice> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_workspace_workset_choice(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_mcp_option(McpOption self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.name, serializer);
@@ -10205,6 +10501,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         self,
         serializer,
       );
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_ask_view(
+    AskView? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_ask_view(self, serializer);
     }
   }
 
@@ -10860,6 +11169,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_box_autoadd_automation_source(self.automation, serializer);
     sse_encode_opt_String(self.agentDefinitionId, serializer);
     sse_encode_opt_String(self.profileId, serializer);
+    sse_encode_opt_String(self.worksetId, serializer);
+    sse_encode_opt_String(self.worksetTask, serializer);
+    sse_encode_opt_String(self.worksetBranch, serializer);
   }
 
   @protected
@@ -11047,6 +11359,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.root, serializer);
     sse_encode_String(self.title, serializer);
     sse_encode_u_32(self.order, serializer);
+    sse_encode_list_workspace_workset_choice(self.worksets, serializer);
+  }
+
+  @protected
+  void sse_encode_workspace_workset_choice(
+    WorkspaceWorksetChoice self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.id, serializer);
+    sse_encode_String(self.task, serializer);
+    sse_encode_String(self.branch, serializer);
   }
 }
 

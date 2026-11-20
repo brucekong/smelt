@@ -273,6 +273,64 @@ void main() {
       expect(backend.calls, contains('submit 0=main'));
       await tester.pump(const Duration(seconds: 9));
     });
+
+    testWidgets('选择题：选项带说明，能写自己的答案，点选项就作废写的字', (tester) async {
+      usePhone(tester);
+      final backend = RecordingBackend(manualWatch: true);
+      await tester.pumpWidget(host(startModel(backend), _page));
+      await tester.pump();
+      backend.watch.add(
+        snapshot(
+          view(
+            phase: ConversationPhase.waitingForUser,
+            elicitation: Elicitation(
+              message: 'Which plan?',
+              isReady: false,
+              fields: [
+                ElicitationField(
+                  key: 'q0',
+                  title: 'Which plan?',
+                  required_: true,
+                  allowCustomInput: true,
+                  kind: ElicitationFieldKind.select,
+                  options: const [
+                    ElicitationOption(
+                      label: 'Recommended',
+                      description: 'Fix both repos',
+                    ),
+                    ElicitationOption(label: 'Not now'),
+                  ],
+                  secret: false,
+                  chosen: Uint32List(0),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Which plan?'), findsOneWidget, reason: '只有一道题时题面不重复');
+      expect(find.text('Fix both repos'), findsOneWidget);
+
+      final other = find.widgetWithText(TextField, 'Other answer…');
+      await tester.enterText(other, 'staging');
+      await tester.pump();
+      await tester.tap(find.text('Not now'));
+      await tester.pumpAndSettle();
+      expect(backend.calls, contains('choose 0:1'));
+      expect(
+        tester.widget<TextField>(other).controller!.text,
+        isEmpty,
+        reason: '点了选项，写的字作废',
+      );
+
+      await tester.enterText(other, 'staging only');
+      await tester.pump();
+      await tester.tap(find.text('Send answer'));
+      await tester.pumpAndSettle();
+      expect(backend.calls, contains('submit 0=staging only'));
+      await tester.pump(const Duration(seconds: 9));
+    });
   });
 
   group('发送', () {
@@ -576,6 +634,47 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.text('reply-lang'), findsOneWidget);
+    });
+
+    testWidgets('关掉的记忆卡片和提示，退出对话再进来也不再弹出', (tester) async {
+      usePhone(tester);
+      final backend = RecordingBackend(manualWatch: true);
+      final model = startModel(backend);
+      final memory = ConversationMemoryChanges(
+        id: 5,
+        agentId: 'a1',
+        entries: const [
+          ConversationMemoryChange(
+            layer: MemoryLayer.agent,
+            fileName: 'reply-lang.md',
+            name: 'reply-lang',
+            description: 'about reply-lang',
+            created: true,
+            body: 'body',
+          ),
+        ],
+      );
+      const notice = ConversationNotice(id: 10, text: 'compaction failed');
+
+      await tester.pumpWidget(host(model, _page));
+      await tester.pump();
+      backend.watch.add(snapshot(view(memoryChanges: memory, notice: notice)));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Hide memory card'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Dismiss notice'));
+      await tester.pumpAndSettle();
+      expect(find.text('reply-lang'), findsNothing);
+      expect(find.text('compaction failed'), findsNothing);
+
+      // 离开对话页，再进来。
+      await tester.pumpWidget(host(model, const SizedBox()));
+      await tester.pumpWidget(host(model, _page));
+      await tester.pump();
+      backend.watch.add(snapshot(view(memoryChanges: memory, notice: notice)));
+      await tester.pumpAndSettle();
+      expect(find.text('reply-lang'), findsNothing);
+      expect(find.text('compaction failed'), findsNothing);
     });
 
     testWidgets('空闲时没有停止钮', (tester) async {

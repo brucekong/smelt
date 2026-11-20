@@ -1,37 +1,121 @@
 //! 能力库各表单、面板的状态类型。
 
 use super::*;
+use smelt_plugin_api::ui::kit::{TYPE, TypeStyled as _};
 
 #[derive(Clone)]
 pub struct PiModelEditor {
-    pub provider: Entity<gpui_component::input::InputState>,
-    pub model: Entity<gpui_component::input::InputState>,
-    pub base_url: Entity<gpui_component::input::InputState>,
-    pub api_key: Entity<gpui_component::input::InputState>,
+    pub provider: Entity<InputState>,
+    pub model: Entity<InputState>,
+    pub base_url: Entity<InputState>,
+    pub api_key: Entity<InputState>,
     pub thinking_level: String,
     pub credential_configured: bool,
 }
 
+impl PiModelEditor {
+    /// 占位文字：建好时和换语言时都从这里取。
+    pub fn label(&self, window: &mut Window, cx: &mut App) {
+        set_placeholder(
+            &self.provider,
+            t!("model_editor.provider_placeholder"),
+            window,
+            cx,
+        );
+        set_placeholder(
+            &self.model,
+            t!("model_editor.model_placeholder"),
+            window,
+            cx,
+        );
+        set_placeholder(
+            &self.base_url,
+            t!("model_editor.base_url_placeholder"),
+            window,
+            cx,
+        );
+        let key = if self.credential_configured {
+            t!("editor.key_configured")
+        } else {
+            t!("model_editor.key_placeholder")
+        };
+        set_placeholder(&self.api_key, key, window, cx);
+    }
+}
+
 #[derive(Clone)]
 pub struct PiCustomModelEditor {
-    pub id: Entity<gpui_component::input::InputState>,
-    pub name: Entity<gpui_component::input::InputState>,
-    pub context_window: Entity<gpui_component::input::InputState>,
-    pub max_tokens: Entity<gpui_component::input::InputState>,
+    pub id: Entity<InputState>,
+    pub name: Entity<InputState>,
+    pub context_window: Entity<InputState>,
+    pub max_tokens: Entity<InputState>,
+}
+
+impl PiCustomModelEditor {
+    /// 占位文字：建好时和换语言时都从这里取。
+    pub fn label(&self, window: &mut Window, cx: &mut App) {
+        set_placeholder(&self.id, t!("model_row.id_placeholder"), window, cx);
+        set_placeholder(&self.name, t!("model_row.name_placeholder"), window, cx);
+        set_placeholder(
+            &self.context_window,
+            t!("model_row.context_placeholder"),
+            window,
+            cx,
+        );
+        set_placeholder(
+            &self.max_tokens,
+            t!("model_row.max_tokens_placeholder"),
+            window,
+            cx,
+        );
+    }
 }
 
 #[derive(Clone)]
 pub struct PiCustomProviderEditor {
     pub previous_id: Option<String>,
-    pub id: Entity<gpui_component::input::InputState>,
-    pub display_name: Entity<gpui_component::input::InputState>,
-    pub api_key: Entity<gpui_component::input::InputState>,
-    pub base_url: Entity<gpui_component::input::InputState>,
+    pub id: Entity<InputState>,
+    pub display_name: Entity<InputState>,
+    pub api_key: Entity<InputState>,
+    pub base_url: Entity<InputState>,
     pub api: String,
     pub models: Vec<PiCustomModelEditor>,
     /// 「获取模型列表」的进度与结果；`None` 表示还没点过。
     pub discovery: Option<ModelDiscoveryState>,
     pub credential_configured: bool,
+}
+
+impl PiCustomProviderEditor {
+    /// 占位文字：建好时和换语言时都从这里取。
+    pub fn label(&self, window: &mut Window, cx: &mut App) {
+        set_placeholder(&self.id, t!("provider.id_placeholder"), window, cx);
+        set_placeholder(
+            &self.display_name,
+            t!("provider.name_placeholder"),
+            window,
+            cx,
+        );
+        set_placeholder(&self.base_url, "https://gateway.example/v1", window, cx);
+        let key = if self.credential_configured {
+            t!("editor.key_configured")
+        } else {
+            t!("provider.key_placeholder")
+        };
+        set_placeholder(&self.api_key, key, window, cx);
+        for model in &self.models {
+            model.label(window, cx);
+        }
+    }
+}
+
+fn set_placeholder(
+    input: &Entity<InputState>,
+    text: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let text = text.into();
+    input.update(cx, |input, cx| input.set_placeholder(text, window, cx));
 }
 
 /// 模型发现的进度：一次直连 HTTP。
@@ -77,13 +161,22 @@ pub struct PiLoginPrompt {
     pub options: Vec<api::model::pi_auth::PiPromptOption>,
 }
 
+/// 登录的是什么。两种登录在运行时那边是同一套会话（授权链接、粘贴、取消），面板也共用。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PiLoginTarget {
+    /// Pi 内置 provider 的订阅 / API key 登录。
+    Provider { id: String, name: String },
+    /// `~/.pi/agent/mcp.json` 里一台要 OAuth 的 HTTP MCP 服务器。
+    Mcp { name: String },
+}
+
 /// 一次进行中的（或刚结束的）登录。登录本身跑在运行时那边，这里只拿着它的 id。
 #[derive(Clone)]
 pub struct PiLoginView {
-    pub provider_id: String,
-    pub provider_name: String,
-    /// 运行时给的登录 id：取事件、回答、取消都带着它。
-    pub login_id: String,
+    pub target: PiLoginTarget,
+    /// 运行时给的登录 id：取事件、回答、取消都带着它。`None` 是还在请运行时起登录
+    /// （首次可能要先装运行时），面板先出来，点了不至于没反应。
+    pub login_id: Option<String>,
     /// progress / info 的流水，最新的在最后。
     pub messages: Vec<String>,
     pub auth_url: Option<String>,
@@ -93,8 +186,8 @@ pub struct PiLoginView {
     pub prompt: Option<PiLoginPrompt>,
     /// 两个输入框在登录开始时就建好：提问是从子进程的事件流里来的，那里没有
     /// `Window`，建不了控件，也改不了掩码。按提问类型选用哪一个即可。
-    pub input: Entity<gpui_component::input::InputState>,
-    pub secret_input: Entity<gpui_component::input::InputState>,
+    pub input: Entity<InputState>,
+    pub secret_input: Entity<InputState>,
     /// 输入框上的回车订阅。快照会 clone 整个 view，而订阅一旦被丢弃回车就失灵，
     /// 所以放进 `Rc` 跟着 view 一起活。订阅不是 `Send`，不能用 `Arc`。
     #[allow(dead_code, reason = "只为让订阅活到面板关闭，没有读取方")]
@@ -106,8 +199,29 @@ pub struct PiLoginView {
 }
 
 impl PiLoginView {
+    /// 登录的是哪个内置 provider。
+    pub fn provider_id(&self) -> Option<&str> {
+        match &self.target {
+            PiLoginTarget::Provider { id, .. } => Some(id),
+            PiLoginTarget::Mcp { .. } => None,
+        }
+    }
+
+    /// 登录的是哪台 MCP 服务器。
+    pub fn mcp_server(&self) -> Option<&str> {
+        match &self.target {
+            PiLoginTarget::Mcp { name } => Some(name),
+            PiLoginTarget::Provider { .. } => None,
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        match &self.target {
+            PiLoginTarget::Provider { name, .. } | PiLoginTarget::Mcp { name } => name,
+        }
+    }
     /// 当前提问该用哪个输入框。
-    pub fn active_input(&self) -> Option<&Entity<gpui_component::input::InputState>> {
+    pub fn active_input(&self) -> Option<&Entity<InputState>> {
         match self.prompt.as_ref()?.kind {
             api::model::pi_auth::PiPromptKind::Select => None,
             api::model::pi_auth::PiPromptKind::Secret => Some(&self.secret_input),
@@ -133,34 +247,29 @@ pub(crate) fn render_model_discovery_section(
     muted: gpui::Hsla,
     danger_fg: gpui::Hsla,
 ) -> gpui::AnyElement {
-    let note = |color: gpui::Hsla, text: String| div().text_xs().text_color(color).child(text);
+    let note = |color: gpui::Hsla, text: String| {
+        div()
+            .type_style(TYPE.text_xsmall)
+            .text_color(color)
+            .child(text)
+    };
 
     match state {
-        None if manual_rows == 0 => note(
-            muted,
-            "未列出任何模型：保存时将从 API 地址自动获取，并在每次启动时刷新。\
-             想自己固定一份目录，就在上面添加模型。"
-                .to_string(),
-        )
-        .into_any_element(),
-        None => note(
-            muted,
-            "可以点「获取模型列表」从 API 地址读取该服务提供的模型，不必逐个手填。".to_string(),
-        )
-        .into_any_element(),
+        None if manual_rows == 0 => {
+            note(muted, t!("discovery.auto").into_owned()).into_any_element()
+        }
+        None => note(muted, t!("discovery.hint").into_owned()).into_any_element(),
         Some(ModelDiscoveryState::Loading) => {
-            note(muted, "正在向该端点询问可用模型…".to_string()).into_any_element()
+            note(muted, t!("discovery.loading").into_owned()).into_any_element()
         }
         Some(ModelDiscoveryState::Failed(error)) => note(
             danger_fg,
-            format!("未能读取模型列表：{error}（仍可在下方手动填写）"),
+            t!("discovery.failed", error = error).into_owned(),
         )
         .into_any_element(),
-        Some(ModelDiscoveryState::Ready(models)) if models.is_empty() => note(
-            muted,
-            "该端点没有报告任何模型，请在下方手动填写。".to_string(),
-        )
-        .into_any_element(),
+        Some(ModelDiscoveryState::Ready(models)) if models.is_empty() => {
+            note(muted, t!("discovery.empty").into_owned()).into_any_element()
+        }
         Some(ModelDiscoveryState::Ready(models)) => {
             let total = models.len();
             let buttons = models.into_iter().map(move |model| {
@@ -168,8 +277,7 @@ pub(crate) fn render_model_discovery_section(
                 let taken = adopted.iter().any(|id| id == &model.id);
                 let label = model.label().to_string();
                 Button::new(format!("{id_prefix}-discovered-{}", model.id))
-                    .choice()
-                    .compact()
+                    .small()
                     .selected(taken)
                     .label(label)
                     .disabled(taken)
@@ -180,13 +288,22 @@ pub(crate) fn render_model_discovery_section(
                         });
                     })
             });
-            v_flex()
+            div()
+                .flex()
+                .flex_col()
                 .gap_1()
                 .child(note(
                     muted,
-                    format!("该端点提供 {total} 个模型，点击添加到下方列表："),
+                    t!("discovery.found", count = total).into_owned(),
                 ))
-                .child(h_flex().gap_2().flex_wrap().children(buttons))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_wrap()
+                        .children(buttons),
+                )
                 .into_any_element()
         }
     }

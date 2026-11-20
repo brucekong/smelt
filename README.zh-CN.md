@@ -63,7 +63,7 @@ smeltd status
 smeltd pair
 smeltd devices
 smeltd relay [<url>|off]     # 查看、设置或清除自定义 iroh 中继
-smeltd mcp add <id>          # playwright、figma、rea、browser-mcp
+smeltd mcp add <id>          # playwright、figma、rea、browser-mcp、chrome-devtools
 ```
 
 ## 功能
@@ -76,7 +76,7 @@ smeltd mcp add <id>          # playwright、figma、rea、browser-mcp
 - **用量与历史**：用量按 provider 查账户（Claude、Copilot、Codex、Cursor、Grok），不读 transcript。历史会话读各家本机存档，不只 Claude Code
 - **远程访问**（默认关闭）：把另一台 Smelt 桌面或手机 App 配对到这台机器的运行时，连接走 iroh。同网直连，否则打洞，再走 relay。relay 留空用 n0 的公共 relay，也可以填自建地址。配对串是 `smelt+iroh://<endpoint_id>/?code=<一次性码>`，10 分钟内、只能用一次。没有长期共享 token，也没有单独的「允许远程写入」开关：配对就是把这台机器上当前用户的 shell 交给那台设备。在设置里撤销设备，或执行 `smeltd devices revoke`。应用不开放普通局域网监听端口。
   **配对码即权限，开之前先读 [relay 说明](docs/iroh-relay-deployment.md)**
-- **其它**：终端会话持久化（GUI 退出/崩溃不影响 shell，重开自动 reattach）。升级或重启本机 `smeltd` 会停掉它（各平台都一样）：正在跑的终端会话会关掉，进行中的回合会中断，对话历史保留。同一格终端可以叠成 Dock，也可以分屏。结构化对话闲置 30 分钟会停掉这场会话在同进程里的 runtime，再用时唤醒，并恢复挂起前的模型、权限模式和推理强度。一个窗口可以挂多台运行时，包括无头 Linux，并能经 noVNC 看那台机器的桌面。细节见 [`docs/workspace.md`](docs/workspace.md)。
+- **其它**：终端会话持久化（GUI 退出/崩溃不影响 shell，重开自动 reattach）。升级或重启本机 `smeltd` 会停掉它（各平台都一样）：正在跑的终端会话会关掉，进行中的回合会中断，对话历史保留。同一格终端可以叠成 Dock，也可以分屏。结构化对话闲置 20 分钟会停掉这场会话在同进程里的 runtime，再用时唤醒，并恢复挂起前的模型、权限模式和推理强度。一个窗口可以挂多台运行时，包括无头 Linux，并能经 noVNC 看那台机器的桌面。细节见 [`docs/workspace.md`](docs/workspace.md)。
 
 完整功能清单、快捷键与架构细节见 [`docs/workspace.md`](docs/workspace.md)；产品方向见 [`docs/product-roadmap.md`](docs/product-roadmap.md)。
 
@@ -104,7 +104,7 @@ make test                   # cargo nextest（与 CI 同一运行器）
 
 ## 架构
 
-Rust 2024 + [GPUI](https://github.com/zed-industries/zed)（`gpui-pre` 0.3.11）/ [gpui-kit](https://github.com/longbridge/gpui-kit)（GUI）、portable-pty + alacritty_terminal（内嵌终端）、tokio、iroh（远程连接）。axum 用于自动化 webhook 服务（只听本机回环）。结构化状态在 `~/.smelt/` 的 SQLite（Windows 上是 `%USERPROFILE%\.smelt`）：运行时库 `smelt.sqlite3`，这台桌面的客户端库 `client.sqlite3`。见 [`docs/local-storage.md`](docs/local-storage.md)。
+Rust 2024 + [GPUI](https://github.com/zed-industries/zed)（`gpui-pre` 0.3.12）/ [gpui-kit](https://github.com/longbridge/gpui-kit)（GUI）、portable-pty + alacritty_terminal（内嵌终端）、tokio、iroh（远程连接）。axum 用于自动化 webhook 服务（只听本机回环）。结构化状态在 `~/.smelt/` 的 SQLite（Windows 上是 `%USERPROFILE%\.smelt`）：运行时库 `smelt.sqlite3`，这台桌面的客户端库 `client.sqlite3`。见 [`docs/local-storage.md`](docs/local-storage.md)。
 
 工作区包含 `smelt`（GUI 主程序）、`smeltd`（运行时守护：PTY、同进程的 ACP 驱动、自动化；macOS 与 Windows 桌面按需拉起，在 Linux 上可以装成 systemd 用户服务）、`smelt-agent`（Pi 运行时单二进制）、`smelt-notify`（agent hook 的状态上报）、`smelt-installer`（退出后替换 macOS App 的安装助手）。`smelt-iroh-connect` 用来调试运行时的 iroh 路径。普通用户主要使用 `smelt`，本机守护由 GUI 按需管理。
 Windows 上，Rust 客户端（桌面、`smelt-notify`、runtime client）连 `%USERPROFILE%\.smelt\smeltd.sock`（AF_UNIX，`smelt-runtime-client/src/stream/windows.rs` 自己包的非阻塞套接字）。Bun 和 Pi 走当前用户的命名管道。子进程放进 Job Object（`KILL_ON_JOB_CLOSE`）。受管 Bun 下载 `bun-windows-x64.zip`，装到 `%USERPROFILE%\.smelt\runtime`。
@@ -118,8 +118,8 @@ Windows 上，Rust 客户端（桌面、`smelt-notify`、runtime client）连 `%
 
 ## 贡献
 
-欢迎 issue 与 PR。提交前请确保 `make check-all` 通过，commit message 遵循 [Conventional Commits](https://www.conventionalcommits.org/)。
+欢迎 issue 与 PR。提交前请确保 `make check-all` 通过，commit message 遵循 [Conventional Commits](https://www.conventionalcommits.org/)。除非你另有声明，提交的贡献即按 Apache License 2.0 授权（第 5 条）。
 
 ## License
 
-[Apache License 2.0](LICENSE)
+Copyright 2026 NIO。以 [Apache License 2.0](LICENSE) 授权，另见 [NOTICE](NOTICE)。

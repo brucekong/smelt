@@ -135,6 +135,10 @@ pub struct SessionSummary {
     pub agent_definition_id: Option<String>,
     /// 自定义 Agent 开的对话：它的 id。名字到工作区目录的 `agents` 里按 `profile:<id>` 配。
     pub profile_id: Option<String>,
+    /// 绑定的任务工作树：id、任务名、分支。列表里同一项目下按工作树再分小组。
+    pub workset_id: Option<String>,
+    pub workset_task: Option<String>,
+    pub workset_branch: Option<String>,
 }
 
 /// 当前已知的会话列表。
@@ -200,6 +204,16 @@ pub struct WorkspaceProject {
     pub root: String,
     pub title: String,
     pub order: u32,
+    /// 项目里的任务工作树，按桌面侧栏的次序。新建会话可以开在其中一棵里。
+    pub worksets: Vec<WorkspaceWorksetChoice>,
+}
+
+/// 新建会话时可选的一棵任务工作树。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceWorksetChoice {
+    pub id: String,
+    pub task: String,
+    pub branch: String,
 }
 
 /// 可开对话的 agent 选项。产品智能体在前，裸引擎与 profile 在后。
@@ -263,9 +277,11 @@ pub fn workspace_catalog(runtime_id: String) -> Result<WorkspaceCatalog, SmeltEr
 /// - 否则 `kind` 为空或 `Acp` 时开对话（要 `agent_option_id`），`Terminal` 开空白终端。
 /// - `project_root` 为空：只有产品智能体的对话可以，开在智能体自己的 space。
 /// - `request_id`：一次新建意图的 UUID，重试时复用，落到同一个会话。
+/// - `workset_id`：开在项目里的哪棵任务工作树（[`WorkspaceProject::worksets`]），空就是项目根。
 pub fn create_session(
     runtime_id: String,
     project_root: String,
+    workset_id: Option<String>,
     agent_option_id: Option<String>,
     launch_key: Option<String>,
     resume_id: Option<String>,
@@ -275,6 +291,7 @@ pub fn create_session(
     let node = crate::fleet::fleet().node(&runtime_id)?;
     node.catalog.create_session(crate::catalog::CreateSession {
         project_root,
+        workset_id,
         agent_option_id,
         launch_key,
         resume_id,

@@ -246,6 +246,7 @@ fn select(
             .map(|(value, name)| (value.to_string(), name.to_string()))
             .collect(),
         boolean: None,
+        smelt: None,
     }
 }
 
@@ -253,7 +254,10 @@ fn mode(current: &str) -> smelt_core::acp_conn::SessionConfigState {
     select(
         "mode",
         current,
-        &[("default", "逐次审批"), ("bypassPermissions", "完全访问")],
+        &[
+            ("default", "Ask each time"),
+            ("bypassPermissions", "Full access"),
+        ],
     )
 }
 
@@ -261,7 +265,7 @@ fn thinking(current: &str) -> smelt_core::acp_conn::SessionConfigState {
     select(
         "thought_level",
         current,
-        &[("medium", "中"), ("high", "高")],
+        &[("medium", "Medium"), ("high", "High")],
     )
 }
 
@@ -272,11 +276,15 @@ fn switch(id: &str, on: bool) -> smelt_core::acp_conn::SessionConfigState {
     }
 }
 
-/// 挂起前用户调过的一组配置：换了模型、开了完全访问、推理拉到高、开了开关。
+/// 挂起前用户调过的一组配置：换了模型、开了Full access、推理拉到高、开了开关。
 fn tuned_state() -> AcpSessionState {
     quiet_with(|state| {
         state.model = Some(pi_model("deepseek/flash"));
-        state.config_options = vec![mode("完全访问"), thinking("高"), switch("codemode", true)];
+        state.config_options = vec![
+            mode("Full access"),
+            thinking("High"),
+            switch("codemode", true),
+        ];
     })
 }
 
@@ -284,7 +292,11 @@ fn tuned_state() -> AcpSessionState {
 fn fresh_defaults() -> AcpSessionState {
     quiet_with(|state| {
         state.model = Some(pi_model("openai/gpt-5"));
-        state.config_options = vec![mode("逐次审批"), thinking("中"), switch("codemode", false)];
+        state.config_options = vec![
+            mode("Ask each time"),
+            thinking("Medium"),
+            switch("codemode", false),
+        ];
     })
 }
 
@@ -341,8 +353,8 @@ fn settings_the_new_runtime_no_longer_offers_are_skipped() {
         state.model = Some(model);
         // 推理强度只剩 medium，codemode 整项没了。
         state.config_options = vec![
-            mode("逐次审批"),
-            select("thought_level", "中", &[("medium", "中")]),
+            mode("Ask each time"),
+            select("thought_level", "Medium", &[("medium", "Medium")]),
         ];
     });
     assert!(
@@ -377,6 +389,63 @@ fn a_model_also_listed_as_a_config_option_is_restored_once() {
         !debug_all(saved.option_actions(&fresh))
             .iter()
             .any(|action| action.contains("\"model\"")),
+        "模型只走 model 那一步"
+    );
+}
+
+#[test]
+fn initial_config_from_the_client_is_written_like_a_restore() {
+    let saved = acp_idle::SuspendedConfig::from_values(&[
+        ("model".into(), "deepseek/flash".into()),
+        ("mode".into(), "bypassPermissions".into()),
+        ("thought_level".into(), "  ".into()),
+        ("".into(), "high".into()),
+    ]);
+    assert!(!saved.is_empty());
+    let fresh = fresh_defaults();
+    assert_eq!(
+        debug_all(saved.model_action(&fresh)),
+        [set("model", "deepseek/flash", None)]
+    );
+    assert_eq!(
+        debug_all(saved.option_actions(&fresh)),
+        [set("mode", "bypassPermissions", None)],
+        "空的 id 和值不发"
+    );
+    assert!(acp_idle::SuspendedConfig::from_values(&[]).is_empty());
+}
+
+/// 客户端存的是 agent 自己的模型配置 id（不是 `model` 占位名）时，也要按模型那一步先换，
+/// 不能当普通配置项跟其它项一起写。
+#[test]
+fn initial_config_naming_the_agents_own_model_id_switches_the_model_first() {
+    let saved = acp_idle::SuspendedConfig::from_values(&[
+        ("claude_model".into(), "deepseek/flash".into()),
+        ("mode".into(), "bypassPermissions".into()),
+    ]);
+    let fresh = quiet_with(|state| {
+        let mut model = pi_model("openai/gpt-5");
+        model.config_id = "claude_model".into();
+        state.model = Some(model);
+        state.config_options = vec![
+            mode("Ask each time"),
+            select(
+                "claude_model",
+                "openai/gpt-5",
+                &[
+                    ("openai/gpt-5", "openai/gpt-5"),
+                    ("deepseek/flash", "deepseek/flash"),
+                ],
+            ),
+        ];
+    });
+    assert_eq!(
+        debug_all(saved.model_action(&fresh)),
+        [set("claude_model", "deepseek/flash", None)]
+    );
+    assert_eq!(
+        debug_all(saved.option_actions(&fresh)),
+        [set("mode", "bypassPermissions", None)],
         "模型只走 model 那一步"
     );
 }
@@ -426,9 +495,71 @@ fn restore_waits_for_the_model_before_writing_other_settings() {
     );
     expect(next(), "thought_level", ConfigValue::Select("high".into()));
     expect(next(), "codemode", ConfigValue::Boolean(true));
-    session.reduced.lock().config_options =
-        vec![mode("完全访问"), thinking("高"), switch("codemode", true)];
+    session.reduced.lock().config_options = vec![
+        mode("Full access"),
+        thinking("High"),
+        switch("codemode", true),
+    ];
     restoring.join().unwrap();
+}
+
+/// Pi 驱动发布的脚本工具开关是 off/on 两项的下拉，不是布尔开关。
+fn pi_codemode(on: bool) -> smelt_core::acp_conn::SessionConfigState {
+    select(
+        "codemode",
+        if on { "On" } else { "Off" },
+        &[("off", "Off"), ("on", "On")],
+    )
+}
+
+/// 新开 Pi 对话带着「完全放行 + 脚本工具开」：就绪时脚本工具还是关的，两项要 agent 先后两次
+/// 确认。写回在补做线程里等确认，事件线程每批归并完都要更新守护状态；写回等待期间不能占着
+/// 事件线程要的锁，否则第二次确认进不来，只能等满超时，首条消息跟着干等。
+#[test]
+fn restoring_pi_script_tools_finishes_once_confirmed() {
+    let (session, cmd_rx) = direct_session(quiet_with(|state| {
+        state.config_options = vec![mode("Ask each time"), pi_codemode(false)];
+    }));
+    crate::acp_supervise::remember_relaunch_config(
+        &session,
+        acp_idle::SuspendedConfig::from_values(&[
+            ("mode".into(), "bypassPermissions".into()),
+            ("codemode".into(), "on".into()),
+        ]),
+    );
+    session.startup_hold.store(true, Ordering::SeqCst);
+    let session = Arc::new(session);
+    let subscribers = new_event_hub();
+    let after_ready = {
+        let session = Arc::clone(&session);
+        let subscribers = subscribers.clone();
+        std::thread::spawn(move || {
+            crate::acp_supervise::run_after_ready("acp-idle", &session, &subscribers)
+        })
+    };
+    // 两项一起写：完全放行、脚本工具开。
+    for _ in 0..2 {
+        cmd_rx.recv_blocking().unwrap();
+    }
+    let started = std::time::Instant::now();
+    // 照事件线程的做法：归并一批，再更新守护状态。
+    for options in [
+        vec![mode("Full access"), pi_codemode(false)],
+        vec![mode("Full access"), pi_codemode(true)],
+    ] {
+        smelt_core::acp_session::apply_event(
+            &mut session.reduced.lock(),
+            smelt_core::acp_conn::ConversationEvent::ConfigOptions(options),
+        );
+        crate::acp_host::update_acp_daemon_state(&session, &subscribers);
+    }
+    after_ready.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "确认到了就该放行，等了 {:?}",
+        started.elapsed()
+    );
+    assert!(!session.startup_hold.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -436,7 +567,7 @@ fn a_rejected_restore_does_not_hold_the_user_action() {
     let saved = acp_idle::SuspendedConfig::capture(&tuned_state());
     let (session, _cmd_rx) = direct_session(quiet_with(|state| {
         state.model = Some(pi_model("deepseek/flash"));
-        state.config_options = vec![mode("逐次审批")];
+        state.config_options = vec![mode("Ask each time")];
     }));
     let session = Arc::new(session);
     let subscribers = new_event_hub();
@@ -449,7 +580,11 @@ fn a_rejected_restore_does_not_hold_the_user_action() {
     std::thread::sleep(Duration::from_millis(200));
     smelt_core::acp_session::apply_event(
         &mut session.reduced.lock(),
-        smelt_core::acp_conn::ConversationEvent::ConfigRejected("更新会话配置失败：不行".into()),
+        smelt_core::acp_conn::ConversationEvent::ConfigRejected(
+            smelt_core::acp_session::RuntimeNote::ConfigUpdateFailed {
+                detail: "nope".into(),
+            },
+        ),
     );
     let started = std::time::Instant::now();
     restoring.join().unwrap();
@@ -530,11 +665,13 @@ fn a_recently_active_conversation_sets_the_next_wake() {
     let (session, _cmd_rx) = direct_session(quiet_state());
     let (slot, _) = acp_sessions.reserve_with("acp-idle-recent", || session);
     let before = crate::event_hub::now_ms();
+    let idle_after = acp_idle::ACP_IDLE_SUSPEND_AFTER.as_millis() as u64;
     let sweep =
         acp_idle::suspend_idle_acp_sessions(&acp_sessions, acp_idle::ACP_IDLE_SUSPEND_AFTER);
     let deadline = sweep.next_deadline_ms.expect("还没闲置够的会话要排上截止");
+    // 会话建好时记的活动早于 `before`，截止落在 `before` 加闲置期前后，差不过一秒。
     assert!(
-        deadline > before + 29 * 60 * 1_000,
+        deadline + 1_000 > before + idle_after && deadline <= before + idle_after,
         "截止是最后活动加闲置期"
     );
     assert!(!sweep.contended);
@@ -621,4 +758,44 @@ fn a_poisoned_session_lock_does_not_panic_the_suspend_check() {
     let blocker =
         acp_idle::acp_suspend_blocker(&session, long_after_now(), acp_idle::ACP_IDLE_SUSPEND_AFTER);
     assert_eq!(blocker, None);
+}
+
+/// 用户发消息：runtime 在跑就只记活动，不重新拉起。
+#[test]
+fn user_input_to_a_running_conversation_does_not_relaunch() {
+    let acp_sessions = new_test_acp_sessions();
+    let (session, _cmd_rx) = direct_session(quiet_state());
+    let (slot, _) = acp_sessions.reserve_with("acp-idle", || session);
+    let generation = slot.value.connection_generation.load(Ordering::SeqCst);
+    assert_eq!(
+        acp_idle::launch_for_user_input("acp-idle", &slot, &acp_sessions, &new_event_hub()),
+        Ok(())
+    );
+    assert_eq!(
+        slot.value.connection_generation.load(Ordering::SeqCst),
+        generation
+    );
+}
+
+/// 上次因失败停下的对话（这里是没登录）不是终点：用户发消息就按记录的启动规格拉起。
+/// 没记下启动规格时拉不起来，原话回给发消息的人。
+#[test]
+fn user_input_to_a_stopped_conversation_relaunches_it() {
+    let acp_sessions = new_test_acp_sessions();
+    let mut stopped = quiet_state();
+    smelt_core::acp_session::force_end_because(
+        &mut stopped,
+        smelt_core::acp_session::AcpEndKind::RestoreFailed,
+        smelt_core::acp_session::ConversationEndReason::SignInRequired {
+            agent: smelt_core::acp_session::SignInAgent::Antigravity,
+        },
+        "Authentication required",
+    );
+    let (slot, _) = acp_sessions.reserve_with("acp-stopped", || {
+        make_acp_session_value("acp-stopped", stopped)
+    });
+    let error =
+        acp_idle::launch_for_user_input("acp-stopped", &slot, &acp_sessions, &new_event_hub())
+            .unwrap_err();
+    assert!(error.contains("no launch spec"), "{error}");
 }

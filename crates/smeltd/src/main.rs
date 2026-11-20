@@ -27,10 +27,10 @@
 //!   {"op":"version"}                                         → 回 {"version":"..","exe_mtime":123} 后关闭
 //!   {"op":"shutdown"}                                        → 优雅停机（收割子进程、checkpoint 状态库）后
 //!                                                              回 {"ok":true} 再退出，所有会话结束
-//!   {"op":"upgrade"}                                         → 先把启动名拨到本进程钉住的映像，同样优雅停机、
-//!                                                              回执；Unix 随后在本进程 exec，Windows 拉起接班
-//!                                                              进程后退出。不交接 fd，进行中的回合中断
-//!   {"op":"upgrade","exe":"/path/to/smeltd"}                 → 同上，换到指定映像
+//!   {"op":"upgrade"}                                         → 同样优雅停机、回执，再按本进程启动时的路径重新
+//!                                                              起来（那里装的可能已是新版本）：Unix 在本进程
+//!                                                              exec，Windows 拉起接班进程后退出。进行中的回合中断
+//!   {"op":"upgrade","exe":"/path/to/smeltd"}                 → 同上，换成指定的那份
 //!   {"op":"runtime_upgrade","version":"2026.1023.0"}         → 回 {"state":"accepted"}，从 GitHub Release
 //!                                                              下载该版本校验通过后重启守护；见 runtime_upgrade.rs
 //!   {"op":"agent_event","id":"..","event":{...}}             → 回 {"ok":true} 后关闭，归一化 hook 事件
@@ -105,20 +105,24 @@
 mod acp_host;
 mod acp_idle;
 mod acp_registry;
+mod acp_supervise;
 mod agent_memory_control;
 mod agent_notify;
+mod attention;
 mod automation_runtime;
 mod client_conn;
 mod control;
-mod memory_peer_auth;
+mod conversation_delivery;
 mod conversation_image;
+mod conversation_prompt_index;
 mod desktop;
 mod devices;
-mod appearance_requests;
+mod app_requests;
 mod event_hub;
 mod files_control;
 mod git_control;
 mod history_control;
+mod memory_peer_auth;
 mod memory_watch;
 #[cfg(target_os = "macos")]
 mod menubar;
@@ -135,12 +139,14 @@ mod remote;
 mod runtime_identity;
 mod runtime_upgrade;
 mod service;
+mod session_branch;
 mod session_catalog;
 mod session_control;
 mod session_directory;
+mod session_names;
 mod session_state;
-mod terminal_names;
 mod terminal_graphics;
+mod terminal_names;
 mod terminal_output;
 mod terminal_progress;
 mod terminal_registry;
@@ -148,7 +154,9 @@ mod terminal_resume;
 mod terminal_shell;
 mod terminal_snapshot;
 mod webhook;
+mod workset_control;
 mod workspace_directory;
+mod worktree_setup;
 
 use acp_host::*;
 use protocol::*;
@@ -168,10 +176,10 @@ use smelt_core::automation::{AutomationCommand, AutomationFile, AutomationInboun
 use smelt_core::automation_store::{
     AutomationStore, local_timezone_fingerprint, new_automation_store,
 };
+use smelt_core::kitty_graphics::GraphicsSplitter;
 use smelt_core::osc::{
     OscEvent, OscScan, TerminalGeometryOsc, program_status_reply, terminal_geometry_osc,
 };
-use smelt_core::kitty_graphics::GraphicsSplitter;
 use smelt_core::session_control::find_agent_option_for;
 use terminal_graphics::{FedOutput, TerminalGraphics, feed_output};
 use terminal_output::{KeyframeNeed, OutputAttachment, SessionOutput, enqueue_session_streams};
@@ -234,7 +242,7 @@ pub(crate) struct DaemonStopping;
 
 impl std::fmt::Display for DaemonStopping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("守护正在停机")
+        f.write_str("The runtime is shutting down")
     }
 }
 
@@ -265,119 +273,47 @@ fn acquire_spawn_permit(
 fn sock_path() -> std::path::PathBuf {
     let dir = smelt_paths::smelt_home().unwrap_or_else(|| std::env::temp_dir().join(".smelt"));
     let _ = std::fs::create_dir_all(&dir);
-    dir.join("smeltd.sock")
+    dir.join(smelt_paths::SMELTD_SOCK)
 }
 
-/// 启动时钉住的那份普通文件。升级只 exec 这条路径，不再回头看启动名现在指向谁。
-struct PinnedDaemonImage {
-    path: std::path::PathBuf,
-    /// 钉住时的设备号和 inode。生产路径只 exec `path`；单测用这两个字段确认
-    /// 钉住的是映像文件本身，不是启动名那根链接。
-    #[cfg(unix)]
-    #[cfg_attr(not(test), allow(dead_code))]
-    dev: u64,
-    #[cfg(unix)]
-    #[cfg_attr(not(test), allow(dead_code))]
-    ino: u64,
-}
-
-static PINNED_DAEMON_IMAGE: OnceLock<PinnedDaemonImage> = OnceLock::new();
+/// 本进程按哪条路径重启。从 `~/.smelt/bin` 起的就是那里固定名字的 smeltd（从旧布局升上来的
+/// 守护跑的是 `smeltd-<指纹>`，启动时会被整理掉）；别处起的（开发、测试）就是启动时的
+/// 可执行文件。Linux 上这个文件被 rename 换掉之后 `current_exe()` 会变成 `…/smeltd (deleted)`，
+/// 所以启动时记一次。
+static DAEMON_EXECUTABLE: OnceLock<std::path::PathBuf> = OnceLock::new();
+/// 本进程是不是从 `~/.smelt/bin` 起的。
+static MANAGED_DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn daemon_executable_path() -> std::io::Result<std::path::PathBuf> {
-    PINNED_DAEMON_IMAGE
+    DAEMON_EXECUTABLE
         .get()
-        .map(|pinned| pinned.path.clone())
-        .ok_or_else(|| std::io::Error::other("没有钉住守护映像"))
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("没有记下守护的可执行文件路径"))
 }
 
-/// 钉住本次 exec 真正映射的普通文件。
-///
-/// `current_exe()` 经常是启动时用的那条路径。若有人从符号链接 `smeltd` 拉起，
-/// 这里只顺着链接读一次，打开目标文件（`O_NOFOLLOW`，不再二次解析）。
-/// 之后启动名被拨到别的映像，也不改变已经钉住的路径。
-fn pin_running_daemon_image() {
-    let Ok(path) = std::env::current_exe() else {
-        eprintln!("smeltd 无法读取当前可执行路径，升级将拒绝换映像");
-        return;
-    };
-    let Some(pinned) = open_mapped_image(&path) else {
-        eprintln!(
-            "smeltd 没有钉住守护映像（{}），升级将拒绝换映像",
-            path.display()
-        );
-        return;
-    };
-    let _ = PINNED_DAEMON_IMAGE.set(pinned);
+#[cfg(target_os = "linux")]
+pub(crate) fn is_managed_daemon() -> bool {
+    MANAGED_DAEMON.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn open_mapped_image(current: &std::path::Path) -> Option<PinnedDaemonImage> {
-    #[cfg(windows)]
-    {
-        // `current_exe()` 在 Windows 上就是正在映射的那份 exe（哈希副本），不是启动名。
-        let path = std::fs::canonicalize(current).ok()?;
-        let meta = std::fs::metadata(&path).ok()?;
-        if !meta.is_file() {
-            return None;
+fn pin_daemon_executable() {
+    let exe = match std::env::current_exe() {
+        Ok(path) => std::fs::canonicalize(&path).unwrap_or(path),
+        Err(error) => {
+            eprintln!("smeltd 无法读取当前可执行路径：{error}");
+            return;
         }
-        return Some(PinnedDaemonImage { path });
-    }
-    #[cfg(unix)]
-    {
-        if let Some(pinned) = open_regular_nofollow(current) {
-            return Some(pinned);
+    };
+    let bin =
+        smelt_paths::smelt_home().and_then(|home| std::fs::canonicalize(home.join("bin")).ok());
+    let pinned = match bin {
+        Some(bin) if exe.parent() == Some(bin.as_path()) => {
+            MANAGED_DAEMON.store(true, std::sync::atomic::Ordering::Relaxed);
+            smelt_core::daemon_image::installed_path(&bin)
         }
-        let target = std::fs::read_link(current).ok()?;
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            current.parent()?.join(target)
-        };
-        open_regular_nofollow(&resolved)
-    }
-}
-
-#[cfg(unix)]
-fn open_regular_nofollow(path: &std::path::Path) -> Option<PinnedDaemonImage> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.file_type().is_file() {
-        return None;
-    }
-    Some(PinnedDaemonImage {
-        path: path.to_path_buf(),
-        dev: meta.dev(),
-        ino: meta.ino(),
-    })
-}
-
-/// 已经写好、还没切到运行中守护的下一份映像。只认 `smeltd.pending` 这根链接，
-/// 不认会被覆盖的 `smeltd.next`。正在跑的就是这份文件时，不当成候选。
-fn staged_successor_executable(running: &std::path::Path) -> Option<std::path::PathBuf> {
-    let pending = smelt_core::daemon_image::pending_image(running.parent()?)?;
-    (!same_device_inode(running, &pending)).then_some(pending)
-}
-
-fn same_device_inode(left: &std::path::Path, right: &std::path::Path) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(
-            (std::fs::canonicalize(left), std::fs::canonicalize(right)),
-            (Ok(left), Ok(right)) if left == right
-        )
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let (Ok(left), Ok(right)) = (std::fs::metadata(left), std::fs::metadata(right)) else {
-            return false;
-        };
-        left.dev() == right.dev() && left.ino() == right.ino()
-    }
+        _ => exe,
+    };
+    let _ = DAEMON_EXECUTABLE.set(pinned);
 }
 
 /// 进程指纹钉死（启动时调一次）：GUI 拉起时对 spawn 目标的哈希优先；否则对
@@ -410,7 +346,7 @@ fn bind_single_instance(
     path: &std::path::Path,
     check_existing: bool,
 ) -> std::io::Result<Option<DaemonListener>> {
-    let lock_path = path.with_extension("lock");
+    let lock_path = startup_lock_path(path);
     // 锁只覆盖「检查 → 删僵尸 sock → bind」。函数结束就放锁；长期单实例靠套接字文件本身。
     let _lock = {
         let lock = std::fs::OpenOptions::new()
@@ -446,7 +382,7 @@ fn bind_single_instance(
     check_existing: bool,
 ) -> std::io::Result<Option<DaemonListener>> {
     use smelt_sys::file_lock::ExclusiveFile;
-    let lock_path = path.with_extension("instance.lock");
+    let lock_path = instance_lock_path(path);
     let instance = if check_existing {
         match ExclusiveFile::try_lock(&lock_path)? {
             Some(instance) => instance,
@@ -459,6 +395,19 @@ fn bind_single_instance(
     let _ = std::fs::remove_file(path);
     let listener = RuntimeListener::bind_taking_over(path)?;
     Ok(Some(DaemonListener { listener, instance }))
+}
+
+/// 串行化启动的锁，放在连接口旁边。改名字要同步 `smelt_paths::DECLARED_ENTRIES`，
+/// 不然「清理残留」会把它列出来。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn startup_lock_path(sock: &std::path::Path) -> std::path::PathBuf {
+    sock.with_extension("lock")
+}
+
+/// Windows 的单实例锁，放在连接口旁边。登记要求同 [`startup_lock_path`]。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn instance_lock_path(sock: &std::path::Path) -> std::path::PathBuf {
+    sock.with_extension("instance.lock")
 }
 
 fn bind_fresh_daemon(path: &std::path::Path) -> std::io::Result<Option<DaemonListener>> {
@@ -595,10 +544,7 @@ enum PixelQuery {
 impl PixelQuery {
     fn answer(&self, window: WindowSize) -> String {
         match self {
-            Self::Cell => format!(
-                "\x1b[6;{};{}t",
-                window.cell_height, window.cell_width
-            ),
+            Self::Cell => format!("\x1b[6;{};{}t", window.cell_height, window.cell_width),
             Self::TextArea(format) => format(window),
         }
     }
@@ -1124,9 +1070,36 @@ fn broadcast_state(event_hub: &EventHubHandle, state: &SessionState) {
     match event_hub.publish_session(state) {
         Ok(true) => {
             with_session_directory(|directory| directory.upsert(state));
+            session_branch::observe(state);
+            session_names::observe(state);
         }
         Ok(false) => {}
         Err(error) => eprintln!("[event-hub] session state publish failed: {error}"),
+    }
+}
+
+/// 没有运行时的留下的会话（崩溃恢复、归档后重启留下的，实例 0）改展示字段再发布。它没有
+/// 活的状态锁，就在提交门里对着总线上发布着的那份改。已经被活实例接管的不动：活实例自己
+/// 发布时会带上新值。
+fn republish_dormant(
+    event_hub: &EventHubHandle,
+    id: &str,
+    update: impl FnOnce(&mut SessionState) -> bool,
+) {
+    let _commit = STATE_DIRECTORY_COMMIT_GATE.lock().unwrap();
+    let Some(mut state) = event_hub.published_session(id) else {
+        return;
+    };
+    if state.instance != 0 || !update(&mut state) {
+        return;
+    }
+    session_state::bump_state_revision(&mut state);
+    match event_hub.publish_session(&state) {
+        Ok(true) => {
+            with_session_directory(|directory| directory.upsert(&state));
+        }
+        Ok(false) => {}
+        Err(error) => eprintln!("[event-hub] dormant session publish failed: {error}"),
     }
 }
 
@@ -1137,19 +1110,31 @@ fn forget_session(event_hub: &EventHubHandle, id: &str, instance: u64) {
     match event_hub.remove_session(id, instance) {
         Ok(true) => {
             with_session_directory(|directory| directory.remove_instance(id, instance));
+            session_branch::forget(id);
+            session_names::forget(id);
         }
         Ok(false) => {}
         Err(error) => eprintln!("[event-hub] session removal publish failed: {error}"),
     }
 }
 
-fn suspend_terminal_identity(event_hub: &EventHubHandle, state: &SessionState) -> Result<(), String> {
+fn suspend_terminal_identity(
+    event_hub: &EventHubHandle,
+    state: &SessionState,
+) -> Result<(), String> {
     let _commit = STATE_DIRECTORY_COMMIT_GATE.lock().unwrap();
-    if !event_hub.remove_session(&state.id, state.instance).map_err(|error| error.to_string())? {
-        return Err("终端实例已替换，不能归档旧实例".to_string());
+    if !event_hub
+        .remove_session(&state.id, state.instance)
+        .map_err(|error| error.to_string())?
+    {
+        return Err(
+            "The terminal instance was replaced; the old one can't be archived".to_string(),
+        );
     }
+    session_branch::forget(&state.id);
+    session_names::forget(&state.id);
     with_session_directory(|directory| directory.suspend_instance(state))
-        .unwrap_or_else(|| Err("终端身份目录尚未初始化".to_string()))
+        .unwrap_or_else(|| Err("The terminal identity directory isn't ready yet".to_string()))
 }
 
 /// Remote ownership is a small catalog, so each change publishes a complete replacement. This
@@ -1247,7 +1232,8 @@ fn handle_automation_command<C: ClientSocket>(
                 owner.run_once(automation_id, chrono::Local::now())
             }
             command => owner.apply(command, chrono::Local::now()),
-        }?;
+        }
+        .map_err(|error| error.to_string())?;
         if applied.changed
             && let Err(error) =
                 event_hub.publish_automations(&webhook::annotate_snapshot(applied.snapshot.clone()))
@@ -1288,7 +1274,9 @@ fn handle_event_publish<C: ClientSocket>(
         let event: AutomationInboundEvent =
             serde_json::from_value(event).map_err(|error| format!("invalid event: {error}"))?;
         let mut owner = automations.lock().unwrap();
-        let applied = owner.publish_event(event, chrono::Local::now())?;
+        let applied = owner
+            .publish_event(event, chrono::Local::now())
+            .map_err(|error| error.to_string())?;
         if applied.changed
             && let Err(error) =
                 event_hub.publish_automations(&webhook::annotate_snapshot(applied.snapshot.clone()))
@@ -1324,15 +1312,15 @@ fn handle_event_publish<C: ClientSocket>(
 }
 
 /// 常驻 Term 的事件监听。OSC 标题留在终端网格自己的标题栏，这里直接丢掉。
-/// Bell 只刷新活动时间并广播。程序的查询（颜色、设备属性、光标位置、尺寸）在网格锁内入队，
-/// 泵释放锁后再写回。
+/// 响铃只记一下，泵在这批输出处理完后交给提醒（见 [`take_terminal_bell`]）。程序的查询（颜色、
+/// 设备属性、光标位置、尺寸）在网格锁内入队，泵释放锁后再写回。
 #[derive(Clone)]
 struct StateListener {
-    state: Arc<Mutex<SessionState>>,
-    event_hub: EventHubHandle,
     /// 查询在 `Term` 网格锁内回调。这里只入队，等 PTY 泵释放网格锁后再经 `Ctl.master`
     /// 写入，避免与 resize 的 ctl -> term 锁序相反而死锁。
     replies: PendingTermReplies,
+    /// 网格上响过铃。和 [`Session::bell`] 是同一个。
+    bell: Arc<AtomicBool>,
 }
 
 /// 常驻 Term 对程序查询的一条应答。守护的网格是这个会话唯一的权威画面，查询都由它答（同
@@ -1351,21 +1339,8 @@ enum TermReply {
 type PendingTermReplies = Arc<Mutex<VecDeque<TermReply>>>;
 
 impl StateListener {
-    #[cfg(test)]
-    fn new(state: Arc<Mutex<SessionState>>, event_hub: EventHubHandle) -> Self {
-        Self::with_replies(state, event_hub, Arc::new(Mutex::new(VecDeque::new())))
-    }
-
-    fn with_replies(
-        state: Arc<Mutex<SessionState>>,
-        event_hub: EventHubHandle,
-        replies: PendingTermReplies,
-    ) -> Self {
-        Self {
-            state,
-            event_hub,
-            replies,
-        }
+    fn new(replies: PendingTermReplies, bell: Arc<AtomicBool>) -> Self {
+        Self { replies, bell }
     }
 }
 
@@ -1376,9 +1351,9 @@ impl EventListener for StateListener {
             Event::ColorRequest(index, format) => {
                 Some(TermReply::Color(*index, Arc::clone(format)))
             }
-            Event::TextAreaSizeRequest(format) => Some(TermReply::Pixels(PixelQuery::TextArea(
-                Arc::clone(format),
-            ))),
+            Event::TextAreaSizeRequest(format) => {
+                Some(TermReply::Pixels(PixelQuery::TextArea(Arc::clone(format))))
+            }
             _ => None,
         };
         if let Some(reply) = reply {
@@ -1388,19 +1363,9 @@ impl EventListener for StateListener {
             return;
         }
         // OSC 0/2 不是会话名，也不广播。
-        let Event::Bell = event else {
-            return;
-        };
-
-        let snapshot = {
-            let Ok(mut st) = self.state.lock() else {
-                return;
-            };
-            st.updated_at = now_unix();
-            bump_state_revision(&mut st);
-            st.clone()
-        };
-        broadcast_state(&self.event_hub, &snapshot);
+        if let Event::Bell = event {
+            self.bell.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -2124,8 +2089,10 @@ struct Session {
     output_gate: Mutex<()>,
     /// 守护 Term 收到的查询要回的应答；由 PTY 泵在网格锁释放后串行写回 child。
     replies: PendingTermReplies,
+    /// 网格上响过铃，PTY 泵取走（见 [`take_terminal_bell`]）。
+    bell: Arc<AtomicBool>,
     /// 常驻网格：PTY 输出持续 advance；attach 时序列化成 ANSI 快照。挂的是
-    /// `StateListener`（不再是 `VoidListener`）——守护自己也要看得见 Title/Bell。
+    /// `StateListener`（不再是 `VoidListener`）——守护自己也要看得见查询和响铃。
     term: Mutex<Term<StateListener>>,
     /// kitty 图形的图片和放置（见 terminal_graphics）。加锁顺序在 `term` 之后。
     graphics: Mutex<TerminalGraphics>,
@@ -2450,9 +2417,8 @@ fn main() {
     // Grok/CI 会给进程打 NO_COLOR=1。必须在任何线程/子进程之前卸掉，否则
     // 交互式 PTY（agy 等）会继承关色开关，整屏只剩默认灰白。
     smelt_core::tty_color::clear_process();
-    // 钉住自己映射的那份文件。钉晚了，启动名若已被拨走，再去解析
-    // `current_exe()` 就会拿到下一份映像。
-    pin_running_daemon_image();
+    // 记下自己的路径。记晚了，那个文件可能已经被新版本换掉。
+    pin_daemon_executable();
     // `smeltd install` / `status` 这类子命令跑完就退出，不起守护。
     if let Some(code) = service::maybe_run(&std::env::args().collect::<Vec<_>>()) {
         std::process::exit(code);
@@ -2534,7 +2500,9 @@ fn main() {
         match smelt_sys::process::retire_predecessor(pid, Duration::from_secs(30)) {
             Ok(false) => {}
             Ok(true) => dlog(&format!("升级接班：前任 {pid} 30 秒内没退出，已结束它")),
-            Err(error) => dlog(&format!("升级接班：等前任 {pid} 退出失败，照常绑定：{error}")),
+            Err(error) => dlog(&format!(
+                "升级接班：等前任 {pid} 退出失败，照常绑定：{error}"
+            )),
         }
     }
     let bound = match bind_fresh_daemon(&path) {
@@ -2582,6 +2550,11 @@ fn main() {
     *SESSION_DIRECTORY.write().unwrap_or_else(|e| e.into_inner()) = Some(directory);
     let sessions = new_sessions();
     let acp_sessions = new_acp_sessions();
+    session_branch::spawn(
+        Arc::clone(&sessions),
+        Arc::clone(&acp_sessions),
+        Arc::clone(&event_hub),
+    );
 
     let automations = new_automation_store();
 
@@ -2590,6 +2563,12 @@ fn main() {
         &acp_sessions,
         automations.lock().unwrap().snapshot(),
     ));
+    // 留下的会话进了总线才起：它们也要按目录算名字。
+    session_names::spawn(
+        Arc::clone(&sessions),
+        Arc::clone(&acp_sessions),
+        Arc::clone(&event_hub),
+    );
 
     automation_runtime::spawn(
         Arc::clone(&automations),
@@ -2598,7 +2577,7 @@ fn main() {
         Arc::clone(&event_hub),
     );
     webhook::spawn(Arc::clone(&automations), Arc::clone(&event_hub));
-    push::spawn(&event_hub);
+    push::spawn();
 
     run_serve_loop(
         listener,
@@ -2633,172 +2612,20 @@ fn wait_for_test_owner_exit(owner: i32) {
     while !smelt_core::process_wait::wait_until_exit(owner, Duration::from_secs(3600)) {}
 }
 
-/// headless 自升级第一次检查前让 GUI 先手：GUI 拉起守护后马上会连上来，升级时机归它。
-/// 只在启动时等这一次。
-const HEADLESS_UPGRADE_STARTUP_GRACE: Duration = Duration::from_secs(60);
-/// 升级没做成（交接被拒、读不了新映像）之后隔多久再试：从 60 秒起翻倍，上限 30 分钟。
-// 轮询例外：升级被拒之后没有「可以再试了」的事件；周期 60 秒起翻倍，上限 30 分钟。新映像挂上、最后一个观看连接断开都会立刻再看。
-const HEADLESS_UPGRADE_RETRY_FIRST: Duration = Duration::from_secs(60);
-const HEADLESS_UPGRADE_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
-
-/// 叫醒 headless 自升级线程。容量 1 的通道：连着来的几次合成一次检查。
-static HEADLESS_UPGRADE_WAKE: Mutex<Option<std::sync::mpsc::SyncSender<()>>> = Mutex::new(None);
-
-/// 最后一个观看连接断开时由 [`protocol::ViewerLease`] 调用。线程没起来时什么也不做。
-pub(crate) fn nudge_headless_self_upgrade() {
-    if let Ok(slot) = HEADLESS_UPGRADE_WAKE.lock()
-        && let Some(wake) = slot.as_ref()
-    {
-        let _ = wake.try_send(());
-    }
-}
-
-/// 连续第 `failures` 次（从 0 起）没升成之后隔多久再试。
-fn headless_upgrade_retry_delay(failures: u32) -> Duration {
-    HEADLESS_UPGRADE_RETRY_FIRST
-        .saturating_mul(1u32.checked_shl(failures).unwrap_or(u32::MAX))
-        .min(HEADLESS_UPGRADE_RETRY_MAX)
-}
-
-/// 这条文件事件是不是 `smeltd.pending` 被挂上、改指或拿掉。事件丢了（要重扫）也算，
-/// 宁可多看一眼。
-fn touches_staged_successor(event: &notify::Event) -> bool {
-    let pending = std::ffi::OsStr::new(smelt_core::daemon_image::PENDING_NAME);
-    event.need_rescan()
-        || event
-            .paths
-            .iter()
-            .any(|path| path.file_name() == Some(pending))
-}
-
-/// 盯着守护映像所在的目录，`smeltd.pending` 一变就叫醒自升级线程。盯不上只记日志：
-/// 那样新映像要等下一次「最后一个观看连接断开」才会被看到。
-fn watch_staged_successor(
-    wake: std::sync::mpsc::SyncSender<()>,
-) -> Option<notify::RecommendedWatcher> {
-    use notify::Watcher as _;
-    let dir = daemon_executable_path().ok()?.parent()?.to_path_buf();
-    let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        // 出错多半是事件丢了，看一眼不亏。
-        let relevant = match &event {
-            Ok(event) => touches_staged_successor(event),
-            Err(_) => true,
-        };
-        if relevant {
-            let _ = wake.try_send(());
-        }
-    });
-    let mut watcher = match watcher {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            dlog(&format!("headless 自升级盯不住 {}：{error}", dir.display()));
-            return None;
-        }
-    };
-    if let Err(error) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
-        dlog(&format!("headless 自升级盯不住 {}：{error}", dir.display()));
-        return None;
-    }
-    Some(watcher)
-}
-
-enum HeadlessUpgradeStep {
-    /// 已经交给新映像，本线程到此为止。
-    Upgraded,
-    /// 现在没什么可做：有人在看、没挂新映像、挂的就是自己。等下一次事件。
-    Idle,
-    Failed(String),
-}
-
-fn headless_self_upgrade_once(pinned: &str) -> HeadlessUpgradeStep {
-    // 有人在看就让 GUI 提示并重启，避免无界面地把对话打断。
-    if protocol::viewer_is_present() {
-        return HeadlessUpgradeStep::Idle;
-    }
-    let Ok(current) = daemon_executable_path() else {
-        return HeadlessUpgradeStep::Idle;
-    };
-    let Some(target) = staged_successor_executable(&current) else {
-        return HeadlessUpgradeStep::Idle;
-    };
-    let disk = match smelt_core::daemon_image::content_fingerprint(&target) {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => return HeadlessUpgradeStep::Failed(format!("读不了新映像：{error}")),
-    };
-    if disk == pinned {
-        return HeadlessUpgradeStep::Idle;
-    }
-    dlog("headless 自升级：已 stage 新映像且没有观看连接，重启到新映像");
-    match request_self_upgrade(&target) {
-        SelfUpgradeOutcome::Upgraded => HeadlessUpgradeStep::Upgraded,
-        SelfUpgradeOutcome::Failed(reason) => HeadlessUpgradeStep::Failed(reason),
-    }
-}
-
-/// headless 自升级：没人看时，把 `smeltd.pending` 指向的新映像应用到运行中的守护。
-/// 启动后先让 GUI 一分钟，之后只在两件事发生时看：`smeltd.pending` 变了，最后一个
-/// 观看连接断开了。
-/// 门控：
-/// - 指纹未知（None）不升：证明不了自己旧，别乱动。
-/// - 有活着的观看连接就不升：GUI 在，由它提示用户并重启。
-/// - 不等待 agent 空闲。upgrade 会停掉本进程，进行中的回合中断，历史在库里。
-fn spawn_headless_self_upgrade(daemon_fingerprint: Option<String>) {
-    let Some(pinned) = daemon_fingerprint else {
-        return;
-    };
-    let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    std::thread::Builder::new()
-        .name("smelt-headless-self-upgrade".into())
-        .spawn(move || {
-            let _watcher = watch_staged_successor(wake_tx.clone());
-            if let Ok(mut slot) = HEADLESS_UPGRADE_WAKE.lock() {
-                *slot = Some(wake_tx);
-            }
-            // 期间到的叫醒留在通道里，让完一起看。
-            std::thread::sleep(HEADLESS_UPGRADE_STARTUP_GRACE);
-            let mut failures = 0u32;
-            loop {
-                let retry = match headless_self_upgrade_once(&pinned) {
-                    HeadlessUpgradeStep::Upgraded => return,
-                    HeadlessUpgradeStep::Idle => {
-                        failures = 0;
-                        None
-                    }
-                    HeadlessUpgradeStep::Failed(reason) => {
-                        let delay = headless_upgrade_retry_delay(failures);
-                        failures = failures.saturating_add(1);
-                        dlog(&format!(
-                            "headless 自升级未完成，{}s 后重试：{reason}",
-                            delay.as_secs()
-                        ));
-                        Some(delay)
-                    }
-                };
-                let woke = match retry {
-                    Some(delay) => wake_rx.recv_timeout(delay),
-                    None => wake_rx
-                        .recv()
-                        .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
-                };
-                if matches!(woke, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) {
-                    return;
-                }
-            }
-        })
-        .ok();
-}
-
+/// `smeltd install` 请正在跑的运行时换到新装的版本，见 [`request_self_upgrade`]。
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SelfUpgradeOutcome {
     Upgraded,
     Failed(String),
 }
 
-/// 对自己 socket 发一次 upgrade op（纯 IO，可单测判定；socket 交互在调用方）。
+/// 判读 upgrade op 的回执（纯函数，可单测；socket 交互在调用方）。
+#[cfg(any(target_os = "linux", test))]
 fn classify_self_upgrade_reply(reply: &str) -> SelfUpgradeOutcome {
     let value: serde_json::Value = match serde_json::from_str(reply.trim()) {
         Ok(value) => value,
-        Err(_) => return SelfUpgradeOutcome::Failed(format!("回包非 JSON：{reply:?}")),
+        Err(_) => return SelfUpgradeOutcome::Failed(format!("The reply isn't JSON: {reply:?}")),
     };
     if value["ok"].as_bool() == Some(true) {
         return SelfUpgradeOutcome::Upgraded;
@@ -2811,10 +2638,14 @@ fn classify_self_upgrade_reply(reply: &str) -> SelfUpgradeOutcome {
     SelfUpgradeOutcome::Failed(reason)
 }
 
+/// 向本机正在跑的运行时发一次 upgrade op，让它换到 `target`。
+#[cfg(target_os = "linux")]
 pub(crate) fn request_self_upgrade(target: &std::path::Path) -> SelfUpgradeOutcome {
     let sock = match RuntimeStream::connect(sock_path()) {
         Ok(sock) => sock,
-        Err(error) => return SelfUpgradeOutcome::Failed(format!("连自己失败：{error}")),
+        Err(error) => {
+            return SelfUpgradeOutcome::Failed(format!("Couldn't connect to the runtime: {error}"));
+        }
     };
     let _ = sock.set_write_timeout(Some(Duration::from_secs(5)));
     let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
@@ -2823,11 +2654,11 @@ pub(crate) fn request_self_upgrade(target: &std::path::Path) -> SelfUpgradeOutco
         &mut sock,
         &serde_json::json!({ "op": "upgrade", "exe": target.to_string_lossy() }),
     ) {
-        return SelfUpgradeOutcome::Failed(format!("发 upgrade 失败：{error}"));
+        return SelfUpgradeOutcome::Failed(format!("Couldn't send upgrade: {error}"));
     }
     let mut reply = String::new();
     if let Err(error) = BufReader::new(&sock).read_line(&mut reply) {
-        return SelfUpgradeOutcome::Failed(format!("读回包失败：{error}"));
+        return SelfUpgradeOutcome::Failed(format!("Couldn't read the reply: {error}"));
     }
     classify_self_upgrade_reply(&reply)
 }
@@ -2844,13 +2675,17 @@ fn run_serve_loop(
     daemon_fingerprint: Option<String>,
 ) {
     let exe_mtime = exe_mtime_secs();
+    // 要在起任何 Pi 之前：可能要把旧布局里的 smelt-agent 目录挪到固定名字。
+    smelt_core::managed_runtime::tidy_managed_bin();
     // 第一次启动就把运行时身份落盘，不等第一个客户端来问；失败只记日志，describe 时再试。
     let _ = runtime_identity::runtime_id();
-    thread::spawn(smelt_core::managed_runtime::retire_managed_bun);
+    thread::spawn(|| {
+        smelt_core::managed_runtime::retire_managed_bun();
+        smelt_core::pi_mcp::upgrade_preset_pins();
+    });
     thread::spawn(smelt_core::control_skill::remove_legacy_copy);
-    thread::spawn(smelt_core::managed_runtime::reap_legacy_smelt_pi);
     #[cfg(target_os = "linux")]
-    thread::spawn(runtime_upgrade::ensure_smelt_agent);
+    thread::spawn(runtime_upgrade::complete_install);
     // 远程访问每次进程启动都是空的，按落盘配置重新拉起。
     // 菜单栏 quit / 任何路径 cleanup 都要够得着它。
     let remote_state = new_remote_state();
@@ -2873,10 +2708,6 @@ fn run_serve_loop(
     let _ = SERVER.set(server.clone());
     // 自己起线程，不阻塞 accept 循环。
     autostart_remote_from_config(&remote_state);
-
-    // headless 空闲自升级：没有观看连接时磁盘新了没人触发 upgrade，这里兜底。
-    // GUI 连着时它 60s 探一次、有空闲门控，让它拥有升级时机（见函数注释）。
-    spawn_headless_self_upgrade(server.daemon_fingerprint.clone());
 
     // 闲置会话挂起（见 acp_idle）。冷启动走到这里。
     acp_idle::spawn_acp_idle_reaper(Arc::clone(&server.acp_sessions));
@@ -2949,26 +2780,27 @@ fn action_payload(kind: Option<&str>, text: Option<&str>) -> Result<Vec<u8>, &'s
             // 空 reply 若退化成单独 `\r` 就和 approve 一样——误点会当成批准。
             let t = text.unwrap_or("");
             if t.is_empty() {
-                return Err("需要非空 text");
+                return Err("text can't be empty");
             }
             let mut bytes = t.as_bytes().to_vec();
             bytes.push(b'\r');
             Ok(bytes)
         }
-        _ => Err("未知 kind"),
+        _ => Err("unknown kind"),
     }
 }
 
-/// 升级换到哪份映像。可选 `"exe"` 指定不可变映像；没传就是本进程钉住的那份文件。
+/// 升级换到哪份。可选 `"exe"` 指定；没传就是本进程启动时的那条路径，那里装的可能已是新版本。
 fn upgrade_target(req: &serde_json::Value) -> Result<std::path::PathBuf, String> {
     if let Some(p) = req["exe"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
         let path = std::path::PathBuf::from(p);
         if !path.is_file() {
-            return Err(format!("exe 不存在：{}", path.display()));
+            return Err(format!("exe doesn't exist: {}", path.display()));
         }
         return Ok(path);
     }
-    daemon_executable_path().map_err(|error| format!("找不到当前守护映像：{error}"))
+    daemon_executable_path()
+        .map_err(|error| format!("Couldn't find the runtime's own executable: {error}"))
 }
 
 /// Windows 升级时接班进程从这个变量拿到前任的 pid，等它退出再绑定监听。
@@ -2987,15 +2819,7 @@ fn handle_upgrade<C: ClientSocket>(conn: C, req: &serde_json::Value) {
             return;
         }
     };
-    // 启动名先拨到这份映像。失败就停在当前映像上，不把进程换到一个拨不上的路径。
-    if let Err(error) = smelt_core::daemon_image::retarget_launch_after_commit(&exe) {
-        let _ = smelt_runtime_client::protocol::write_json_line(
-            &mut c,
-            &serde_json::json!({ "ok": false, "err": format!("设置启动名失败：{error}") }),
-        );
-        return;
-    }
-    // 先收割子进程并回执，再换映像：Unix 在本进程里 exec，systemd 看到的还是同一个
+    // 先收割子进程并回执，再换版本：Unix 在本进程里 exec，systemd 看到的还是同一个
     // 主进程；Windows 拉起接班进程后退出。
     protocol::graceful_shutdown(Some(c.into_client_conn()), Some(exe));
 }
@@ -3095,7 +2919,7 @@ fn sync_pi_status_extension_at(path: &std::path::Path) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("无效的 Pi 状态扩展路径：{}", path.display()),
+            format!("Invalid Pi status extension path: {}", path.display()),
         )
     })?;
     std::fs::create_dir_all(parent)?;
@@ -3186,7 +3010,6 @@ fn spawn_session(
     cols: u16,
     cwd: Option<&str>,
     launch: TerminalLaunch<'_>,
-    event_hub: &EventHubHandle,
 ) -> anyhow::Result<(Session, Box<dyn PtyReader>)> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
@@ -3269,6 +3092,7 @@ fn spawn_session(
         ..Default::default()
     }));
     let replies = Arc::new(Mutex::new(VecDeque::new()));
+    let bell = Arc::new(AtomicBool::new(false));
     let sess = Session {
         instance,
         geometry_token: uuid::Uuid::new_v4().simple().to_string(),
@@ -3293,11 +3117,8 @@ fn spawn_session(
         }),
         output_gate: Mutex::new(()),
         replies: Arc::clone(&replies),
-        term: Mutex::new(new_daemon_term(
-            rows,
-            cols,
-            StateListener::with_replies(Arc::clone(&state), Arc::clone(event_hub), replies),
-        )),
+        bell: Arc::clone(&bell),
+        term: Mutex::new(new_daemon_term(rows, cols, StateListener::new(replies, bell))),
         graphics: Mutex::default(),
         state,
     };
@@ -3345,15 +3166,16 @@ fn flush_terminal_replies(sess: &Session) {
     write_terminal_replies(sess);
 }
 
-/// 把一批输出里扫到的 OSC 通知发给订阅的客户端。会话已有结构化 hook 事件时不发：
-/// 那之后 agent 的状态和通知都以 hook 为准，终端通知只会重复。
+/// 把一批输出里扫到的 OSC 通知和响铃交给提醒。会话已有结构化 hook 事件时不记：那之后 agent
+/// 的状态和通知都以 hook 为准，终端通知和响铃只会重复。
 fn publish_terminal_notifications(
     state: &Mutex<SessionState>,
     id: &str,
     event_hub: &EventHubHandle,
     messages: Vec<String>,
+    bell: bool,
 ) {
-    if messages.is_empty() {
+    if messages.is_empty() && !bell {
         return;
     }
     let structured = state
@@ -3364,10 +3186,29 @@ fn publish_terminal_notifications(
         return;
     }
     for message in messages {
+        event_hub.notify_attention(
+            id,
+            smelt_event_protocol::AttentionKind::Notice,
+            attention::NOTICE_TITLE,
+            &message,
+        );
         if let Err(error) = event_hub.publish_terminal_notification(id, None, &message) {
             eprintln!("[event-hub] terminal notification publish failed: {error}");
         }
     }
+    if bell {
+        event_hub.notify_attention(
+            id,
+            smelt_event_protocol::AttentionKind::Bell,
+            attention::BELL_TITLE,
+            "",
+        );
+    }
+}
+
+/// 这批输出里响过铃没有，顺手清掉。
+fn take_terminal_bell(sess: &Session) -> bool {
+    sess.bell.swap(false, Ordering::AcqRel)
 }
 
 fn publish_terminal_progress(
@@ -3410,6 +3251,8 @@ fn start_pty_pump(
         let mut progress = ProgressTracker::default();
         // resume 的旧 keyframe 理论上不含查询序列；即便有，也要在首次 read 前答复。
         flush_terminal_replies(&sess);
+        // 旧 keyframe 里的响铃不是现在响的。
+        take_terminal_bell(&sess);
         loop {
             match pty_reader.read(&mut buf) {
                 Ok(0) => break,
@@ -3539,7 +3382,13 @@ fn start_pty_pump(
                     if let Some(snapshot) = program_status {
                         broadcast_state(&event_hub, &snapshot);
                     }
-                    publish_terminal_notifications(&sess.state, &id, &event_hub, notifications);
+                    publish_terminal_notifications(
+                        &sess.state,
+                        &id,
+                        &event_hub,
+                        notifications,
+                        take_terminal_bell(&sess),
+                    );
                     publish_terminal_progress(&mut progress, &id, sess.instance, &event_hub);
                 }
             }

@@ -49,7 +49,7 @@ pub fn set_thinking_level(params: ThinkingLevelParams) -> Result<(), String> {
             model.model.filter(|v| !v.trim().is_empty())?,
         ))
     }) else {
-        return Err("先选一个默认模型，再调推理强度".into());
+        return Err("Pick a default model before setting the reasoning effort".into());
     };
     let config = PiDefaultModelConfig {
         provider,
@@ -120,10 +120,14 @@ pub fn save_custom_provider(params: SaveCustomProviderParams) -> Result<bool, St
             api_key: api_key.clone().unwrap_or_default(),
             saved_provider_id: previous_id.clone(),
         })
-        .map_err(|error| format!("{error}\n未能自动获取模型，请手动填写至少一个模型"))?
+        .map_err(|error| {
+            format!(
+                "{error}\nCouldn't fetch the models automatically; enter at least one model by hand"
+            )
+        })?
         .models;
         if discovered.is_empty() {
-            return Err("该端点没有报告任何模型，请手动填写至少一个模型".into());
+            return Err("The endpoint reported no models; enter at least one model by hand".into());
         }
         provider.models = discovered
             .into_iter()
@@ -169,7 +173,7 @@ pub fn ensure_config_file(
     if !path.exists() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|error| format!("创建 Pi 配置目录失败：{error}"))?;
+                .map_err(|error| format!("couldn't create the Pi config directory: {error}"))?;
         }
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -181,10 +185,10 @@ pub fn ensure_config_file(
         match options.open(&path) {
             Ok(mut file) => {
                 file.write_all(b"{\n}\n")
-                    .map_err(|error| format!("创建 Pi 配置文件失败：{error}"))?;
+                    .map_err(|error| format!("couldn't create the Pi config file: {error}"))?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(format!("创建 Pi 配置文件失败：{error}")),
+            Err(error) => return Err(format!("couldn't create the Pi config file: {error}")),
         }
     }
     Ok(EnsureConfigFileResult {
@@ -206,15 +210,10 @@ pub fn set_mcp_enabled(params: McpEnabledParams) -> Result<(), String> {
 /// 残留的勾选会在以后添加同名服务器时自动生效。先清勾选，中途失败时服务器还在列表里，
 /// 再删一次会把剩下的勾选清完（清勾选可重入）；清完了删失败，同样再删一次即可。
 pub fn remove_mcp_server(params: McpServerParams) -> Result<(), String> {
-    crate::agent_definition_store::forget_mcp_server(&params.name)
-        .map_err(|error| format!("清理智能体里的勾选失败，服务器没有删除：{error}"))?;
+    crate::agent_definition_store::forget_mcp_server(&params.name).map_err(|error| {
+        format!("Couldn't clear the agents' selections, so the server wasn't deleted: {error}")
+    })?;
     crate::pi_mcp::remove_pi_mcp_server(&params.name)
-}
-
-/// 跑 `pi mcp login <name>`：需要授权时 Pi 打开浏览器，等回调写好令牌。
-/// 浏览器开在运行时那台机器上；远程运行时上的 OAuth 登录要等登录地址能转给客户端。
-pub fn login_mcp_server(params: McpServerParams) -> Result<(), String> {
-    crate::pi_mcp::login_pi_mcp_server(&params.name, &|_| {}).map(|_| ())
 }
 
 /// 先清掉这台机器上各智能体对这个插件的勾选，再删 `~/.pi` 下的插件实体。顺序的道理同
@@ -223,10 +222,40 @@ pub fn remove_plugin(params: PluginIdParams) -> Result<(), String> {
     let plugin = crate::pi_plugin_catalog::discover_plugins()
         .into_iter()
         .find(|plugin| plugin.id == params.id)
-        .ok_or_else(|| format!("插件不存在：{}", params.id))?;
-    crate::agent_definition_store::forget_plugin(&plugin.id)
-        .map_err(|error| format!("清理智能体里的勾选失败，插件没有删除：{error}"))?;
+        .ok_or_else(|| format!("The plugin doesn't exist: {}", params.id))?;
+    crate::agent_definition_store::forget_plugin(&plugin.id).map_err(|error| {
+        format!("Couldn't clear the agents' selections, so the plugin wasn't deleted: {error}")
+    })?;
     crate::pi_plugin_catalog::remove_plugin(&plugin)
+}
+
+/// 同名几份里以 `path` 那份为准：别的进回收目录，它不在通用目录就移过去（见
+/// [`crate::skill_home::SkillHome::adopt`]）。只有一份时就是把旧位置的移到通用目录。
+/// id 不变，智能体的勾选不用动。
+pub fn adopt_plugin(params: AdoptPluginParams) -> Result<(), String> {
+    let plugin = crate::pi_plugin_catalog::discover_plugins()
+        .into_iter()
+        .find(|plugin| {
+            plugin.id == params.id && plugin.kind == crate::pi_plugin_catalog::PiPluginKind::Skill
+        })
+        .ok_or_else(|| format!("The skill doesn't exist: {}", params.id))?;
+    let home = crate::skill_home::SkillHome::current()
+        .ok_or_else(|| "can't find the home directory".to_string())?;
+    home.adopt(
+        std::path::Path::new(&params.path),
+        &crate::skill_home::copies(&plugin),
+    )
+    .map(|_| ())
+}
+
+/// 给 Claude Code 补齐指回 `~/.agents/skills` 的链接。读配置时顺带做：用户在 smelt 之外
+/// 装的技能，下次打开能力库就补上。失败只记日志，不挡读配置。
+pub fn sync_skill_bridges() {
+    if let Some(home) = crate::skill_home::SkillHome::current()
+        && let Err(error) = home.sync_bridges()
+    {
+        eprintln!("[pi] 给 Claude Code 补技能链接失败：{error}");
+    }
 }
 
 pub fn import_plugin(params: ImportPluginParams) -> Result<(), String> {
@@ -291,6 +320,8 @@ mod tests {
                 origin: "~/.pi/agent/skills".into(),
                 broken: None,
                 builtin: false,
+                legacy_location: false,
+                duplicates: Vec::new(),
             }],
             model_choice_groups: Vec::new(),
             auto_provider_ids: vec!["gateway".into()],
@@ -314,6 +345,9 @@ mod tests {
             ..SaveCustomProviderParams::default()
         })
         .unwrap_err();
-        assert!(!error.contains("未能自动获取模型"), "{error}");
+        assert!(
+            !error.contains("Couldn't fetch the models automatically"),
+            "{error}"
+        );
     }
 }

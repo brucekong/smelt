@@ -1,7 +1,11 @@
-//! `smelt mcp …`、`smelt plugin …`、`smelt model …`：能力库里 Pi 的 MCP 服务器、插件和默认
-//! 模型。都是运行时那台机器上的全局配置，对所有智能体生效。
+//! `smelt mcp …`、`smelt pi skill|extension …`、`smelt model …`：能力库里 Pi 的 MCP 服务器、
+//! 技能和扩展、默认模型。都是运行时那台机器上的全局配置，对所有智能体生效。
+//!
+//! Pi 的技能和扩展放在 `smelt pi` 下，不叫插件：`smelt plugin` 是 Smelt 自己的界面插件
+//! （桌面程序里的命令，见 `smelt` 的 `plugins::cli`）。
 
-use crate::{control, flag_value, id_arg, respond, usage};
+use crate::{control, id_arg, respond, usage};
+use rust_i18n::t;
 use smelt_model::control_api::{
     PiConfigGet, PiMcpAddPreset, PiMcpRemove, PiMcpSetEnabled, PiModelsSaveDefault,
     PiModelsSetThinkingLevel, PiPluginsImport, PiPluginsRemove,
@@ -29,7 +33,7 @@ pub(crate) fn run_mcp(args: &[String]) -> i32 {
         Some("presets") => respond(Ok(presets_json())),
         Some("add") => match id_arg(rest) {
             Some(id) => respond(add_preset(id)),
-            None => usage("smelt mcp add <预设id>（smelt mcp presets 查看）"),
+            None => usage(&t!("mcp.add_usage")),
         },
         Some(verb @ ("enable" | "disable")) => match id_arg(rest) {
             Some(name) => respond(
@@ -39,7 +43,7 @@ pub(crate) fn run_mcp(args: &[String]) -> i32 {
                 })
                 .and_then(mcp_json),
             ),
-            None => usage("smelt mcp enable|disable <服务器名>"),
+            None => usage(&t!("mcp.toggle_usage")),
         },
         Some("remove") => match id_arg(rest) {
             Some(name) => respond(
@@ -48,9 +52,9 @@ pub(crate) fn run_mcp(args: &[String]) -> i32 {
                 })
                 .and_then(mcp_json),
             ),
-            None => usage("smelt mcp remove <服务器名>"),
+            None => usage(&t!("mcp.remove_usage")),
         },
-        Some(command) => usage(&format!("未知子命令: {command}")),
+        Some(command) => usage(&t!("unknown_subcommand", command = command)),
         None => usage("smelt mcp list|presets|add|enable|disable|remove"),
     }
 }
@@ -58,7 +62,7 @@ pub(crate) fn run_mcp(args: &[String]) -> i32 {
 fn mcp_json(config: PiConfig) -> Result<serde_json::Value, String> {
     let servers = config
         .mcp_servers
-        .map_err(|error| format!("读不到 MCP 配置：{error}"))?;
+        .map_err(|error| t!("mcp_config_unreadable", error = error).into_owned())?;
     Ok(serde_json::json!({ "servers": servers }))
 }
 
@@ -68,8 +72,8 @@ fn presets_json() -> serde_json::Value {
         .map(|preset| {
             serde_json::json!({
                 "id": preset.id,
-                "name": preset.name,
-                "summary": preset.summary,
+                "name": preset.name(),
+                "summary": preset.summary(),
                 "needs_sign_in": preset.transport.needs_sign_in(),
                 "extension_url": preset.extension_url,
             })
@@ -81,70 +85,90 @@ fn presets_json() -> serde_json::Value {
 /// 要登录的服务器加上以后还连不上，得让用户去设置里点「登录」（要开浏览器授权），
 /// 命令行不代办。
 fn add_preset(id: &str) -> Result<serde_json::Value, String> {
-    let preset =
-        find_preset(id).ok_or_else(|| format!("没有这个预设：{id}（smelt mcp presets 查看）"))?;
+    let preset = find_preset(id).ok_or_else(|| t!("mcp.no_such_preset", id = id).into_owned())?;
     let mut result =
         control::<PiMcpAddPreset>(McpPresetParams { id: id.to_string() }).and_then(mcp_json)?;
     if preset.transport.needs_sign_in() {
-        result["next"] = "需要用户在 Smelt 设置的能力库里登录这个服务器".into();
+        result["next"] = t!("mcp.next_sign_in").into_owned().into();
     } else if let Some(url) = preset.extension_url {
-        result["next"] = format!("需要用户在 Chrome 里装扩展：{url}").into();
+        result["next"] = t!("mcp.next_extension", url = url).into_owned().into();
     }
     Ok(result)
 }
 
-pub(crate) fn run_plugin(args: &[String]) -> i32 {
-    let rest = args.get(1..).unwrap_or_default();
-    match args.first().map(String::as_str) {
-        Some("list") => respond(config().map(plugins_json)),
-        Some("import") => match parse_import(rest) {
-            Ok(params) => respond(control::<PiPluginsImport>(params).map(plugins_json)),
+/// `smelt pi skill|extension …`：Pi 的技能（带 SKILL.md 的目录）和扩展（注册工具、命令的
+/// TypeScript 模块）。两类分开管，各自只列、只删自己那类。
+pub(crate) fn run(args: &[String]) -> i32 {
+    let kind = match args.first().map(String::as_str) {
+        Some("skill") => PiPluginKind::Skill,
+        Some("extension") => PiPluginKind::Extension,
+        Some(command) => return usage(&t!("unknown_subcommand", command = command)),
+        None => return usage("smelt pi skill|extension list|import|remove"),
+    };
+    let rest = args.get(2..).unwrap_or_default();
+    match args.get(1).map(String::as_str) {
+        Some("list") => respond(config().map(|config| catalog_json(config, kind))),
+        Some("import") => match import_params(kind, rest) {
+            Ok(params) => {
+                respond(control::<PiPluginsImport>(params).map(|config| catalog_json(config, kind)))
+            }
             Err(message) => usage(&message),
         },
         Some("remove") => match id_arg(rest) {
-            Some(id) => respond(
-                control::<PiPluginsRemove>(PluginIdParams { id: id.to_string() }).map(plugins_json),
+            Some(name) => respond(
+                control::<PiPluginsRemove>(PluginIdParams {
+                    id: catalog_id(kind, name),
+                })
+                .map(|config| catalog_json(config, kind)),
             ),
-            None => usage("smelt plugin remove <id>"),
+            None => usage(&format!("smelt pi {} remove <name>", kind.as_str())),
         },
-        Some(command) => usage(&format!("未知子命令: {command}")),
-        None => usage("smelt plugin list|import|remove"),
+        Some(command) => usage(&t!("unknown_subcommand", command = command)),
+        None => usage(&format!("smelt pi {} list|import|remove", kind.as_str())),
     }
 }
 
-fn plugins_json(config: PiConfig) -> serde_json::Value {
-    let plugins: Vec<_> = config
+/// 目录里的 id 是 `<类别>:<名字>`；命令行写名字或整个 id 都行。
+pub(crate) fn catalog_id(kind: PiPluginKind, name: &str) -> String {
+    let prefix = format!("{}:", kind.as_str());
+    if name.starts_with(&prefix) {
+        name.to_string()
+    } else {
+        format!("{prefix}{name}")
+    }
+}
+
+/// 只列这一类。智能体的 `--skill` / `--extension` 写 `name` 或 `id` 都行。
+fn catalog_json(config: PiConfig, kind: PiPluginKind) -> serde_json::Value {
+    let items: Vec<_> = config
         .plugins
         .into_iter()
-        .map(|plugin| {
+        .filter(|item| item.kind == kind)
+        .map(|item| {
             serde_json::json!({
-                "id": plugin.id,
-                "kind": plugin.kind.as_str(),
-                "name": plugin.name,
-                "description": plugin.description,
-                "origin": plugin.origin,
-                "builtin": plugin.builtin,
-                "broken": plugin.broken,
+                "id": item.id,
+                "name": item.name,
+                "description": item.description,
+                "origin": item.origin,
+                "builtin": item.builtin,
+                "broken": item.broken,
             })
         })
         .collect();
-    serde_json::json!({ "plugins": plugins })
+    let key = match kind {
+        PiPluginKind::Skill => "skills",
+        PiPluginKind::Extension => "extensions",
+    };
+    serde_json::json!({ key: items })
 }
 
 /// 运行时在本机，相对路径按当前目录补全（运行时的工作目录不是这里）。
-fn parse_import(args: &[String]) -> Result<ImportPluginParams, String> {
-    const USAGE: &str = "smelt plugin import --skill <目录> | --extension <路径>";
-    let kind = match args.first().map(String::as_str) {
-        Some("--skill") => PiPluginKind::Skill,
-        Some("--extension") => PiPluginKind::Extension,
-        _ => return Err(USAGE.into()),
+fn import_params(kind: PiPluginKind, args: &[String]) -> Result<ImportPluginParams, String> {
+    let [source] = args else {
+        return Err(format!("smelt pi {} import <path>", kind.as_str()));
     };
-    if args.len() != 2 {
-        return Err(USAGE.into());
-    }
-    let source = flag_value(args, 0)?;
-    let source =
-        std::path::absolute(&source).map_err(|error| format!("路径无效：{source}：{error}"))?;
+    let source = std::path::absolute(source)
+        .map_err(|error| t!("pi.invalid_path", path = source, error = error).into_owned())?;
     Ok(ImportPluginParams {
         kind,
         source: source.to_string_lossy().into_owned(),
@@ -157,7 +181,7 @@ pub(crate) fn run_model(args: &[String]) -> i32 {
         Some("list") => respond(config().and_then(models_json)),
         Some("default") => match id_arg(rest) {
             Some(model) => respond(set_default(model)),
-            None => usage("smelt model default <provider>/<模型id>（smelt model list 查看）"),
+            None => usage(&t!("model.default_usage")),
         },
         Some("thinking") => match id_arg(rest) {
             Some(level) if THINKING_LEVELS.contains(&level) => respond(
@@ -171,7 +195,7 @@ pub(crate) fn run_model(args: &[String]) -> i32 {
                 THINKING_LEVELS.join("|")
             )),
         },
-        Some(command) => usage(&format!("未知子命令: {command}")),
+        Some(command) => usage(&t!("unknown_subcommand", command = command)),
         None => usage("smelt model list|default|thinking"),
     }
 }
@@ -180,7 +204,7 @@ pub(crate) fn run_model(args: &[String]) -> i32 {
 fn models_json(config: PiConfig) -> Result<serde_json::Value, String> {
     let summary = config
         .settings_summary
-        .map_err(|error| format!("读不到 Pi 设置：{error}"))?;
+        .map_err(|error| t!("model.settings_unreadable", error = error).into_owned())?;
     Ok(serde_json::json!({
         "default": summary.default_model,
         "models": config.model_choice_groups,
@@ -201,12 +225,10 @@ fn set_default(value: &str) -> Result<serde_json::Value, String> {
     let (provider, model) = value
         .split_once('/')
         .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
-        .ok_or("格式为 <provider>/<模型id>")?;
+        .ok_or_else(|| t!("model.format").into_owned())?;
     let current = config()?;
     if !has_model(&current, provider, model) {
-        return Err(format!(
-            "没有这个模型：{provider}/{model}（smelt model list 查看）"
-        ));
+        return Err(t!("no_such_model", provider = provider, model = model).into_owned());
     }
     let thinking_level = current
         .settings_summary
@@ -234,13 +256,25 @@ mod tests {
 
     #[test]
     fn import_resolves_relative_paths_here() {
-        let params = parse_import(&args(&["--skill", "skills/writer"])).unwrap();
+        let params = import_params(PiPluginKind::Skill, &args(&["skills/writer"])).unwrap();
         assert_eq!(params.kind, PiPluginKind::Skill);
         assert!(std::path::Path::new(&params.source).is_absolute());
         assert!(params.source.ends_with("writer"));
-        assert!(parse_import(&args(&["--skill"])).is_err());
-        assert!(parse_import(&args(&["--theme", "x"])).is_err());
-        assert!(parse_import(&args(&["--extension", "a", "b"])).is_err());
+        assert!(import_params(PiPluginKind::Skill, &args(&[])).is_err());
+        assert!(import_params(PiPluginKind::Extension, &args(&["a", "b"])).is_err());
+    }
+
+    #[test]
+    fn remove_takes_a_name_or_the_whole_id() {
+        assert_eq!(catalog_id(PiPluginKind::Skill, "writer"), "skill:writer");
+        assert_eq!(
+            catalog_id(PiPluginKind::Skill, "skill:writer"),
+            "skill:writer"
+        );
+        assert_eq!(
+            catalog_id(PiPluginKind::Extension, "skill:x"),
+            "extension:skill:x"
+        );
     }
 
     #[test]

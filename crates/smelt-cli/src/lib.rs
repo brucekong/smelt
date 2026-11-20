@@ -4,18 +4,26 @@
 //! 它们各自去开窗口。这里只拦截明确的控制命令，一律经 smeltd 读写：库只有运行时一个
 //! 写入者，CLI 不绕过它。smeltd 没在跑时直接报错。
 //!
-//! 不开放的：配对设备和远程（等于把 shell 交出去）、需要浏览器的登录、采纳/删除记忆
-//! （运行时对智能体进程树拒绝）、钩子和往桌面打字。
+//! App 里的功能（开视图、开页面等）经 `smelt app` 调插件开给命令行的命令，运行时转给本机
+//! 开着的 App；宿主不认识具体命令。
+//!
+//! 不开放的：配对设备和远程（等于把 shell 交出去）、需要浏览器的登录和凭据、采纳/删除记忆
+//! （运行时只认签过名的桌面，且拒绝智能体会话进程树）、往桌面打字。
+
+rust_i18n::i18n!("locales", fallback = "en");
 
 mod agent;
+mod app;
 mod automation;
 mod conversation;
+mod engine;
+mod history;
 mod pi;
+mod workspace;
 
+use rust_i18n::t;
 use smelt_model::appearance_settings::SettingsPatch;
-use smelt_model::control_api::{
-    NotifySend, NotifySendParams, QuotaGet, SettingsGet, SettingsUpdate,
-};
+use smelt_model::control_api::{NotifySend, NotifySendParams, SettingsGet, SettingsUpdate};
 use smelt_runtime_client::protocol::control::{
     ControlCall, ControlClientError, ControlMethod, EmptyParams,
 };
@@ -32,14 +40,24 @@ where
         .collect();
     match args.get(1).map(String::as_str) {
         Some(
-            "agent" | "conversation" | "automation" | "mcp" | "plugin" | "model" | "quota"
-            | "settings" | "notify" | "help" | "-h" | "--help" | "--version" | "-V",
+            "agent" | "app" | "conversation" | "project" | "worktree" | "history" | "automation"
+            | "mcp" | "pi" | "model" | "quota" | "engine" | "hooks" | "settings" | "notify"
+            | "help" | "-h" | "--help" | "--version" | "-V",
         ) => Some(run(&args)),
         _ => None,
     }
 }
 
+/// 命令行没有自己的语言设置，用法、报错和运行时报错的原因都按系统语言说。
+pub fn use_system_locale() {
+    let locale = sys_locale::get_locale().map_or(smelt_model::locale::FALLBACK_LOCALE, |tag| {
+        smelt_model::locale::supported_locale(&tag)
+    });
+    rust_i18n::set_locale(locale);
+}
+
 fn run(args: &[String]) -> i32 {
+    use_system_locale();
     let rest = &args[2..];
     match args.get(1).map(String::as_str) {
         Some("--version" | "-V") => {
@@ -52,11 +70,17 @@ fn run(args: &[String]) -> i32 {
         }
         Some("agent") => agent::run(rest),
         Some("conversation") => conversation::run(rest),
+        Some("project") => workspace::run_project(rest),
+        Some("worktree") => workspace::run_worktree(rest),
+        Some("history") => history::run(rest),
+        Some("app") => app::run(rest),
         Some("automation") => automation::run(rest),
         Some("mcp") => pi::run_mcp(rest),
-        Some("plugin") => pi::run_plugin(rest),
+        Some("pi") => pi::run(rest),
         Some("model") => pi::run_model(rest),
-        Some("quota") => respond(control::<QuotaGet>(EmptyParams::default())),
+        Some("quota") => engine::run_quota(rest),
+        Some("engine") => engine::run(rest),
+        Some("hooks") => engine::run_hooks(rest),
         Some("settings") => run_settings(rest),
         Some("notify") => match parse_notify(rest) {
             Ok(params) => respond(control::<NotifySend>(params)),
@@ -68,62 +92,23 @@ fn run(args: &[String]) -> i32 {
 
 /// Linux 上只有运行时、没有图形界面，不列「启动图形界面」那一行。
 pub fn print_help() {
-    let gui = if cfg!(target_os = "linux") {
-        ""
+    // Linux 上的 `smelt` 不带界面，也就没有开 App 和 Smelt 插件这两组命令。
+    let (gui, plugins) = if cfg!(target_os = "linux") {
+        (String::new(), String::new())
     } else {
-        "  smelt                         启动图形界面\n"
+        (
+            format!("  smelt                         {}\n", t!("help.gui")),
+            t!("help.plugins").into_owned(),
+        )
     };
     eprint!(
-        "\
-smelt {version}
-
-用法（stdout 为 JSON，都需要 smeltd 在跑）：
-{gui}
-智能体（长期定义，不是正在跑的对话）：
-  smelt agent list | get <id> | delete <id>
-  smelt agent create --name <名称> [选项]
-  smelt agent update <id> [选项]          列表类选项整份替换，写 \"\" 清空
-      --prompt <工作方式>  --engine <id>  --memory on|off
-      --plugin <id>...  --mcp <服务器名>...  --folder <路径>...  --link <地址>...
-      --model <provider>/<模型id> | --model default
-  smelt agent chat <id> [--message <第一句话>]   用该定义开一场对话
-
-对话：
-  smelt conversation list [--agent <智能体id>] [--archived]
-  smelt conversation rename <id> --title <标题>
-  smelt conversation archive|unarchive|pin|unpin|delete <id>
-
-自动化：
-  smelt automation list | get <id>
-  smelt automation create --name <名称> (--agent <智能体id> [--prompt <指令>] | --shell <命令>) <触发>... [--notify on|off]
-  smelt automation update <id> [--name ...] [--agent ...] [--prompt ...] [--shell ...] [<触发>...] [--notify on|off]
-      触发（可以组合）：
-      --every-minutes N  --every-hours N  --daily HH:MM
-      --weekly mon,wed,fri@HH:MM          --during 30@09:00-18:00[@weekdays]
-      --webhook  --event <主题> [--event-filter '{{\"字段\":\"值\"}}']
-      update 时：给了定时就整组换掉定时，--event 同理，--webhook 已有就保留原地址；
-      --no-schedule / --no-webhook / --no-event 去掉那一类
-  smelt automation enable|disable|run|delete <id>
-  smelt automation runs [<id>] [--limit N]     最近的运行
-  smelt automation run-log <run_id>            一次运行的输出和对话记录
-  smelt automation cancel <run_id>
-
-能力（对所有智能体生效）：
-  smelt mcp list | presets | add <预设id> | enable|disable|remove <服务器名>
-  smelt plugin list | import --skill|--extension <路径> | remove <id>
-  smelt model list | default <provider>/<模型id> | thinking off|minimal|low|medium|high|xhigh
-  smelt quota
-
-通知（桌面弹出，并推给在手机端打开了「智能体消息」的手机）：
-  smelt notify [--title <标题>] <内容>
-
-设置：
-  smelt settings get
-  smelt settings set appearance.theme_mode=light appearance.ui_font_px=16
-  smelt settings set appearance.theme=\"Ayu Dark\"
-  smelt settings set memory.embedding_base_url=http://localhost:11434/v1 memory.embedding_model=bge-m3
-",
-        version = smelt_version::VERSION,
+        "{}",
+        t!(
+            "help.text",
+            version = smelt_version::VERSION,
+            gui = gui,
+            plugins = plugins
+        )
     );
 }
 
@@ -136,7 +121,11 @@ fn parse_notify(args: &[String]) -> Result<NotifySendParams, String> {
         match args[index].as_str() {
             "--title" => {
                 index += 1;
-                title = Some(args.get(index).ok_or("--title 后面要跟标题")?.to_string());
+                title = Some(
+                    args.get(index)
+                        .ok_or_else(|| t!("notify.title_missing").into_owned())?
+                        .to_string(),
+                );
             }
             word => words.push(word),
         }
@@ -144,29 +133,37 @@ fn parse_notify(args: &[String]) -> Result<NotifySendParams, String> {
     }
     let message = words.join(" ");
     if message.trim().is_empty() {
-        return Err("smelt notify [--title <标题>] <内容>".to_string());
+        return Err(t!("notify.usage").into_owned());
     }
     Ok(NotifySendParams { title, message })
 }
 
 /// 一次 Control API 调用。smeltd 没在跑时给出能看懂的原因。
 fn control<C: ControlCall>(params: C::Params) -> Result<C::Result, String> {
+    control_within::<C>(params, std::time::Duration::from_secs(10))
+}
+
+/// 同 [`control`]，给要等网络、git 或包管理器的慢调用一个更长的上限。
+fn control_within<C: ControlCall>(
+    params: C::Params,
+    timeout: std::time::Duration,
+) -> Result<C::Result, String> {
     smelt_client::daemon_state::local_runtime()
-        .call::<C>(&params, std::time::Duration::from_secs(10))
+        .call::<C>(&params, timeout)
         .map_err(|error| match error {
-            ControlClientError::Protocol(error) => error.message,
+            ControlClientError::Protocol(error) => error.text(),
             ControlClientError::Transport(message)
                 if C::METHOD == ControlMethod::SettingsUpdate =>
             {
-                format!("与 smeltd 通信失败；如果请求已送出，设置修改结果可能未知：{message}")
+                t!("control.settings_transport", error = message).into_owned()
             }
             ControlClientError::InvalidResponse(message)
                 if C::METHOD == ControlMethod::SettingsUpdate =>
             {
-                format!("smeltd 的响应无效，设置修改结果未知：{message}")
+                t!("control.settings_invalid_response", error = message).into_owned()
             }
             ControlClientError::Transport(message) => {
-                format!("连不上 smeltd（需要它在运行）：{message}")
+                t!("control.unreachable", error = message).into_owned()
             }
             other => other.to_string(),
         })
@@ -191,7 +188,7 @@ fn parse_settings_patch(args: &[String]) -> Result<SettingsPatch, String> {
     for arg in args {
         let (key, value) = arg
             .split_once('=')
-            .ok_or_else(|| format!("设置项必须是 key=value: {arg}"))?;
+            .ok_or_else(|| t!("settings.not_key_value", arg = arg).into_owned())?;
         let parsed = if let Ok(number) = value.parse::<u64>() {
             serde_json::json!(number)
         } else if let Ok(number) = value.parse::<f64>() {
@@ -211,18 +208,27 @@ fn id_arg(args: &[String]) -> Option<&str> {
         .filter(|id| !id.trim().is_empty() && !id.starts_with("--"))
 }
 
+/// 命令行给的路径换成绝对路径：在的话解开软链，和桌面选目录得到的写法一致。
+fn absolute(path: &str) -> Result<String, String> {
+    let path = std::path::Path::new(path);
+    dunce::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| error.to_string())
+}
+
 /// `--flag value` 里的 value。
 fn flag_value(args: &[String], index: usize) -> Result<String, String> {
     args.get(index + 1)
         .cloned()
-        .ok_or_else(|| format!("{} 需要一个值", args[index]))
+        .ok_or_else(|| t!("flag.value_missing", flag = args[index]).into_owned())
 }
 
 fn on_off(flag: &str, value: &str) -> Result<bool, String> {
     match value {
         "on" => Ok(true),
         "off" => Ok(false),
-        other => Err(format!("{flag} 只能是 on 或 off，收到 {other}")),
+        other => Err(t!("flag.on_off", flag = flag, value = other).into_owned()),
     }
 }
 
@@ -249,7 +255,7 @@ fn json_id(id: &str) -> serde_json::Value {
 
 fn usage(message: &str) -> i32 {
     eprintln!("{message}");
-    eprintln!("用法见 smelt --help");
+    eprintln!("{}", t!("usage_hint"));
     2
 }
 
@@ -272,21 +278,21 @@ mod tests {
         assert_eq!(maybe_run(["smelt", "--help"]), Some(0));
         assert_eq!(maybe_run(["smelt", "--version"]), Some(0));
         assert_eq!(maybe_run(["smelt"]), None);
-        assert_eq!(maybe_run(["smelt", "--install-app"]), None);
     }
 
     #[test]
     fn unknown_subcommands_fail_without_touching_smeltd() {
-        for group in [
-            "agent",
-            "conversation",
-            "automation",
-            "mcp",
-            "plugin",
-            "model",
-        ] {
+        for group in ["agent", "conversation", "automation", "mcp", "pi", "model"] {
             assert_eq!(maybe_run(["smelt", group, "nope"]), Some(2), "{group}");
         }
+        assert_eq!(maybe_run(["smelt", "pi", "skill", "nope"]), Some(2));
+        assert_eq!(maybe_run(["smelt", "pi", "extension", "nope"]), Some(2));
+    }
+
+    #[test]
+    fn smelt_plugins_are_left_to_the_desktop_app() {
+        // `smelt plugin` 是 Smelt 自己的界面插件，由桌面程序处理；Pi 的技能和扩展在 `smelt pi`。
+        assert_eq!(maybe_run(["smelt", "plugin", "status"]), None);
     }
 
     #[test]

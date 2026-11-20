@@ -1,115 +1,114 @@
 //! 语义色板。自绘界面的颜色只从**当前装上的主题**来。
 //!
-//! gpui-kit 的 `Theme::update` / `apply_config` 管组件库。侧栏、会话行、气泡、
-//! Git 大多没有 `&App`，不能在绘制时读 `cx.theme()`，所以装主题时把语义位
-//! 抄进这里，绘制时读 `ui_theme::bg_stage()`。这里没有第二套色值。
+//! 主题由 `theme_catalog::apply` 装上：主题文件求值成语义色（`theme_config::ThemeColors`），
+//! 在这里按窗口材质配好字色，再投影成界面常用的色板 [`Palette`]。侧栏、会话行、气泡、Git
+//! 大多没有 `&App`，绘制时读 `ui_theme::bg()` 这类函数，不读全局；要色板以外的语义色读
+//! [`colors`]，投影读 [`elevation`]。这里没有第二套色值：还没装主题时用的也是 smelt 主题文件。
 //!
-//! 默认主题是库自带的 Default Dark / Default Light。换 Ayu、Catppuccin
-//! 或其它已注册主题时，下面这一条映射整份重填。主题文件不带产品色块。
+//! 色板位和读的语义色一一对应，见 `docs/ui-design-language.md` 第 2 节。默认主题是
+//! smelt-ui 自带的 smelt Light / smelt Dark（`theme_catalog`），换别的主题时整份重填。
 //!
-//! 内容区用实底，不要再给卡片叠半透明。调用点不写裸 `rgb(0x...)`。
+//! 界面本身是黑白灰：颜色只表示状态（`run` / `need` / `ok` / `bad`）和主操作
+//! （`ink`）。调用点不写裸 `rgb(0x...)`。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
-use gpui::{FontFeatures, Hsla, Pixels, Rgba, px, rgb, rgba};
+use gpui::{FontFeatures, Pixels, Rgba, px, rgb, rgba};
 
 use smelt_model::agent_status::AgentStatus;
 
+use crate::theme_catalog;
+use crate::theme_config::{Elevation, ThemeColors, ThemeMode};
+
 /// 一套完整语义色板。字段即语义位，深浅两套必须一一对应填满。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
-    // ---- 底色（表面层级） ----
-    /// 项目 rail / Tool Panel 图标条（深色下最深，浅色下最灰）。
-    pub bg_rail: u32,
-    /// 舞台底：中间会话区（终端 / ACP 对话）。
-    pub bg_stage: u32,
-    /// 左右栏底：会话栏和工具栏共用的次表面。
-    pub bg_column: u32,
-    /// 标题栏底。
-    pub bg_bar: u32,
-    /// 卡片 / 胶囊底。读主题的 `popover`，和菜单同一层。
-    pub bg_card: u32,
-    /// 控件 hover。`list_hover` 压在卡片上。
-    pub bg_hover: u32,
-    /// 列表行 hover。`list_hover` 压在侧栏上，不跟控件 hover 共用一个底。
-    pub bg_row_hover: u32,
-    /// 选中行底：主题的 `sidebar.accent`，跟组件库侧栏选中项同一个色。主题没写时组件库
-    /// 回落到 `accent`，这里照用，不另挑颜色。
-    pub bg_selected: u32,
-    /// 状态栏 / 终端底条。
-    pub bg_status: u32,
+    // ---- 底色（由浅到深一档一档往下压） ----
+    /// 舞台：对话、终端所在的主区。`bg_base`。
+    pub bg: u32,
+    /// 侧栏、页签栏。`page`。
+    pub side: u32,
+    /// 菜单、对话框、卡片、输入框、composer。`surface_raised`。
+    pub surface: u32,
+    /// 次要按钮、行悬停、标签。`layer_01`，压在 `side` 上。
+    pub soft: u32,
+    /// 次要按钮悬停、行选中。`layer_02`，同上。
+    pub soft_hover: u32,
+    /// 次要按钮按下、开关关闭底。`layer_03`，同上。
+    pub soft_press: u32,
+    /// 列表行悬停：正文色叠一层透明度，底下透出窗口材质时跟着透。`hover` 压在 `bg` 上
+    /// 那一档，压在字底那层窗口底上至少差 [`ROW_HOVER_MIN_LIGHTNESS`] 的明度。
+    pub row_hover: Rgba,
+    /// 列表行选中，同上。`pressed` 那一档，至少差 [`ROW_SELECTED_MIN_LIGHTNESS`]。
+    pub row_selected: Rgba,
 
-    // ---- 边色（对比由弱到强） ----
-    /// 大区块分界线（列与列之间）。
-    pub border_dim: u32,
-    /// 标题栏下沿。
-    pub border: u32,
-    /// 卡片 / 胶囊描边。
-    pub border_mid: u32,
-    /// 输入框 / 虚线块描边。
-    pub border_loud: u32,
-    /// hover / 焦点描边。
-    pub border_focus: u32,
+    // ---- 线（带透明度，压在哪层底上都是同一个深浅） ----
+    /// 分隔线、卡片外沿。`border_base`。
+    pub hair: Rgba,
+    /// 输入框、复选框外沿。`border_strong`。
+    pub hair_strong: Rgba,
+
     // ---- 文字（由强到弱） ----
-    /// 标题 / 强调正文。
-    pub text_bright: u32,
-    /// 选中行的字：主题的 `sidebar.accent.foreground`。跟组件库侧栏选中项一样，选中靠底色、
-    /// 这个字色和中等字重一起表达。
-    pub text_selected: u32,
-    /// 正文。
+    /// 正文、标题。`text_base`。
     pub text: u32,
-    /// 次级正文。正文和 `muted_foreground` 的中间。
-    pub text_mid: u32,
-    /// 弱化说明。主题的 `muted_foreground`。
-    pub text_muted: u32,
-    /// 最弱（占位、时间戳、快捷键提示）。从弱字再往窗口底走一截。
-    pub text_faint: u32,
+    /// 说明、次级信息、图标。`text_muted`。
+    pub muted: u32,
+    /// 占位、时间、快捷键。`text_faint`，压在字底下那层窗口底（毛玻璃时是材质，不然是
+    /// `bg`）上至少 3:1。
+    pub faint: u32,
+    /// 压在选中行底上的 `muted`：选中底和窗口底差得出来，原样的次要字压上去就不够对比，
+    /// 按选中底再配一次（[`row_muted`]）。
+    pub muted_selected: u32,
+    /// 压在选中行底上的 `faint`，从 `muted_selected` 往选中底混（[`row_faint`]）。
+    pub faint_selected: u32,
 
-    // ---- 语义色 ----
-    /// 强调色。`link` 能从正文里认出来就用它，否则用列表选中边，再否则用蓝。
-    pub accent: u32,
-    /// 绿：运行正常 / 通过 / diff 新增侧。
-    pub green: u32,
-    /// 黄：警告 / 额度将满，不是 agent 状态。
-    pub yellow: u32,
-    /// 蓝：运行中、读类工具。来自主题的 `base.blue`，不是强调色。
-    pub blue: u32,
-    /// 紫：agent 会话标识 / 模型胶囊。
-    pub purple: u32,
-    /// 红：要你 / 拒绝 / diff 删除侧。
-    pub red: u32,
-    /// diff 新增行的文字色（深色下比 green 亮一档用于深绿底；浅色下反之压深）。
-    pub diff_add_text: u32,
-    /// 实心彩色按钮（橙/绿/黄底）上的反色文字。
-    pub on_accent: u32,
+    // ---- 主操作 ----
+    /// 主操作底、选中的复选框。`bg_contrast`；悬停、按下叠 `contrast_hover` / `contrast_pressed`。
+    pub ink: u32,
+    pub ink_hover: u32,
+    pub ink_press: u32,
+    /// 压在 `ink` 三档上的字和图标。`text_contrast`，三档上都配够 4.5:1。
+    pub on_ink: u32,
 
-    // ---- diff 视图（git_panel 并排/统一视图） ----
-    /// 新增行：前景 / 整行底 / 左色条 / 行内变化片段的加深底。
-    pub diff_add_fg: u32,
-    pub diff_add_bg: u32,
-    pub diff_add_bar: u32,
-    pub diff_add_hl: u32,
-    /// 删除行：同上四件套。
-    pub diff_del_fg: u32,
-    pub diff_del_bg: u32,
-    pub diff_del_bar: u32,
-    pub diff_del_hl: u32,
-    /// 上下文行前景。
-    pub diff_ctx_fg: u32,
-    /// hunk 头前景。
-    pub diff_hunk_fg: u32,
-    /// diff 元信息行（文件头等）前景。
-    pub diff_meta_fg: u32,
-    /// 并排视图里「此侧无对应行」的空白底。
-    pub diff_empty_bg: u32,
-    /// 并排视图中缝分隔线。
-    pub diff_gutter: u32,
+    /// 主按钮三档（常态、悬停、按下），同 `ink`。次要按钮三档是 `bg_button_neutral` 叠
+    /// `hover` / `pressed`，字是 `text`。
+    pub button_primary: [Rgba; 3],
+    pub button_primary_foreground: u32,
+    /// 只有图标的主按钮（发送、提交）三档：`bg_icon_button_contrast` 叠 `submit_hover` /
+    /// `contrast_pressed`。图标是 `submit_icon`，三档上都配够 4.5:1。
+    pub button_submit: [Rgba; 3],
+    pub button_submit_foreground: u32,
+    pub button_secondary: [Rgba; 3],
+    pub button_secondary_foreground: u32,
 
-    /// 主操作填充，读主题的 `primary`。
-    pub action_fill: u32,
-    /// 压在 `action_fill` 上的字和图标。
-    pub action_on: u32,
+    /// 键盘焦点环。`border_focus`。
+    pub focus: Rgba,
+    /// 文字选区（输入框、Markdown）。`selection`，带透明度。
+    pub selection: Rgba,
+    /// 正文里的链接。`text_accent`。
+    pub link: u32,
+
+    // ---- 状态色：只用在状态上 ----
+    /// 在跑。`info.fg`（蓝只表示在跑；信息图标色可以另配色相）。
+    pub run: u32,
+    /// 要你处理、需要留意的提醒。`warning.icon`。
+    pub need: u32,
+    /// 完成、通过、diff 新增。`success.icon`。
+    pub ok: u32,
+    /// 出错、危险操作、diff 删除。`danger.icon`。
+    pub bad: u32,
+    /// 压在 `bad` 实底上的字：`text_contrast` 和 `text_base` 里对比高的那个，配够 4.5:1。
+    pub on_bad: u32,
+
+    /// 弹层（菜单、提示）里的正文。`text_base`，可能带透明度，
+    /// 用 [`popover_foreground`] 压到实际弹层底上取实色。
+    pub popover_text: Rgba,
+
+    /// 对话框后的遮罩。`scrim`。
+    pub scrim: Rgba,
+    /// 分类色（用量分项、轨迹分道）：没有状态含义的并列类别。`chart.1`–`chart.5`。
+    pub chart: [u32; 5],
 }
 
 /// 当前是不是浅色。进程级全局态：色板要在任意渲染函数里同步读到，
@@ -117,183 +116,388 @@ pub struct Palette {
 /// （跟 terminal.rs 的 `DARK_MODE` 是同一路数）。
 static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
 
-static ACTIVE: RwLock<Option<Palette>> = RwLock::new(None);
+/// 装上的主题：投影好的色板，加上它来自的那份语义色和投影。
+#[derive(Clone)]
+struct Installed {
+    palette: Palette,
+    colors: ThemeColors,
+    elevation: Arc<Elevation>,
+    /// 窗口底叠出来的颜色，见 [`backdrop`]。
+    backdrop: u32,
+}
 
-/// 主题还没装上时的明暗。测试和 `apply` 失败时走这里。
-/// 正式切换走 `adopt_active_theme`，整份换成当前主题。
+static ACTIVE: RwLock<Option<Installed>> = RwLock::new(None);
+
+/// 窗口底下那块系统材质（毛玻璃）在深浅两种外观下的代表色（0xRRGGBB）。
+///
+/// 材质的颜色跟着后面的桌面变，程序读不到，只能由宿主按材质种类给一个代表值，往不利的
+/// 那头留余量：深色往亮、浅色往暗。字在代表色上对比够，在常见的桌面上就都够。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaterialTone {
+    pub dark: u32,
+    pub light: u32,
+}
+
+impl MaterialTone {
+    fn pack(self) -> u64 {
+        (u64::from(self.dark & 0xffffff) << 32) | u64::from(self.light & 0xffffff)
+    }
+
+    fn unpack(packed: u64) -> Self {
+        Self {
+            dark: (packed >> 32) as u32,
+            light: packed as u32,
+        }
+    }
+
+    fn pick(self, dark: bool) -> u32 {
+        if dark { self.dark } else { self.light }
+    }
+}
+
+/// 「窗口底下没有材质」：两个色各只占低 24 位，打包后不可能撞上。
+const NO_MATERIAL: u64 = u64::MAX;
+
+/// 窗口底下垫的材质（打包的 [`MaterialTone`]）。
+static WINDOW_MATERIAL: AtomicU64 = AtomicU64::new(NO_MATERIAL);
+/// 有材质时主题底色铺在材质上的不透明度（`f32` 的位）。
+static BG_OPACITY: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+
+/// 宿主告诉色板窗口底透的地方是怎么叠的：底下垫什么材质（`None` 是没有，窗口不透明；几种
+/// 材质时宿主给最不利的那种），主题底色以多大的不透明度（0–1）铺在材质上。界面上的字压在两者叠出来的颜色上（[`text_backdrop`]），
+/// 之后装的每份主题都按它配色，所以这两样变了要重装一次主题。
+pub fn set_window_backdrop(material: Option<MaterialTone>, bg_opacity: f32) {
+    WINDOW_MATERIAL.store(
+        material.map_or(NO_MATERIAL, MaterialTone::pack),
+        Ordering::Relaxed,
+    );
+    BG_OPACITY.store(bg_opacity.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+
+fn window_material() -> Option<MaterialTone> {
+    match WINDOW_MATERIAL.load(Ordering::Relaxed) {
+        NO_MATERIAL => None,
+        packed => Some(MaterialTone::unpack(packed)),
+    }
+}
+
+fn bg_opacity() -> f32 {
+    f32::from_bits(BG_OPACITY.load(Ordering::Relaxed))
+}
+
+/// 窗口底实色的地方铺的那层：不透的主题底色。窗口底只由宿主在窗口根上按地方铺（实色的
+/// 这层、透的地方 [`glass_fill`]），各栏、各视图不再铺页面底。
+pub fn solid_fill() -> Rgba {
+    Rgba {
+        a: 1.0,
+        ..colors().bg_base
+    }
+}
+
+/// 窗口底透的地方（布局声明了材质的停靠区）铺的那层：主题底色按设置的不透明度，透出底下的
+/// 材质。没有材质时和 [`solid_fill`] 一样。
+pub fn glass_fill() -> Rgba {
+    let bg = colors().bg_base;
+    match window_material() {
+        Some(_) => Rgba {
+            a: bg.a * bg_opacity(),
+            ..bg
+        },
+        None => Rgba { a: 1.0, ..bg },
+    }
+}
+
+/// 窗口底透的地方叠出来的颜色：界面上的字、行底、交给组件库和插件的实色都按它配。和
+/// [`glass_fill`] 是同一份算法，读的是同一时刻装上的主题。实色的地方离字更远，对比只会更足。
+pub(crate) fn backdrop() -> u32 {
+    installed(|installed| installed.backdrop)
+}
+
+/// 正文压在窗口底上至少要的对比（WCAG AAA），和次要字拉开层次。
+const TEXT_MIN_CONTRAST: f32 = 7.0;
+/// 次要字压在窗口底上至少要的对比（WCAG AA 正文）。压在实色填充（主按钮、危险底）上的字
+/// 也按这一档。
+const TEXT_MUTED_MIN_CONTRAST: f32 = 4.5;
+/// 行悬停底和窗口底至少差的明度（CIE L*，0–100）：刚好看得出指针在哪一行。
+/// 按明度差不按对比度：同一个对比度在亮底上看着比暗底上重得多，明度差深浅两头观感一样。
+const ROW_HOVER_MIN_LIGHTNESS: f32 = 5.0;
+/// 行选中底和窗口底至少差的明度。名字不随选中换色，选中全靠这层底，要一眼认得出，
+/// 也要和悬停拉开一档。主题配得更深的照主题。
+const ROW_SELECTED_MIN_LIGHTNESS: f32 = 15.0;
+
+/// 字实际压着的那层窗口底：有材质时是主题底色按 `opacity` 叠在材质代表色上，不然就是
+/// 主题底色。
+fn text_backdrop(
+    material: Option<MaterialTone>,
+    background: Rgba,
+    opacity: f32,
+    dark: bool,
+) -> u32 {
+    match material {
+        None => pack(background),
+        Some(tone) => flatten(
+            Rgba {
+                a: background.a * opacity,
+                ..background
+            },
+            tone.pick(dark),
+        ),
+    }
+}
+
+/// 把字色往离底更远的那头（白或黑）挪，挪到和底的对比够 `min` 为止；本来就够的不动。
+/// 只改明暗，色相跟着混，主题给的冷暖还在。
+pub(crate) fn legible(fg: u32, backdrop: u32, min: f32) -> u32 {
+    legible_toward(fg, backdrop, min, away_from(backdrop))
+}
+
+/// 实色按钮悬停、按下两档的底：主题的叠层叠在静息底上。叠完字往哪头挪都不够 4.5:1 时
+/// （浅色主题正文偏浅，主按钮底是中灰，按下往白提，白字就压不住），两档一起反过来、按同样
+/// 的力度往字的另一头压：按下照样看得出，字也看得清。两档同一个方向，不一档变亮一档变暗。
+fn state_fills(rest: u32, overlays: [Rgba; 2]) -> [u32; 2] {
+    let text_side = away_from(rest);
+    let themed = overlays.map(|overlay| flatten(overlay, rest));
+    if themed
+        .iter()
+        .all(|fill| contrast_ratio(text_side, *fill) >= TEXT_MUTED_MIN_CONTRAST)
+    {
+        return themed;
+    }
+    let other_side = 0xffffff - text_side;
+    overlays.map(|overlay| mix(rest, other_side, overlay.a))
+}
+
+/// 离 `backdrop` 更远的那头：白或黑。
+fn away_from(backdrop: u32) -> u32 {
+    if contrast_ratio(0xffffff, backdrop) >= contrast_ratio(0x000000, backdrop) {
+        0xffffff
+    } else {
+        0x000000
+    }
+}
+
+/// 同 [`legible`]，但只往 `toward` 那头挪；那头挪到底也不够时停在 `toward`。
+fn legible_toward(fg: u32, backdrop: u32, min: f32, toward: u32) -> u32 {
+    if contrast_ratio(fg, backdrop) >= min {
+        return fg;
+    }
+    // 对比随 t 单调变大，二分找刚好够的那一步，不多挪。
+    let (mut short, mut enough) = (0.0_f32, 1.0_f32);
+    for _ in 0..16 {
+        let t = (short + enough) / 2.0;
+        if contrast_ratio(mix(fg, toward, t), backdrop) >= min {
+            enough = t;
+        } else {
+            short = t;
+        }
+    }
+    mix(fg, toward, enough)
+}
+
+/// 窗口底下有材质时，把直接压在窗口底上的那几档字色和图标色按实际的窗口底配够对比。主题
+/// 是按自己的 `bg_base` 配色的；毛玻璃时字压在底色和材质叠出来的颜色上，底色铺得越薄越接近
+/// 材质，材质一般比深色主题的底亮、比浅色主题的底暗，灰字就糊成一片。在装主题这一处改，
+/// 自绘色板、[`colors`] 和应用交给组件库的字色是同一组，不用一处处补。没有材质时什么都不改。
+pub(crate) fn fit_text_to_backdrop(colors: &mut ThemeColors, dark: bool) {
+    let Some(material) = window_material() else {
+        return;
+    };
+    let backdrop = text_backdrop(Some(material), colors.bg_base, bg_opacity(), dark);
+    let fit = |color: &mut Rgba, min: f32| {
+        let flat = flatten(*color, backdrop);
+        let fitted = legible(flat, backdrop, min);
+        if fitted != flat {
+            *color = rgb(fitted);
+        }
+    };
+    fit(&mut colors.text_base, TEXT_MIN_CONTRAST);
+    fit(&mut colors.icon_base, TEXT_MIN_CONTRAST);
+    fit(&mut colors.text_muted, TEXT_MUTED_MIN_CONTRAST);
+    fit(&mut colors.icon_muted, TEXT_MUTED_MIN_CONTRAST);
+    fit(&mut colors.text_faint, TEXT_FAINT_MIN_CONTRAST);
+    fit(&mut colors.icon_faint, TEXT_FAINT_MIN_CONTRAST);
+}
+
+/// 主题还没装上时的明暗。测试和 `apply` 失败时走这里，装上同明暗的 smelt 主题。
+/// 正式切换走 `theme_catalog::apply`，整份换成当前主题。
 pub fn set_light(light: bool) {
-    install_palette(builtin_fallback(light), light);
+    install(builtin(light), light);
 }
 
 pub fn is_light() -> bool {
     LIGHT_MODE.load(Ordering::Relaxed)
 }
 
-/// 主题装上之后，按语义位重填产品色板。
-pub fn adopt_active_theme(cx: &gpui::App) {
-    use gpui_component::Theme;
-
-    if !cx.has_global::<Theme>() {
-        return;
-    }
-    let theme = Theme::global(cx);
-    install_palette(palette_from_theme(theme), !theme.is_dark());
+/// 主题装上之后，按语义色重填色板。只由 `theme_catalog::apply` 调；`colors` 已经按材质配过
+/// 字色（[`fit_text_to_backdrop`]）。
+pub(crate) fn install_theme(colors: &ThemeColors, elevation: Arc<Elevation>, dark: bool) {
+    let backdrop = text_backdrop(window_material(), colors.bg_base, bg_opacity(), dark);
+    let installed = Installed {
+        palette: palette_from_tokens(colors, backdrop),
+        colors: *colors,
+        elevation,
+        backdrop,
+    };
+    install(installed, !dark);
 }
 
-fn install_palette(palette: Palette, light: bool) {
+fn install(installed: Installed, light: bool) {
     LIGHT_MODE.store(light, Ordering::Relaxed);
     *ACTIVE
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(palette);
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(installed);
 }
 
-struct ThemeRoles {
-    background: Hsla,
-    foreground: Hsla,
-    muted_foreground: Hsla,
-    sidebar: Hsla,
-    popover: Hsla,
-    list_hover: Hsla,
-    sidebar_accent: Hsla,
-    sidebar_accent_foreground: Hsla,
-    list_active_border: Hsla,
-    title_bar: Hsla,
-    status_bar: Hsla,
-    sidebar_border: Hsla,
-    border: Hsla,
-    input: Hsla,
-    ring: Hsla,
-    link: Hsla,
-    success: Hsla,
-    danger: Hsla,
-    warning: Hsla,
-    blue: Hsla,
-    magenta: Hsla,
-    primary: Hsla,
-    primary_foreground: Hsla,
+/// 同明暗的 smelt 主题，不按材质配字色。
+fn builtin(light: bool) -> Installed {
+    let mode = if light {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    };
+    let config = theme_catalog::builtin_for_mode(mode);
+    let colors = *config.colors();
+    let backdrop = pack(colors.bg_base);
+    Installed {
+        palette: palette_from_tokens(&colors, backdrop),
+        colors,
+        elevation: config.elevation().clone(),
+        backdrop,
+    }
 }
 
-fn palette_from_theme(theme: &gpui_component::Theme) -> Palette {
-    palette_from_roles(&ThemeRoles {
-        background: theme.background,
-        foreground: theme.foreground,
-        muted_foreground: theme.muted_foreground,
-        sidebar: theme.sidebar,
-        popover: theme.popover,
-        list_hover: theme.list_hover,
-        sidebar_accent: theme.sidebar_accent,
-        sidebar_accent_foreground: theme.sidebar_accent_foreground,
-        list_active_border: theme.list_active_border,
-        title_bar: theme.title_bar,
-        status_bar: theme.status_bar,
-        sidebar_border: theme.sidebar_border,
-        border: theme.border,
-        input: theme.input,
-        ring: theme.ring,
-        link: theme.link,
-        success: theme.success,
-        danger: theme.danger,
-        warning: theme.warning,
-        blue: theme.blue,
-        magenta: theme.magenta,
-        primary: theme.primary,
-        primary_foreground: theme.primary_foreground,
-    })
-}
-
-/// 正文和弱字之间的一档。库只有 `muted_foreground` 一种弱字。
-const TEXT_MID_MIX: f32 = 0.45;
-/// 最弱字再往窗口底走的比例。对比仍够 3:1 才走满。
+/// 选中行里的最弱字从选中行里的次要字往选中底走的比例。对比仍够 3:1 才走满。
 const TEXT_FAINT_MIX: f32 = 0.40;
 /// 弱字自己已经偏暗时只走一小步，避免时间戳掉进底色。
 const TEXT_FAINT_SHORT_MIX: f32 = 0.15;
 const TEXT_FAINT_MIN_CONTRAST: f32 = 3.0;
-/// 和正文或窗口底的平方距离不超过这个值，就还是同一种墨。
-/// 纯灰大约 23 级。Default Light 的 link 落到 `#171717`，
-/// 正文是 `#0a0a0a`，只差 13 级，不能当强调色。
-const EMPHASIS_MIN_DISTANCE2: u32 = 40 * 40;
 
-/// 产品档读当前主题的语义位。库没有的几档才用这份主题自己的颜色推一次：
-/// 字的中间档和最弱档、hover 压在各自的底上、选中行取离栏底更远的那个、
-/// 强调色在 link 和正文糊在一起时改走列表选中边。diff 底色用 success / danger
-/// 和背景混一次。不另写一套色，也不按主题名分支。
-fn palette_from_roles(theme: &ThemeRoles) -> Palette {
-    let bg = solid(theme.background, theme.background);
-    let fg = solid(theme.foreground, theme.background);
-    let muted_fg = solid(theme.muted_foreground, theme.background);
-    let column = solid(theme.sidebar, theme.background);
-    let card = solid(theme.popover, theme.background);
-    let row_hover = solid(theme.list_hover, theme.sidebar);
-    let control_hover = solid(theme.list_hover, theme.popover);
-    let border = solid(theme.border, theme.background);
-    let link = solid(theme.link, theme.background);
-    let active_border = solid(theme.list_active_border, theme.background);
-    let green = solid(theme.success, theme.background);
-    let red = solid(theme.danger, theme.background);
-    let yellow = solid(theme.warning, theme.background);
-    let blue = solid(theme.blue, theme.background);
-    let accent = emphasis(link, fg, bg, active_border, blue);
-    let text_selected = solid(theme.sidebar_accent_foreground, theme.sidebar);
+/// 每个色板位读一个语义色，不按主题名分支。实色位压在各自的底上取实色；线、焦点环、遮罩
+/// 保留透明度。压在实色填充上的字（`on_ink`、`on_bad`）配够 4.5:1，主题自己配得不够的也看
+/// 得清。`text_backdrop` 是字实际压着的那层窗口底（[`text_backdrop`]），行底按它保底。
+fn palette_from_tokens(c: &ThemeColors, text_backdrop: u32) -> Palette {
+    let bg = pack(c.bg_base);
+    let on = |color: Rgba| flatten(color, bg);
+    let side = on(c.page);
+    let text = on(c.text_base);
+    let muted = on(c.text_muted);
+    let rows = row_fills(on(c.hover), on(c.pressed), bg, text, muted, text_backdrop);
+    let ink = on(c.bg_contrast);
+    let [ink_hover, ink_press] = state_fills(ink, [c.contrast_hover, c.contrast_pressed]);
+    // 静息、悬停、按下三层底共用一个字色。字色只往离静息底更远的那头挪：按下那层压得
+    // 够深时，挪到头也只是不够 4.5，不会翻成另一头、在静息底上反而看不清。
+    let on_fills = |fg: Rgba, fills: [u32; 3]| {
+        let toward = away_from(fills[0]);
+        fills.into_iter().fold(flatten(fg, fills[0]), |fg, fill| {
+            legible_toward(fg, fill, TEXT_MUTED_MIN_CONTRAST, toward)
+        })
+    };
+    let on_ink = on_fills(c.text_contrast, [ink, ink_hover, ink_press]);
+    let submit = on(c.bg_icon_button_contrast);
+    let [submit_hover, submit_press] = state_fills(submit, [c.submit_hover, c.contrast_pressed]);
+    let submit_fills = [submit, submit_hover, submit_press];
+    let on_submit = on_fills(c.submit_icon, submit_fills);
+    let bad = on(c.danger.icon);
+    let on_bad = [c.text_contrast, c.text_base]
+        .map(|fg| flatten(fg, bad))
+        .into_iter()
+        .max_by(|a, b| contrast_ratio(*a, bad).total_cmp(&contrast_ratio(*b, bad)))
+        .map(|fg| legible(fg, bad, TEXT_MUTED_MIN_CONTRAST))
+        .unwrap_or(text);
+    let neutral = c.bg_button_neutral;
     Palette {
-        bg_rail: bg,
-        bg_stage: bg,
-        bg_column: column,
-        bg_bar: solid(theme.title_bar, theme.background),
-        bg_card: card,
-        bg_hover: control_hover,
-        bg_row_hover: row_hover,
-        bg_selected: solid(theme.sidebar_accent, theme.sidebar),
-        bg_status: solid(theme.status_bar, theme.background),
-        border_dim: solid(theme.sidebar_border, theme.background),
-        border,
-        border_mid: border,
-        border_loud: solid(theme.input, theme.background),
-        border_focus: solid(theme.ring, theme.background),
-        text_bright: fg,
-        text_selected,
-        text: fg,
-        text_mid: mix(fg, muted_fg, TEXT_MID_MIX),
-        text_muted: muted_fg,
-        text_faint: faint_text(muted_fg, bg),
-        accent,
-        green,
-        yellow,
-        blue,
-        purple: solid(theme.magenta, theme.background),
-        red,
-        diff_add_text: green,
-        on_accent: solid(theme.primary_foreground, theme.primary),
-        diff_add_fg: green,
-        diff_add_bg: mix(bg, green, 0.18),
-        diff_add_bar: green,
-        diff_add_hl: mix(bg, green, 0.35),
-        diff_del_fg: red,
-        diff_del_bg: mix(bg, red, 0.18),
-        diff_del_bar: red,
-        diff_del_hl: mix(bg, red, 0.35),
-        diff_ctx_fg: muted_fg,
-        diff_hunk_fg: accent,
-        diff_meta_fg: muted_fg,
-        diff_empty_bg: bg,
-        diff_gutter: card,
-        action_fill: solid(theme.primary, theme.background),
-        action_on: solid(theme.primary_foreground, theme.primary),
+        bg,
+        side,
+        surface: on(c.surface_raised),
+        soft: flatten(c.layer_01, side),
+        soft_hover: flatten(c.layer_02, side),
+        soft_press: flatten(c.layer_03, side),
+        row_hover: rows.hover,
+        row_selected: rows.selected,
+        hair: c.border_base,
+        hair_strong: c.border_strong,
+        text,
+        muted,
+        faint: on(c.text_faint),
+        muted_selected: rows.muted_selected,
+        faint_selected: rows.faint_selected,
+        ink,
+        ink_hover,
+        ink_press,
+        on_ink,
+        button_primary: [rgb(ink), rgb(ink_hover), rgb(ink_press)],
+        button_primary_foreground: on_ink,
+        button_submit: submit_fills.map(rgb),
+        button_submit_foreground: on_submit,
+        button_secondary: [neutral, over(c.hover, neutral), over(c.pressed, neutral)],
+        button_secondary_foreground: text,
+        focus: c.border_focus,
+        selection: c.selection,
+        link: on(c.text_accent),
+        // 「在跑」是蓝（第 4 节），取信息色本身；信息图标色可以另配别的色相（默认主题是紫）。
+        run: on(c.info.fg),
+        need: on(c.warning.icon),
+        ok: on(c.success.icon),
+        bad,
+        on_bad,
+        popover_text: c.text_base,
+        scrim: c.scrim,
+        chart: c.chart.map(on),
     }
 }
 
-fn emphasis(link: u32, foreground: u32, background: u32, active_border: u32, blue: u32) -> u32 {
-    if reads_as_emphasis(link, foreground, background) {
-        link
-    } else if reads_as_emphasis(active_border, foreground, background) {
-        active_border
+struct RowFills {
+    hover: Rgba,
+    selected: Rgba,
+    muted_selected: u32,
+    faint_selected: u32,
+}
+
+/// 列表行的悬停底、选中底和选中行里的次要字。`hover` / `active` 是 `hover` / `pressed` 压在
+/// `bg` 上的那两档实色，换算成正文色的透明度，再按字实际压着的那层窗口底（`backdrop`，毛玻璃时是材质）
+/// 保底到看得出。材质一般比深色主题的底亮，同一层白压上去显得淡，只照主题的透明度会糊。
+fn row_fills(hover: u32, active: u32, bg: u32, text: u32, muted: u32, backdrop: u32) -> RowFills {
+    let hover = row_fill(hover, bg, text, backdrop, ROW_HOVER_MIN_LIGHTNESS);
+    let selected = row_fill(active, bg, text, backdrop, ROW_SELECTED_MIN_LIGHTNESS);
+    let under = flatten(selected, backdrop);
+    let muted_selected = legible(muted, under, TEXT_MUTED_MIN_CONTRAST);
+    RowFills {
+        hover,
+        selected,
+        muted_selected,
+        faint_selected: faint_text(muted_selected, under),
+    }
+}
+
+/// 一档行底：正文色叠透明度。透明度取主题那一档（`fill` 压在 `bg` 上比 `bg` 往正文色走了
+/// 多少）和压在 `backdrop` 上和它差够 `min` 明度要的那档里大的那个。主题把这一档配反了（比底更
+/// 远离正文色）就只按 `min` 算。
+fn row_fill(fill: u32, bg: u32, ink: u32, backdrop: u32, min: f32) -> Rgba {
+    let span = channel_sum(ink) - channel_sum(bg);
+    let themed = if span.abs() < 1.0 {
+        0.0
     } else {
-        blue
-    }
-}
-
-fn reads_as_emphasis(color: u32, foreground: u32, background: u32) -> bool {
-    distance2(color, foreground) > EMPHASIS_MIN_DISTANCE2
-        && distance2(color, background) > EMPHASIS_MIN_DISTANCE2
+        ((channel_sum(fill) - channel_sum(bg)) / span).clamp(0.0, 1.0)
+    };
+    let apart = |t: f32| (lightness(mix(backdrop, ink, t)) - lightness(backdrop)).abs();
+    let alpha = if apart(themed) >= min {
+        themed
+    } else {
+        // 明度差随透明度单调变大，二分找刚好够的那一档。
+        let (mut short, mut enough) = (themed, 1.0_f32);
+        for _ in 0..16 {
+            let t = (short + enough) / 2.0;
+            if apart(t) >= min {
+                enough = t;
+            } else {
+                short = t;
+            }
+        }
+        enough
+    };
+    let mut color = rgb(ink);
+    color.a = alpha;
+    color
 }
 
 fn faint_text(muted: u32, background: u32) -> u32 {
@@ -307,76 +511,44 @@ fn faint_text(muted: u32, background: u32) -> u32 {
     }
 }
 
-/// 主题还没装上时的底。只对齐库 Default 的窗口底：深色 `neutral-950`，浅色白。
-/// 强调色用一档能看见的蓝，不跟正文糊在一起。状态色彼此不同，
-/// 好让首帧的状态点分得开。正式颜色由 `adopt_active_theme` 换上。
+/// 同明暗的 smelt 主题投影出的色板，不按材质配字色。测试拿它当已知的一组色。
+#[cfg(test)]
 pub(crate) fn builtin_fallback(light: bool) -> Palette {
-    let bg = if light { 0xffffff } else { 0x0a0a0a };
-    let fg = if light { 0x0a0a0a } else { 0xfafafa };
-    let muted = if light { 0x737373 } else { 0xa3a3a3 };
-    let border = if light { 0xe5e5e5 } else { 0x262626 };
-    let green = 0x16a34a;
-    let red = 0xdc2626;
-    let yellow = 0xca8a04;
-    let blue = 0x2563eb;
-    let purple = 0x9333ea;
-    Palette {
-        bg_rail: bg,
-        bg_stage: bg,
-        bg_column: bg,
-        bg_bar: bg,
-        bg_card: bg,
-        bg_hover: bg,
-        bg_row_hover: bg,
-        bg_selected: bg,
-        bg_status: bg,
-        border_dim: border,
-        border,
-        border_mid: border,
-        border_loud: border,
-        border_focus: border,
-        text_bright: fg,
-        text_selected: fg,
-        text: fg,
-        text_mid: mix(fg, muted, TEXT_MID_MIX),
-        text_muted: muted,
-        text_faint: faint_text(muted, bg),
-        accent: blue,
-        green,
-        yellow,
-        blue,
-        purple,
-        red,
-        diff_add_text: green,
-        on_accent: bg,
-        diff_add_fg: green,
-        diff_add_bg: mix(bg, green, 0.18),
-        diff_add_bar: green,
-        diff_add_hl: mix(bg, green, 0.35),
-        diff_del_fg: red,
-        diff_del_bg: mix(bg, red, 0.18),
-        diff_del_bar: red,
-        diff_del_hl: mix(bg, red, 0.35),
-        diff_ctx_fg: muted,
-        diff_hunk_fg: blue,
-        diff_meta_fg: muted,
-        diff_empty_bg: bg,
-        diff_gutter: bg,
-        action_fill: fg,
-        action_on: bg,
+    builtin(light).palette
+}
+
+/// 半透明色叠在可能也半透明的色上（source-over），结果仍可能半透明：次要按钮的底本身是
+/// 半透明的，悬停叠层要叠在它上面，底下的窗口材质照样透上来。
+fn over(top: Rgba, bottom: Rgba) -> Rgba {
+    let a = top.a + bottom.a * (1.0 - top.a);
+    if a <= 0.0 {
+        return Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+    }
+    let channel = |t: f32, b: f32| (t * top.a + b * bottom.a * (1.0 - top.a)) / a;
+    Rgba {
+        r: channel(top.r, bottom.r),
+        g: channel(top.g, bottom.g),
+        b: channel(top.b, bottom.b),
+        a,
     }
 }
 
-fn solid(color: Hsla, behind: Hsla) -> u32 {
-    let over = color.to_rgb();
-    if over.a >= 0.98 {
-        pack(over)
-    } else {
-        pack(behind.to_rgb().blend(over))
-    }
+/// 弹层正文来自主题的正文色，半透明时压到实际弹层底色上。
+pub(crate) fn popover_foreground(surface: u32) -> u32 {
+    flatten(palette().popover_text, surface)
 }
 
-fn pack(color: Rgba) -> u32 {
+/// 半透明色压在实底上取实色。
+pub(crate) fn flatten(color: Rgba, behind: u32) -> u32 {
+    pack(rgb(behind).blend(color))
+}
+
+pub(crate) fn pack(color: Rgba) -> u32 {
     let q = |channel: f32| ((channel.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xff;
     (q(color.r) << 16) | (q(color.g) << 8) | q(color.b)
 }
@@ -389,14 +561,6 @@ pub(crate) fn mix(from: u32, to: u32, t: f32) -> u32 {
         (value.clamp(0.0, 255.0).round() as u32) << shift
     };
     channel(16) | channel(8) | channel(0)
-}
-
-fn distance2(a: u32, b: u32) -> u32 {
-    let channel = |shift: u32| {
-        let delta = ((a >> shift) & 0xff).abs_diff((b >> shift) & 0xff);
-        delta * delta
-    };
-    channel(16) + channel(8) + channel(0)
 }
 
 fn channel_lin(channel: u32) -> f32 {
@@ -414,6 +578,16 @@ fn relative_luminance(color: u32) -> f32 {
         + 0.0722 * channel_lin(color & 0xff)
 }
 
+/// CIE L*：人眼看到的明暗，0 黑 100 白，等距的差看着也差不多一样大。
+fn lightness(color: u32) -> f32 {
+    let y = relative_luminance(color);
+    if y > 216.0 / 24389.0 {
+        116.0 * y.cbrt() - 16.0
+    } else {
+        y * 24389.0 / 27.0
+    }
+}
+
 pub(crate) fn contrast_ratio(a: u32, b: u32) -> f32 {
     let l1 = relative_luminance(a);
     let l2 = relative_luminance(b);
@@ -421,94 +595,127 @@ pub(crate) fn contrast_ratio(a: u32, b: u32) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// 当前色板。渲染里同步读，不碰数据库。还没装主题时是库 Default 的底色。
-pub fn palette() -> Palette {
-    let guard = ACTIVE
+/// 当前装上的主题；还没装时装上同明暗的 smelt 主题。
+fn installed<T>(read: impl Fn(&Installed) -> T) -> T {
+    if let Some(installed) = ACTIVE
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(palette) = *guard {
-        return palette;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        return read(installed);
     }
-    drop(guard);
-    let palette = builtin_fallback(is_light());
-    *ACTIVE
+    let light = is_light();
+    let fallback = builtin(light);
+    let value = read(&fallback);
+    let mut slot = ACTIVE
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(palette);
-    palette
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(fallback);
+    }
+    value
 }
 
-/// 给每个语义位生成一个取当前色板的读取函数——调用点写 `ui_theme::bg_rail()`。
+/// 当前色板。渲染里同步读，不碰数据库。
+pub fn palette() -> Palette {
+    installed(|installed| installed.palette)
+}
+
+/// 当前主题的全部语义色，字色已按窗口材质配过。色板 [`Palette`] 没有的位从这里读。
+pub fn colors() -> ThemeColors {
+    installed(|installed| installed.colors)
+}
+
+/// 当前主题的投影（阴影）。
+pub fn elevation() -> Arc<Elevation> {
+    installed(|installed| installed.elevation.clone())
+}
+
+/// 给每个语义位生成一个取当前色板的读取函数——调用点写 `ui_theme::bg()`。
 macro_rules! slots {
-    ($($name:ident),* $(,)?) => {
+    ($ty:ty => $($name:ident),* $(,)?) => {
         $(
             #[inline]
-            pub fn $name() -> u32 {
+            pub fn $name() -> $ty {
                 palette().$name
             }
         )*
     };
 }
 
-slots!(
-    bg_rail,
-    bg_stage,
-    bg_column,
-    bg_bar,
-    bg_card,
-    bg_hover,
-    bg_row_hover,
-    bg_selected,
-    bg_status,
-    border_dim,
-    border,
-    border_mid,
-    border_loud,
-    border_focus,
-    text_bright,
-    text_selected,
+slots!(u32 =>
+    bg,
+    link,
+    side,
+    surface,
+    soft,
+    soft_hover,
+    soft_press,
     text,
-    text_mid,
-    text_muted,
-    text_faint,
-    accent,
-    green,
-    yellow,
-    blue,
-    purple,
-    red,
-    diff_add_text,
-    on_accent,
-    diff_add_fg,
-    diff_add_bg,
-    diff_add_bar,
-    diff_add_hl,
-    diff_del_fg,
-    diff_del_bg,
-    diff_del_bar,
-    diff_del_hl,
-    diff_ctx_fg,
-    diff_hunk_fg,
-    diff_meta_fg,
-    diff_empty_bg,
-    diff_gutter,
+    muted,
+    faint,
+    muted_selected,
+    faint_selected,
+    ink,
+    ink_hover,
+    ink_press,
+    on_ink,
+    run,
+    need,
+    ok,
+    bad,
+    on_bad,
 );
 
-/// 给纯色叠低透明度，用于角标底、激活态背景等衍生色。
-/// `alpha` 0–255；`tint(accent(), 0x22)` 给强调色叠一层淡底。
+slots!(Rgba => row_hover, row_selected, hair, hair_strong, focus, selection, scrim);
+
+/// 列表行里的次要字：选中行压在选中底上，换成按它配过的那档。
+pub fn row_muted(selected: bool) -> u32 {
+    if selected { muted_selected() } else { muted() }
+}
+
+/// 列表行里的最弱字，同 [`row_muted`]。
+pub fn row_faint(selected: bool) -> u32 {
+    if selected { faint_selected() } else { faint() }
+}
+
+/// 第 `index` 个分类色，超出五个时循环。
+pub fn chart(index: usize) -> u32 {
+    let chart = palette().chart;
+    chart[index % chart.len()]
+}
+
+/// 给纯色叠低透明度，用于状态色的浅底（悬停 8%–12%）、标记底等衍生色。
+/// `alpha` 0–255；`tint(need(), 0x1f)` 是「要你处理」的浅底。
 pub fn tint(color: u32, alpha: u8) -> Rgba {
     rgba((color << 8) | alpha as u32)
 }
 
-/// 浮层材质：菜单、补全、对话框。Grok Bot 是实色抬起，不是磨砂。
-/// 函数名 `glass_*` 是历史残留，实现必须不透明。
-pub fn glass_floating() -> Rgba {
-    rgb(bg_card())
+/// 把和 `bg` 差一档的实色底（侧栏的 `side`）换成压在 `bg` 上的半透明黑或白：压在实色
+/// `bg` 上和 `fill` 一样深浅，底下是窗口材质时跟着透。和 `bg` 一样深时全透明。
+/// 主题带色相时只对得上深浅，色相跟着 `bg` 走。
+pub fn shade(fill: u32) -> Rgba {
+    shade_over(fill, bg())
 }
 
-/// 内容卡片材质：工具调用、附件、任务卡。
-/// 实色 `bg_card`，跟主题的 popover 同一层。
-pub fn glass_card() -> Rgba {
-    rgb(bg_card())
+fn shade_over(fill: u32, base: u32) -> Rgba {
+    let ink = if channel_sum(fill) < channel_sum(base) {
+        0x000000
+    } else {
+        0xffffff
+    };
+    let span = channel_sum(ink) - channel_sum(base);
+    let mut color = rgb(ink);
+    color.a = if span.abs() < 1.0 {
+        0.0
+    } else {
+        ((channel_sum(fill) - channel_sum(base)) / span).clamp(0.0, 1.0)
+    };
+    color
+}
+
+fn channel_sum(color: u32) -> f32 {
+    ((color >> 16) & 0xff) as f32 + ((color >> 8) & 0xff) as f32 + (color & 0xff) as f32
 }
 
 /// 内容卡片圆角（工具卡、弹层、对话附件）。窗口分栏本身不圆角。
@@ -535,17 +742,17 @@ pub fn chrome_gap() -> Pixels {
     px(6.)
 }
 
-/// 窗口最外圈内边距。Grok Bot 栏贴边，所以是 0；分栏矩形直接顶到窗口。
+/// 窗口最外圈内边距。分栏贴边，所以是 0；分栏矩形直接顶到窗口。
 pub fn shell_padding() -> Pixels {
     px(0.)
 }
 
-/// 对话列最大宽度。Grok 那种居中阅读栏，不是 IDE 拉满的 1040。
+/// 对话列最大宽度。居中阅读栏，不是 IDE 拉满的 1040。
 pub fn conversation_max_width() -> Pixels {
     px(768.)
 }
 
-/// 输入条圆角。Grok 的 composer 是胶囊，不是 12px 卡片。
+/// 输入条圆角。composer 是大圆角，不是 12px 卡片。
 pub fn composer_radius() -> Pixels {
     px(24.)
 }
@@ -557,8 +764,7 @@ pub fn bubble_radius() -> Pixels {
 
 /// 行、输入框、页签条的高度阶梯。同一档的东西并排放时顶边、底边才对得齐。
 ///
-/// 按钮不要用这里的高度去压 `smelt_ui::Button`。按钮只有 icon / compact / default
-/// 三档，跟库的 20 / 24 / 32 rem 步长对齐。
+/// 按钮不要用这里的高度去压 `smelt_ui::Button`，文字按钮自己有 24 / 28 / 32 三档。
 ///
 /// 圆角和内边距不跟着绑死：同一档里主操作和次操作的内边距本来就有意不同。
 pub mod height {
@@ -612,40 +818,8 @@ pub const CHROME_ISLAND_HEIGHT_PX: f32 = 28.;
 pub const CHROME_ISLAND_BAND_PX: f32 = CHROME_ISLAND_TOP_PX + CHROME_ISLAND_HEIGHT_PX;
 /// 穿过舞台正中的内容要让开胶囊：顶带 + 8px 缝。
 ///
-/// 侧栏和工具页签走交通灯那条 `TOP_BAR_HEIGHT`，不用它。
+/// 侧栏和工具页签走交通灯那条 [`crate::window_bar::TOP_BAR_HEIGHT`]，不用它。
 pub const CHROME_ISLAND_CLEARANCE_PX: f32 = CHROME_ISLAND_BAND_PX + 8.;
-
-/// 主操作填充，读当前主题的 `primary`。
-pub fn action_fill() -> u32 {
-    palette().action_fill
-}
-
-/// 主操作上的字/图标，压在 `action_fill` 上。
-pub fn action_on() -> u32 {
-    palette().action_on
-}
-
-/// 弱分隔：半透明 overlay，不是实色 `border_dim`。
-/// 用来切开区块，又不会把界面画成一堆 1px 表格线。
-pub fn hairline() -> Rgba {
-    overlay(0x14)
-}
-
-/// 卡片轮廓：半透明 overlay，不走硬灰边。
-pub fn card_stroke() -> Rgba {
-    overlay(0x22)
-}
-
-/// composer 输入区：实色抬起，压在舞台底上。
-pub fn glass_input() -> Rgba {
-    rgb(bg_card())
-}
-
-/// 浮层背后的压暗层。Grok Bot 弹层背后还能认出来，不要压成一块黑。
-/// `heavy` 只比轻遮罩深一档，仍透得出舞台。
-pub fn glass_scrim(heavy: bool) -> Rgba {
-    rgba(if heavy { 0x0000004d } else { 0x00000020 })
-}
 
 /// 「在底色上压一层薄纱」——深色下是白纱，浅色下是黑纱。
 /// 收编原先散落的 `rgba(0xffffff0d)` 之类：那些在浅色底上是隐形的。
@@ -654,27 +828,22 @@ pub fn overlay(alpha: u8) -> Rgba {
     rgba((base << 8) | alpha as u32)
 }
 
-/// Agent 三态色：要你红 > 运行蓝 > 空闲灰。
+/// Agent 三态色：要你橙 > 运行蓝 > 空闲灰。
 pub fn agent_status_color(status: AgentStatus) -> Rgba {
     rgb(agent_status_u32(status))
 }
 
-fn agent_status_u32(status: AgentStatus) -> u32 {
+/// 同一套状态色的 `0xRRGGBB` 形态，给菜单栏这类不走 gpui 的地方用。
+pub fn agent_status_u32(status: AgentStatus) -> u32 {
     role_for_status(&palette(), status)
 }
 
 fn role_for_status(palette: &Palette, status: AgentStatus) -> u32 {
     match status {
-        AgentStatus::NeedsYou => palette.red,
-        AgentStatus::Running => palette.blue,
-        AgentStatus::Idle => palette.text_faint,
+        AgentStatus::NeedsYou => palette.need,
+        AgentStatus::Running => palette.run,
+        AgentStatus::Idle => palette.faint,
     }
-}
-
-/// 同一套状态色的 (r, g, b) 形态，给 mac 菜单栏（status_item）用。
-pub fn agent_status_rgb8(status: AgentStatus) -> (u8, u8, u8) {
-    let c = agent_status_u32(status);
-    ((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
 /// 左侧会话 / pane 状态色。空闲是灰，不另画点。
@@ -699,7 +868,7 @@ pub fn running_glow_color(phase: f32) -> Rgba {
     } else {
         RUNNING_GLOW_DARK_LIGHTNESS_GAIN
     };
-    running_glow_color_for(blue(), phase, lightness_gain)
+    running_glow_color_for(run(), phase, lightness_gain)
 }
 
 fn running_glow_color_for(base: u32, phase: f32, lightness_gain: f32) -> Rgba {
@@ -716,6 +885,28 @@ fn running_glow_color_for(base: u32, phase: f32, lightness_gain: f32) -> Rgba {
 mod tests {
     use super::*;
 
+    /// 宿主各材质代表色的两头：深色里最亮、最暗的，浅色里最暗、最亮的。字和行底在这两头
+    /// 都成立，中间的就都成立。
+    const TEST_MATERIALS: [MaterialTone; 2] = [
+        MaterialTone {
+            dark: 0x363a40,
+            light: 0xd0d0d3,
+        },
+        MaterialTone {
+            dark: 0x2a2a2a,
+            light: 0xe6e6e6,
+        },
+    ];
+
+    /// 材质的两个代表色打包进一个原子量再取出来不变，也撞不上「没有材质」。
+    #[test]
+    fn material_tone_survives_packing() {
+        for tone in TEST_MATERIALS {
+            assert_ne!(tone.pack(), NO_MATERIAL);
+            assert_eq!(MaterialTone::unpack(tone.pack()), tone);
+        }
+    }
+
     #[test]
     fn chrome_tokens_keep_a_visible_hierarchy() {
         assert!(card_radius() > row_radius());
@@ -730,11 +921,7 @@ mod tests {
             chrome_gap() >= px(4.),
             "输入安全槽不能小于 8px 拖拽命中区落在 WebView 一侧的半宽"
         );
-        assert_eq!(
-            shell_padding(),
-            px(0.),
-            "Grok Bot 栏贴边，窗口不要再留浮卡内边距"
-        );
+        assert_eq!(shell_padding(), px(0.), "分栏贴边，窗口不留外圈内边距");
         assert_eq!(card_padding(), px(12.));
         assert!(composer_radius() > card_radius());
         assert!(bubble_radius() > card_radius());
@@ -754,146 +941,209 @@ mod tests {
         assert_eq!(conversation_max_width(), px(768.));
     }
 
-    fn opaque(hex: u32) -> Hsla {
-        rgb(hex).into()
+    /// 一份只有一款主题的 smelt 主题文件，求值后取那款主题。
+    fn parse_theme(mode: &str, colors: serde_json::Value) -> crate::theme_config::ThemeConfig {
+        let source = serde_json::json!({
+            "version": 1,
+            "name": "test",
+            "themes": [{ "name": "T", "mode": mode, "colors": colors }]
+        });
+        crate::theme_config::parse_theme_set(&source.to_string())
+            .unwrap()
+            .themes
+            .remove(0)
     }
 
-    fn sample_roles() -> ThemeRoles {
-        ThemeRoles {
-            background: opaque(0x111111),
-            foreground: opaque(0xfafafa),
-            muted_foreground: opaque(0xa3a3a3),
-            sidebar: opaque(0x222222),
-            popover: opaque(0x181818),
-            list_hover: rgba(0xffffff40).into(),
-            sidebar_accent: opaque(0x3a3a3a),
-            sidebar_accent_foreground: opaque(0xfafafa),
-            list_active_border: opaque(0x1d4ed8),
-            title_bar: opaque(0x171717),
-            status_bar: opaque(0x0a0a0a),
-            sidebar_border: opaque(0x262626),
-            border: opaque(0x2a2a2a),
-            input: opaque(0x3a3a3a),
-            ring: opaque(0x737373),
-            link: opaque(0x2563eb),
-            success: opaque(0x16a34a),
-            danger: opaque(0xdc2626),
-            warning: opaque(0xca8a04),
-            blue: opaque(0x3b82f6),
-            magenta: opaque(0x9333ea),
-            primary: opaque(0xfafafa),
-            primary_foreground: opaque(0x171717),
+    /// `Rgba` 量化回 `0xRRGGBBAA`，比较时不受 Hsla 来回换算的浮点误差影响。
+    fn rgba_hex(color: Rgba) -> u32 {
+        let q = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u32;
+        (q(color.r) << 24) | (q(color.g) << 16) | (q(color.b) << 8) | q(color.a)
+    }
+
+    /// 行底压在字底那层窗口底上：悬停、选中都看得出，选中比悬停深一档；选中行里的次要字
+    /// 压在选中底上还够读。深浅主题、有没有材质都要成立。
+    #[test]
+    fn row_fills_stand_out_on_the_backdrop() {
+        for light in [true, false] {
+            let p = builtin_fallback(light);
+            let colors = *theme_catalog::builtin_for_mode(if light {
+                ThemeMode::Light
+            } else {
+                ThemeMode::Dark
+            })
+            .colors();
+            let (hover, active) = (flatten(colors.hover, p.bg), flatten(colors.pressed, p.bg));
+            for material in std::iter::once(None).chain(TEST_MATERIALS.into_iter().map(Some)) {
+                let backdrop = text_backdrop(material, rgb(p.bg), 0.0, !light);
+                // 装主题时先按同一外观的材质配字色，再由色板计算行底。
+                let (text, muted) = if material.is_some() {
+                    (
+                        legible(p.text, backdrop, TEXT_MIN_CONTRAST),
+                        legible(p.muted, backdrop, TEXT_MUTED_MIN_CONTRAST),
+                    )
+                } else {
+                    (p.text, p.muted)
+                };
+                let rows = row_fills(hover, active, p.bg, text, muted, backdrop);
+                let hover_under = flatten(rows.hover, backdrop);
+                let selected_under = flatten(rows.selected, backdrop);
+                let at = format!("light={light} backdrop={backdrop:06x}");
+                assert!(
+                    (lightness(hover_under) - lightness(backdrop)).abs()
+                        >= ROW_HOVER_MIN_LIGHTNESS - 0.3,
+                    "{at}"
+                );
+                assert!(
+                    (lightness(selected_under) - lightness(backdrop)).abs()
+                        >= ROW_SELECTED_MIN_LIGHTNESS - 0.3,
+                    "{at}"
+                );
+                assert!(rows.selected.a > rows.hover.a, "{at}: 选中要比悬停深");
+                assert!(
+                    contrast_ratio(rows.muted_selected, selected_under) >= TEXT_MUTED_MIN_CONTRAST,
+                    "{at}"
+                );
+                assert!(
+                    contrast_ratio(rows.faint_selected, selected_under) >= TEXT_FAINT_MIN_CONTRAST,
+                    "{at}"
+                );
+            }
         }
     }
 
     #[test]
-    fn product_slots_read_theme_roles() {
-        let roles = sample_roles();
-        let palette = palette_from_roles(&roles);
-        assert_eq!(palette.bg_stage, 0x111111);
-        assert_eq!(palette.bg_rail, palette.bg_stage);
-        assert_eq!(palette.bg_column, 0x222222);
-        assert_eq!(palette.bg_card, 0x181818);
-        assert_ne!(palette.bg_card, palette.border);
-        assert_eq!(palette.bg_bar, 0x171717);
-        assert_eq!(palette.bg_status, 0x0a0a0a);
-        assert_eq!(palette.bg_row_hover, solid(roles.list_hover, roles.sidebar));
-        assert_eq!(palette.bg_hover, solid(roles.list_hover, roles.popover));
-        assert_ne!(palette.bg_hover, palette.bg_row_hover);
-        assert_eq!(palette.bg_selected, 0x3a3a3a);
-        assert_eq!(palette.border_dim, 0x262626);
-        assert_eq!(palette.border, 0x2a2a2a);
-        assert_eq!(palette.border_mid, palette.border);
-        assert_eq!(palette.border_loud, 0x3a3a3a);
-        assert_eq!(palette.border_focus, 0x737373);
+    fn row_fill_keeps_a_theme_that_already_stands_out() {
+        // 主题配了比保底更深的选中：照主题，不往回收。
+        let fill = row_fill(
+            0x5a5a58,
+            0x1e1e1d,
+            0xecece8,
+            0x1e1e1d,
+            ROW_SELECTED_MIN_LIGHTNESS,
+        );
+        let themed = (0x5a * 2 + 0x58 - (0x1e * 2 + 0x1d)) as f32
+            / (0xec * 2 + 0xe8 - (0x1e * 2 + 0x1d)) as f32;
+        assert!((fill.a - themed).abs() < 0.001, "{}", fill.a);
+    }
+
+    #[test]
+    fn row_fill_turns_a_reversed_theme_toward_the_text() {
+        // 深色底上配了比底还暗的选中：方向反了，按保底往正文色那头铺。
+        let fill = row_fill(
+            0x101010,
+            0x1e1e1d,
+            0xecece8,
+            0x1e1e1d,
+            ROW_SELECTED_MIN_LIGHTNESS,
+        );
+        assert_eq!(rgba_hex(Rgba { a: 1.0, ..fill }), rgba_hex(rgb(0xecece8)));
+        let landed = flatten(fill, 0x1e1e1d);
+        assert!(
+            (lightness(landed) - lightness(0x1e1e1d)).abs() >= ROW_SELECTED_MIN_LIGHTNESS - 0.3
+        );
+    }
+
+    /// 侧栏那一档压回 `bg` 上，深浅要和原来的实色差不出一级；和 `bg` 一样深时不铺。
+    #[test]
+    fn shade_lands_on_the_sidebar_fill_over_the_stage() {
+        for light in [true, false] {
+            let p = builtin_fallback(light);
+            let shade = shade_over(p.side, p.bg);
+            assert!(shade.a > 0.0 && shade.a < 0.3, "{light}: {}", shade.a);
+            let landed = flatten(shade, p.bg);
+            let diff = channel_sum(landed) - channel_sum(p.side);
+            assert!(diff.abs() <= 6.0, "{light} {:06x} -> {landed:06x}", p.side);
+        }
+        assert_eq!(shade_over(0x202020, 0x202020).a, 0.0);
+    }
+
+    #[test]
+    fn each_slot_reads_its_token() {
+        let theme = parse_theme(
+            "dark",
+            serde_json::json!({
+                "bg_base": "#111111", "text_base": "#FAFAFA", "page": "#0C0C0C",
+                "surface_raised": "#181818", "layer_01": "#202020", "layer_02": "#282828",
+                "layer_03": "#303030", "border_base": "#FFFFFF14", "border_strong": "#FFFFFF26",
+                "text_muted": "#A3A3A3", "text_faint": "#737373", "bg_contrast": "#FAFAFA",
+                "contrast_hover": "#FFFFFF", "contrast_pressed": "#E0E0E0",
+                "text_contrast": "#171717", "bg_button_neutral": "#FFFFFF20",
+                "hover": "#FFFFFF10", "pressed": "#FFFFFF20",
+                "border_focus": "#6EA0FF8C", "selection": "#6EA0FF40", "text_accent": "#89B4FA",
+                "info.fg": "#3B82F6", "warning.icon": "#F08A55", "success.icon": "#16A34A",
+                "danger.icon": "#DC2626", "scrim": "#00000073",
+                "chart.1": "#000001", "chart.2": "#000002", "chart.3": "#000003",
+                "chart.4": "#000004", "chart.5": "#000005"
+            }),
+        );
+        let palette = palette_from_tokens(theme.colors(), 0x111111);
+        assert_eq!(palette.bg, 0x111111);
+        assert_eq!(palette.side, 0x0c0c0c);
+        assert_eq!(palette.surface, 0x181818);
+        assert_eq!(palette.soft, 0x202020);
+        assert_eq!(palette.soft_hover, 0x282828);
+        assert_eq!(palette.soft_press, 0x303030);
+        assert_eq!(rgba_hex(palette.hair), 0xffffff14, "线保留透明度");
+        assert_eq!(rgba_hex(palette.hair_strong), 0xffffff26);
         assert_eq!(palette.text, 0xfafafa);
-        assert_eq!(palette.text_bright, palette.text);
-        assert_eq!(palette.text_muted, 0xa3a3a3);
+        assert_eq!(palette.muted, 0xa3a3a3);
+        assert_eq!(palette.faint, 0x737373);
+        assert_eq!(palette.ink, 0xfafafa);
+        assert_eq!(palette.ink_hover, 0xffffff);
+        assert_eq!(palette.ink_press, 0xe0e0e0);
+        assert_eq!(palette.on_ink, 0x171717);
         assert_eq!(
-            palette.text_mid,
-            mix(palette.text, palette.text_muted, TEXT_MID_MIX)
+            palette.button_primary.map(rgba_hex),
+            [0xfafafaff, 0xffffffff, 0xe0e0e0ff]
         );
-        assert_ne!(palette.text_mid, palette.text);
-        assert_ne!(palette.text_mid, palette.text_muted);
-        assert_eq!(
-            palette.text_faint,
-            faint_text(palette.text_muted, palette.bg_stage)
+        assert_eq!(palette.button_primary_foreground, 0x171717);
+        assert_eq!(rgba_hex(palette.button_secondary[0]), 0xffffff20);
+        assert!(
+            palette.button_secondary[1].a > palette.button_secondary[0].a
+                && palette.button_secondary[2].a > palette.button_secondary[1].a,
+            "悬停、按下叠在半透明的底上，越叠越实"
         );
-        assert_ne!(palette.text_faint, palette.text_muted);
-        assert!(contrast_ratio(palette.text_faint, palette.bg_stage) >= TEXT_FAINT_MIN_CONTRAST);
-        assert_eq!(palette.accent, 0x2563eb);
-        assert_eq!(palette.green, 0x16a34a);
-        assert_eq!(palette.red, 0xdc2626);
-        assert_eq!(palette.yellow, 0xca8a04);
-        assert_eq!(palette.blue, 0x3b82f6);
-        assert_eq!(palette.purple, 0x9333ea);
-        assert_eq!(palette.action_fill, 0xfafafa);
-        assert_eq!(
-            palette.action_on,
-            solid(roles.primary_foreground, roles.primary)
-        );
-        assert_eq!(palette.diff_add_fg, palette.green);
-        assert_eq!(palette.diff_add_bar, palette.green);
-        assert_eq!(
-            palette.diff_add_bg,
-            mix(palette.bg_stage, palette.green, 0.18)
-        );
-        assert_eq!(
-            palette.diff_add_hl,
-            mix(palette.bg_stage, palette.green, 0.35)
-        );
-        assert_eq!(palette.diff_del_fg, palette.red);
-        assert_eq!(
-            palette.diff_del_bg,
-            mix(palette.bg_stage, palette.red, 0.18)
-        );
-        assert_eq!(palette.diff_hunk_fg, palette.accent);
-        assert_eq!(palette.diff_ctx_fg, palette.text_muted);
-        assert_eq!(palette.diff_empty_bg, palette.bg_stage);
-        assert_eq!(palette.diff_gutter, palette.bg_card);
+        assert_eq!(palette.button_secondary_foreground, 0xfafafa);
+        assert_eq!(rgba_hex(palette.focus), 0x6ea0ff8c);
+        assert_eq!(rgba_hex(palette.selection), 0x6ea0ff40);
+        assert_eq!(palette.link, 0x89b4fa);
+        assert_eq!(palette.run, 0x3b82f6);
+        assert_eq!(palette.need, 0xf08a55);
+        assert_eq!(palette.ok, 0x16a34a);
+        assert_eq!(palette.bad, 0xdc2626);
+        assert!(contrast_ratio(palette.on_bad, palette.bad) >= TEXT_MUTED_MIN_CONTRAST);
+        assert_eq!(rgba_hex(palette.popover_text), 0xfafafaff);
+        assert_eq!(rgba_hex(palette.scrim), 0x00000073);
+        assert_eq!(palette.chart, [1, 2, 3, 4, 5]);
     }
 
+    /// 主按钮底够深时悬停、按下照主题的叠层往亮提；底是中灰、往亮提就压不住白字时，两档
+    /// 一起往深处压，越按越深，白字始终够 4.5:1。
     #[test]
-    fn selected_row_keeps_the_sidebar_accent_pair_even_when_flat() {
-        // 主题的侧栏选中色贴着栏底也照用，不换成别的选中色：底色和字色是主题配好的一对，
-        // 换掉底色就可能压不住字（Solarized Light 的 `list.active` 是深灰，侧栏选中字也是深色）。
-        let mut roles = sample_roles();
-        roles.sidebar_accent = opaque(0x282828);
-        let palette = palette_from_roles(&roles);
-        assert_eq!(palette.bg_selected, 0x282828);
+    fn state_fills_flip_only_when_the_overlay_drowns_the_text() {
+        let lighten = [rgba(0xfcfcfc1f), rgba(0xfcfcfc3d)];
+        let deep = 0x171717;
+        assert_eq!(
+            state_fills(deep, lighten),
+            lighten.map(|o| flatten(o, deep))
+        );
+
+        let gray = 0x5c6166;
+        let [hover, press] = state_fills(gray, lighten);
+        let on_white = |fill| contrast_ratio(0xffffff, fill);
+        assert!(on_white(gray) < on_white(hover) && on_white(hover) < on_white(press));
+        assert!(on_white(hover) >= TEXT_MUTED_MIN_CONTRAST);
     }
 
+    /// 次要按钮的底本身半透明时，悬停叠层叠在它上面，结果仍透出底下的窗口。
     #[test]
-    fn selected_rows_use_the_sidebar_accent_ink() {
-        let mut roles = sample_roles();
-        roles.sidebar_accent_foreground = opaque(0xffd866);
-        assert_eq!(palette_from_roles(&roles).text_selected, 0xffd866);
-    }
-
-    #[test]
-    fn link_that_matches_body_ink_uses_the_active_border() {
-        let mut roles = sample_roles();
-        roles.link = roles.foreground;
-        let palette = palette_from_roles(&roles);
-        assert_eq!(palette.accent, 0x1d4ed8);
-        assert_ne!(palette.accent, palette.text);
-        assert_eq!(palette.diff_hunk_fg, palette.accent);
-
-        roles.foreground = opaque(0x0a0a0a);
-        roles.background = opaque(0xffffff);
-        roles.link = opaque(0x171717);
-        roles.list_active_border = opaque(0x60a5fa);
-        let palette = palette_from_roles(&roles);
-        assert_eq!(palette.accent, 0x60a5fa);
-    }
-
-    #[test]
-    fn emphasis_uses_blue_when_link_and_border_are_body_ink() {
-        let mut roles = sample_roles();
-        roles.link = roles.foreground;
-        roles.list_active_border = roles.foreground;
-        let palette = palette_from_roles(&roles);
-        assert_eq!(palette.accent, palette.blue);
+    fn overlays_compose_onto_translucent_fills() {
+        let composed = over(rgba(0xffffff10), rgba(0xffffff20));
+        assert!(composed.a > 0x20 as f32 / 255.0 && composed.a < 1.0);
+        assert_eq!(rgba_hex(Rgba { a: 1.0, ..composed }), 0xffffffff);
+        // 128/255 的黑叠在白上：255 × (1 − 128/255) = 127。
+        assert_eq!(rgba_hex(over(rgba(0x00000080), rgb(0xffffff))), 0x7f7f7fff);
+        assert_eq!(over(rgba(0x00000000), rgba(0x00000000)).a, 0.0);
     }
 
     #[test]
@@ -908,6 +1158,72 @@ mod tests {
         assert_ne!(faint_text(muted, background), muted);
     }
 
+    /// 毛玻璃时 smelt 两套主题的字压在材质上：正文、次要字、弱字都够各自的对比，层次
+    /// 还在（正文比次要字清楚，次要字比弱字清楚）。
+    #[test]
+    fn text_fitted_to_the_material_stays_legible_and_ranked() {
+        for tone in TEST_MATERIALS {
+            for dark in [true, false] {
+                let mut colors = *theme_catalog::builtin_for_mode(if dark {
+                    ThemeMode::Dark
+                } else {
+                    ThemeMode::Light
+                })
+                .colors();
+                let backdrop = text_backdrop(Some(tone), colors.bg_base, 0.0, dark);
+                let fit = |color: &mut Rgba, min: f32| {
+                    *color = rgb(legible(flatten(*color, backdrop), backdrop, min))
+                };
+                fit(&mut colors.text_base, TEXT_MIN_CONTRAST);
+                fit(&mut colors.text_muted, TEXT_MUTED_MIN_CONTRAST);
+                fit(&mut colors.text_faint, TEXT_FAINT_MIN_CONTRAST);
+                let [text, muted, faint] =
+                    [colors.text_base, colors.text_muted, colors.text_faint].map(pack);
+                assert!(contrast_ratio(text, backdrop) >= TEXT_MIN_CONTRAST);
+                assert!(contrast_ratio(muted, backdrop) >= TEXT_MUTED_MIN_CONTRAST);
+                assert!(contrast_ratio(faint, backdrop) >= TEXT_FAINT_MIN_CONTRAST - 0.01);
+                assert!(contrast_ratio(text, backdrop) > contrast_ratio(muted, backdrop));
+                assert!(contrast_ratio(muted, backdrop) > contrast_ratio(faint, backdrop));
+            }
+        }
+    }
+
+    /// 本来就够对比的字不动；不够的只挪到刚好够，不一路推到纯白纯黑。
+    #[test]
+    fn legible_moves_only_as_far_as_needed() {
+        assert_eq!(legible(0xecece8, 0x363a40, TEXT_MIN_CONTRAST), 0xecece8);
+        let lifted = legible(0xa3a29c, 0x363a40, TEXT_MUTED_MIN_CONTRAST);
+        assert!(contrast_ratio(lifted, 0x363a40) >= TEXT_MUTED_MIN_CONTRAST);
+        assert!(contrast_ratio(lifted, 0x363a40) < TEXT_MUTED_MIN_CONTRAST + 0.1);
+        let darkened = legible(0x6b6a65, 0xd6d6da, TEXT_MUTED_MIN_CONTRAST);
+        assert!(relative_luminance(darkened) < relative_luminance(0x6b6a65));
+    }
+
+    /// 没有材质时字底就是主题底色，不管底色不透明度设成多少（窗口不透明）。
+    #[test]
+    fn without_material_the_backdrop_is_the_theme_background() {
+        for opacity in [0.0, 0.5, 1.0] {
+            assert_eq!(text_backdrop(None, rgb(0x1e1e1d), opacity, true), 0x1e1e1d);
+        }
+    }
+
+    /// 有材质时字底是底色叠在材质上：铺满是底色，不铺是材质，中间按比例混。
+    #[test]
+    fn with_material_the_backdrop_blends_theme_background_over_it() {
+        let tone = MaterialTone {
+            dark: 0x404040,
+            light: 0xd0d0d0,
+        };
+        let bg = rgb(0x000000);
+        assert_eq!(text_backdrop(Some(tone), bg, 1.0, true), 0x000000);
+        assert_eq!(text_backdrop(Some(tone), bg, 0.0, true), 0x404040);
+        assert_eq!(text_backdrop(Some(tone), bg, 0.5, true), 0x202020);
+        assert_eq!(
+            text_backdrop(Some(tone), rgb(0xffffff), 0.0, false),
+            0xd0d0d0
+        );
+    }
+
     #[test]
     fn contrast_ratio_matches_black_on_white() {
         let ratio = contrast_ratio(0xffffff, 0x000000);
@@ -915,51 +1231,30 @@ mod tests {
     }
 
     #[test]
-    fn fallback_matches_builtin_default_background() {
-        let dark = builtin_fallback(false);
-        let light = builtin_fallback(true);
-        assert_eq!(dark.bg_stage, 0x0a0a0a);
-        assert_eq!(dark.bg_rail, dark.bg_stage);
-        assert_eq!(dark.bg_column, dark.bg_stage);
-        assert_eq!(light.bg_stage, 0xffffff);
-        assert_eq!(dark.action_fill, dark.text);
-        assert_eq!(dark.action_on, dark.bg_stage);
-        assert_eq!(dark.accent, dark.blue);
-        assert_ne!(dark.accent, dark.text);
-        assert_ne!(light.accent, light.text);
-        assert!(relative_luminance(dark.text) > relative_luminance(dark.text_mid));
-        assert!(relative_luminance(dark.text_mid) > relative_luminance(dark.text_muted));
-        assert!(relative_luminance(dark.text_muted) > relative_luminance(dark.text_faint));
-        assert!(relative_luminance(dark.text_faint) > relative_luminance(dark.bg_stage));
-        assert!(relative_luminance(light.text) < relative_luminance(light.text_mid));
-        assert!(relative_luminance(light.text_mid) < relative_luminance(light.text_muted));
-        assert!(relative_luminance(light.text_muted) < relative_luminance(light.text_faint));
-        assert!(relative_luminance(light.text_faint) < relative_luminance(light.bg_stage));
-        assert!(contrast_ratio(dark.text_faint, dark.bg_stage) >= TEXT_FAINT_MIN_CONTRAST);
-        assert!(contrast_ratio(light.text_faint, light.bg_stage) >= TEXT_FAINT_MIN_CONTRAST);
-        assert_ne!(dark.red, dark.blue);
-        assert_ne!(dark.blue, dark.text_faint);
-    }
-
-    #[test]
-    fn card_stroke_and_hairline_are_translucent() {
-        assert!(
-            card_stroke().a < 1.0,
-            "卡片描边必须半透明，不能再走实色硬边"
-        );
-        assert!(hairline().a < card_stroke().a);
-        assert!(hairline().a > 0.0);
-    }
-
-    #[test]
-    fn content_surfaces_are_opaque() {
-        assert_eq!(
-            glass_card().a,
-            1.0,
-            "内容卡必须是 Grok Bot 实底，不能半透明"
-        );
-        assert_eq!(glass_floating().a, 1.0, "浮层必须是实底");
-        assert_eq!(glass_input().a, 1.0, "composer 必须是实底");
+    fn fallback_text_steps_stay_ordered_and_readable() {
+        for light in [false, true] {
+            let palette = builtin_fallback(light);
+            let lum = relative_luminance;
+            let ordered = if light {
+                lum(palette.text) < lum(palette.muted)
+                    && lum(palette.muted) < lum(palette.faint)
+                    && lum(palette.faint) < lum(palette.bg)
+            } else {
+                lum(palette.text) > lum(palette.muted)
+                    && lum(palette.muted) > lum(palette.faint)
+                    && lum(palette.faint) > lum(palette.bg)
+            };
+            assert!(ordered, "light={light}: 正文 > 次级 > 最弱 > 底");
+            assert!(contrast_ratio(palette.faint, palette.bg) >= TEXT_FAINT_MIN_CONTRAST);
+            assert!(contrast_ratio(palette.on_ink, palette.ink) >= 4.5);
+            assert!(contrast_ratio(palette.on_bad, palette.bad) >= 4.5);
+            let status = [palette.run, palette.need, palette.ok, palette.bad];
+            for (i, a) in status.iter().enumerate() {
+                for b in &status[i + 1..] {
+                    assert_ne!(a, b, "四个状态色要分得开");
+                }
+            }
+        }
     }
 
     #[test]
@@ -967,18 +1262,10 @@ mod tests {
         let palette = builtin_fallback(false);
         assert_eq!(
             role_for_status(&palette, AgentStatus::NeedsYou),
-            palette.red
+            palette.need
         );
-        assert_eq!(
-            role_for_status(&palette, AgentStatus::Running),
-            palette.blue
-        );
-        assert_eq!(
-            role_for_status(&palette, AgentStatus::Idle),
-            palette.text_faint
-        );
-        assert_ne!(palette.red, palette.blue);
-        assert_ne!(palette.blue, palette.text_faint);
+        assert_eq!(role_for_status(&palette, AgentStatus::Running), palette.run);
+        assert_eq!(role_for_status(&palette, AgentStatus::Idle), palette.faint);
     }
 
     #[test]
@@ -1009,67 +1296,66 @@ mod tests {
         );
     }
 
-    /// Ayu Light / Catppuccin Latte 的主按钮字色曾经低于 4.5:1。深色主题本来就够，锁住别回退。
+    /// 随 App 带的每份主题文件都合格式；投影出的字压在各自的底上都看得清：主按钮三档上的字、
+    /// 危险底上的字至少 4.5:1，次要字 4.5:1，最弱字 3:1，四个状态色分得开。浅色主题的正文
+    /// 偏浅时主按钮按下那档最容易不够（Ayu Light、Catppuccin Latte、Solarized Light），锁住。
     #[test]
-    fn primary_button_text_meets_contrast() {
-        const MIN: f32 = 4.5;
-        let watched = [
-            "Ayu Light",
-            "Ayu Dark",
-            "Catppuccin Latte",
-            "Catppuccin Mocha",
+    fn bundled_themes_parse_and_stay_legible() {
+        let dirs = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/themes"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/themes/themes"),
         ];
-        for file in [
-            include_str!("../../plugins/themes/themes/ayu.json"),
-            include_str!("../../plugins/themes/themes/catppuccin.json"),
-        ] {
-            let doc: serde_json::Value = serde_json::from_str(file).expect("theme json");
-            let Some(themes) = doc["themes"].as_array() else {
-                continue;
-            };
-            for theme in themes {
-                let name = theme["name"].as_str().unwrap_or("");
-                if !watched.contains(&name) {
+        let mut checked = 0;
+        for dir in dirs {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|ext| ext != "json") {
                     continue;
                 }
-                let colors = &theme["colors"];
-                let fg = parse_theme_hex(
-                    colors["primary.foreground"]
-                        .as_str()
-                        .unwrap_or_else(|| panic!("{name} missing primary.foreground")),
-                );
-                let background = colors["primary.background"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{name} missing primary.background"));
-                let slots = [
-                    ("primary.background", background),
-                    (
-                        "primary.hover.background",
-                        colors["primary.hover.background"]
-                            .as_str()
-                            .unwrap_or(background),
-                    ),
-                    (
-                        "primary.active.background",
-                        colors["primary.active.background"]
-                            .as_str()
-                            .unwrap_or(background),
-                    ),
-                ];
-                for (slot, hex) in slots {
-                    let ratio = contrast_ratio(fg, parse_theme_hex(hex));
+                let source = std::fs::read_to_string(&path).unwrap();
+                let set = crate::theme_config::parse_theme_set(&source)
+                    .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+                for theme in &set.themes {
+                    let name = theme.name();
+                    let c = theme.colors();
+                    let p = palette_from_tokens(c, pack(c.bg_base));
+                    for fill in [p.ink, p.ink_hover, p.ink_press] {
+                        let ratio = contrast_ratio(p.on_ink, fill);
+                        assert!(
+                            ratio >= TEXT_MUTED_MIN_CONTRAST,
+                            "{name} 主按钮上的字 {ratio:.2}"
+                        );
+                    }
+                    for fill in p.button_submit.map(pack) {
+                        let ratio = contrast_ratio(p.button_submit_foreground, fill);
+                        assert!(
+                            ratio >= TEXT_MUTED_MIN_CONTRAST,
+                            "{name} 图标主按钮上的图标 {ratio:.2}"
+                        );
+                    }
+                    let ratio = contrast_ratio(p.on_bad, p.bad);
                     assert!(
-                        ratio >= MIN,
-                        "{name} primary.foreground on {slot} ({hex}) is {ratio:.2}, need {MIN}"
+                        ratio >= TEXT_MUTED_MIN_CONTRAST,
+                        "{name} 危险底上的字 {ratio:.2}"
                     );
+                    assert!(
+                        contrast_ratio(p.muted, p.bg) >= TEXT_MUTED_MIN_CONTRAST - 0.01,
+                        "{name}"
+                    );
+                    assert!(
+                        contrast_ratio(p.faint, p.bg) >= TEXT_FAINT_MIN_CONTRAST - 0.01,
+                        "{name}"
+                    );
+                    let status = [p.run, p.need, p.ok, p.bad];
+                    for (i, a) in status.iter().enumerate() {
+                        for b in &status[i + 1..] {
+                            assert_ne!(a, b, "{name} 四个状态色要分得开");
+                        }
+                    }
+                    checked += 1;
                 }
             }
         }
-    }
-
-    fn parse_theme_hex(hex: &str) -> u32 {
-        let hex = hex.trim_start_matches('#');
-        let rgb = &hex[..hex.len().min(6)];
-        u32::from_str_radix(rgb, 16).unwrap_or_else(|_| panic!("bad color {hex}"))
+        assert!(checked > 30, "只查到 {checked} 款主题");
     }
 }

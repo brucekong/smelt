@@ -131,6 +131,8 @@ fn push_handoff_turns(entries: &[AcpEntry], turns: &mut Vec<HandoffTurn>) {
                 push_handoff_turns(children, turns);
             }
             AcpEntry::Divider(_)
+            | AcpEntry::NewSession { .. }
+            | AcpEntry::TurnFailed { .. }
             | AcpEntry::TaskNote(_)
             | AcpEntry::Assistant { thought: false, .. } => {}
         }
@@ -506,6 +508,7 @@ mod tests {
                 }],
                 subagents: Vec::new(),
                 peer: None,
+                asked: None,
             },
             AcpEntry::Assistant {
                 text: "子 agent 已输出：\n\nHello".into(),

@@ -178,13 +178,15 @@ extension PermissionOptionView on PermissionOption {
 }
 
 extension ConversationPhaseView on ConversationPhase {
-  /// 这个阶段能不能接新消息：等审批、等选择时要先把那件事处理掉。
+  /// 这个阶段能不能接新消息：等审批、等选择时要先把那件事处理掉。停下的对话照样能发，
+  /// 运行时收到就按原来的启动方式拉起、接着原对话。
   bool get acceptsPrompt => switch (this) {
     ConversationPhase.idle ||
     ConversationPhase.thinking ||
     ConversationPhase.executingTool ||
     ConversationPhase.succeeded ||
-    ConversationPhase.failed => true,
+    ConversationPhase.failed ||
+    ConversationPhase.dead => true,
     _ => false,
   };
 
@@ -199,8 +201,13 @@ extension ElicitationView on Elicitation {
     for (final (index, field) in fields.indexed) {
       if (!field.required_) continue;
       final ready = switch (field.kind) {
-        ElicitationFieldKind.select ||
-        ElicitationFieldKind.multiSelect => field.chosen.isNotEmpty,
+        ElicitationFieldKind.select || ElicitationFieldKind.multiSelect =>
+          field.chosen.isNotEmpty ||
+              (field.allowCustomInput &&
+                  (localTextValues[index] ?? field.textValue)
+                          ?.trim()
+                          .isNotEmpty ==
+                      true),
         ElicitationFieldKind.text =>
           (localTextValues[index] ?? field.textValue)?.trim().isNotEmpty ==
               true,

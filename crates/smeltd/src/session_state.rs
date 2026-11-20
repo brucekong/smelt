@@ -18,6 +18,56 @@ pub(crate) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// 「待处理」那一行，只存一份：智能体（或终端里的程序）的原话，或运行时自己说的话。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PendingLine {
+    /// 原话，各端原样显示。
+    Said(String),
+    /// 运行时自己说的话的种类和参数，各端按自己的语言说。
+    Note(smelt_event_protocol::SessionNote),
+}
+
+impl PendingLine {
+    pub(crate) fn said(text: Option<String>) -> Option<Self> {
+        text.map(Self::Said)
+    }
+
+    /// 线上的 `pending_question`：原话，或运行时那句（运行时不设语言，是英文）。不认识
+    /// `pending_note` 的旧客户端显示它。
+    pub(crate) fn question(&self) -> Option<String> {
+        match self {
+            Self::Said(text) => Some(text.clone()),
+            Self::Note(note) => note.text(),
+        }
+    }
+
+    pub(crate) fn note(&self) -> Option<&smelt_event_protocol::SessionNote> {
+        match self {
+            Self::Said(_) => None,
+            Self::Note(note) => Some(note),
+        }
+    }
+}
+
+/// 「待处理」拆成线上的两个字段（在 [`SessionState`] 里摊平）：`pending_question` 总有（没有
+/// 时为 null），`pending_note` 只有运行时自己说的话才有。
+fn serialize_pending<S: serde::Serializer>(
+    pending: &Option<PendingLine>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let note = pending.as_ref().and_then(PendingLine::note);
+    let mut map = serializer.serialize_map(Some(1 + usize::from(note.is_some())))?;
+    map.serialize_entry(
+        "pending_question",
+        &pending.as_ref().and_then(PendingLine::question),
+    )?;
+    if let Some(note) = note {
+        map.serialize_entry("pending_note", note)?;
+    }
+    map.end()
+}
+
 /// 会话状态通道（见 docs/notification-architecture.md）。只有 hook 事件归约
 /// （`agent_event` op）、OSC 7501 程序状态和 ACP 投影能改变 phase。OSC 标题不是会话名，
 /// BEL 和 OSC 9/99/777 只作信息通知。schema 定死，字段不够用再加，不删不改类型——远程端/GUI
@@ -57,6 +107,15 @@ pub(crate) struct SessionState {
     /// [`crate::terminal_names`] 在换对话、改名时写；`conversation_id` 变了就清掉。
     #[serde(default)]
     pub(crate) custom_title: Option<String>,
+    /// 各端显示的这段对话的名字（侧栏的对话行、菜单栏、资源页）。同一段对话里每一格都是
+    /// 同一个值。和 [`Self::name`] 一样只由 [`crate::session_names`] 按工作区目录现算后写，
+    /// 不在目录里的会话没有。
+    #[serde(default)]
+    pub(crate) conversation_name: Option<String>,
+    /// 各端显示的这一格自己的名字（分屏的子行、手机上的一格）。只有一格时和
+    /// [`Self::conversation_name`] 相同。
+    #[serde(default)]
+    pub(crate) name: Option<String>,
     /// CLI 进程已经退出、终端回到 shell。`SessionEnded` 置位；之后又有
     /// `SessionStarted`，或相位门控放行的活事件，再清掉。对话 id 不受影响。
     /// 为 true 时这条终端不能 `--resume`（见 `resume_of`）。不发 SessionEnd 的
@@ -70,17 +129,26 @@ pub(crate) struct SessionState {
     /// 各端会话列表上的「本轮已运行」都按它算：一轮里思考、跑工具、等审批来回切换
     /// 不重置，回到空闲 / 结束才清掉。`phase_since` 每换一个阶段就变，不能拿来算。
     pub(crate) turn_started_at: u64,
-    /// 在问什么——远程遥控的命脉，Phase 6 的 action 门闩靠它判断能不能安全写入。
-    pub(crate) pending_question: Option<String>,
+    /// 「待处理」那一行：在问什么、在做什么，或运行时自己要说的话——远程遥控的命脉，
+    /// Phase 6 的 action 门闩靠它判断能不能安全写入。上线拆成 `pending_question` 和
+    /// `pending_note` 两个字段，见 [`PendingLine`]。
+    #[serde(flatten, serialize_with = "serialize_pending")]
+    pub(crate) pending: Option<PendingLine>,
     /// 对话会话正在等的那个请求的身份（`permission:<请求 id>` / `elicitation:<卡片 id>`），
     /// 客户端靠它分辨「还是不是同一个请求」。终端会话没有。只属于这个进程里的运行时，不落盘。
     #[serde(skip)]
     pub(crate) pending_request: Option<String>,
+    /// 最近结束的那轮对应的外部投递（`conversation.prompt` 的 `delivery_id`）；用户自己
+    /// 说的那轮是 `None`。订阅方看到自己的 id 就去 `conversation.turn_result` 取结果。
+    /// 只属于这个进程里的运行时，不落盘。
+    #[serde(skip)]
+    pub(crate) completed_delivery_id: Option<String>,
     /// 累计花费口径（各轮 cache_read 都加了），**不是**上下文占用，不能当余量分母。
     /// 见 session_history::SessionSummary.total_tokens；目前没接，先占位。
     pub(crate) tokens_used: Option<u64>,
-    /// 撞车预警要用；目前没接（见 smelt_git::GitStatusData），先占位。
+    /// 会话目录所在仓库的当前分支，由 [`crate::session_branch`] 维护。
     pub(crate) branch: Option<String>,
+    /// 撞车预警要用；目前没接（见 smelt_git::GitStatusData），先占位。
     pub(crate) dirty_files: Vec<String>,
     /// 本 daemon 进程内全局单调递增的状态版本。状态锁只保证修改互斥，修改后的
     /// 广播仍可能被线程调度倒序；订阅端用它拒绝旧快照覆盖新事实。
@@ -143,12 +211,15 @@ impl Default for SessionState {
             title: None,
             conversation_id: None,
             custom_title: None,
+            conversation_name: None,
+            name: None,
             cli_exited: false,
             phase: Phase::Idle,
             phase_since: 0,
             turn_started_at: 0,
-            pending_question: None,
+            pending: None,
             pending_request: None,
+            completed_delivery_id: None,
             tokens_used: None,
             branch: None,
             dirty_files: Vec::new(),
@@ -395,7 +466,7 @@ pub(crate) fn apply_agent_event(state: &mut SessionState, event: &AgentEvent) ->
         Occupancy::OpenTurn => {
             if allow {
                 let _ = commit_session_phase(state, PhaseSource::Hook, Phase::Thinking);
-                state.pending_question = None;
+                state.pending = None;
                 state.active_blocker = None;
             }
             note_prompt_fallback(state, event);
@@ -405,7 +476,7 @@ pub(crate) fn apply_agent_event(state: &mut SessionState, event: &AgentEvent) ->
         } => {
             if allow {
                 let _ = commit_session_phase(state, PhaseSource::Hook, Phase::ExecutingTool);
-                state.pending_question = event.message.clone();
+                state.pending = PendingLine::said(event.message.clone());
                 if follow_matched_wait {
                     state.active_blocker = None;
                 }
@@ -417,10 +488,10 @@ pub(crate) fn apply_agent_event(state: &mut SessionState, event: &AgentEvent) ->
             if allow {
                 let _ = commit_session_phase(state, PhaseSource::Hook, Phase::Thinking);
                 if follow_matched_wait {
-                    state.pending_question = event.message.clone();
+                    state.pending = PendingLine::said(event.message.clone());
                     state.active_blocker = None;
                 } else {
-                    state.pending_question = None;
+                    state.pending = None;
                 }
             }
         }
@@ -432,7 +503,8 @@ pub(crate) fn apply_agent_event(state: &mut SessionState, event: &AgentEvent) ->
                     Phase::WaitingForUser
                 };
                 let _ = commit_session_phase(state, PhaseSource::Hook, next);
-                state.pending_question = event.message.clone().or_else(|| event.tool_name.clone());
+                state.pending =
+                    PendingLine::said(event.message.clone().or_else(|| event.tool_name.clone()));
                 state.active_blocker = Some(AgentBlocker {
                     tool_use_id: event.tool_use_id.clone(),
                     agent_id: event.agent_id.clone(),
@@ -448,7 +520,7 @@ pub(crate) fn apply_agent_event(state: &mut SessionState, event: &AgentEvent) ->
                     Phase::Succeeded
                 };
                 let _ = commit_session_phase(state, PhaseSource::Hook, next);
-                state.pending_question = event.message.clone();
+                state.pending = PendingLine::said(event.message.clone());
                 state.active_blocker = None;
             }
         }
@@ -458,7 +530,7 @@ pub(crate) fn apply_agent_event(state: &mut SessionState, event: &AgentEvent) ->
             // 不发 SessionEnd 的 provider 走不到这里，见 `terminal_resume`。
             if allow {
                 let _ = commit_session_phase(state, PhaseSource::Hook, Phase::Dead);
-                state.pending_question = None;
+                state.pending = None;
                 state.active_blocker = None;
             }
             state.agent_token = uuid::Uuid::new_v4().simple().to_string();
@@ -485,22 +557,18 @@ pub(crate) fn apply_agent_event(state: &mut SessionState, event: &AgentEvent) ->
 /// 权限边界（见 docs/notification-architecture.md）。报过一次之后相位就以它为准，见
 /// [`SessionState::program_status`]。
 pub(crate) fn apply_program_status(state: &mut SessionState, status: &ProgramStatus) -> bool {
-    let before = (
-        state.phase,
-        state.pending_question.clone(),
-        state.program_status,
-    );
+    let before = (state.phase, state.pending.clone(), state.program_status);
     let message = status.message.clone();
     match status.state {
         ProgramState::Working => {
             // 已经在跑就留着 hook 细分出的执行工具和工具名，只在有说明时换说明。
             if matches!(state.phase, Phase::Thinking | Phase::ExecutingTool) {
                 if message.is_some() {
-                    state.pending_question = message;
+                    state.pending = PendingLine::said(message);
                 }
             } else {
                 let _ = commit_session_phase(state, PhaseSource::ProgramStatus, Phase::Thinking);
-                state.pending_question = message;
+                state.pending = PendingLine::said(message);
             }
         }
         ProgramState::Blocked => {
@@ -511,19 +579,19 @@ pub(crate) fn apply_program_status(state: &mut SessionState, status: &ProgramSta
                 }
             };
             let _ = commit_session_phase(state, PhaseSource::ProgramStatus, next);
-            state.pending_question = message;
+            state.pending = PendingLine::said(message);
         }
         ProgramState::Done => {
             let _ = commit_session_phase(state, PhaseSource::ProgramStatus, Phase::Succeeded);
-            state.pending_question = message;
+            state.pending = PendingLine::said(message);
         }
         ProgramState::Error => {
             let _ = commit_session_phase(state, PhaseSource::ProgramStatus, Phase::Failed);
-            state.pending_question = message;
+            state.pending = PendingLine::said(message);
         }
         ProgramState::Idle => {
             let _ = commit_session_phase(state, PhaseSource::ProgramStatus, Phase::Idle);
-            state.pending_question = None;
+            state.pending = None;
         }
         // 程序撤掉了全部记录（退出前会这样做）：没有状态了，相位交还给 hook。进程已经退出
         // 的不复活。
@@ -531,18 +599,12 @@ pub(crate) fn apply_program_status(state: &mut SessionState, status: &ProgramSta
             if !state.phase.is_dead() {
                 let _ = commit_session_phase(state, PhaseSource::ProgramStatus, Phase::Idle);
             }
-            state.pending_question = None;
+            state.pending = None;
         }
     }
     state.active_blocker = None;
     state.program_status = status.state != ProgramState::Clear;
-    if before
-        == (
-            state.phase,
-            state.pending_question.clone(),
-            state.program_status,
-        )
-    {
+    if before == (state.phase, state.pending.clone(), state.program_status) {
         return false;
     }
     // 跟 hook 一样：这是程序明确报出的回合状态，客户端据此判断相位可信、关掉终端通知兜底。
@@ -640,7 +702,7 @@ mod agent_event_reducer_tests {
         waiting.message = Some("选一个".into());
         apply_agent_event(&mut state, &waiting);
         assert_eq!(state.phase, Phase::WaitingForUser);
-        assert_eq!(state.pending_question.as_deref(), Some("选一个"));
+        assert_eq!(state.pending, Some(PendingLine::Said("选一个".into())));
 
         let mut answered = event(AgentEventKind::ToolFinished);
         answered.tool_use_id = Some("question-1".into());
@@ -649,6 +711,37 @@ mod agent_event_reducer_tests {
 
         apply_agent_event(&mut state, &event(AgentEventKind::TurnSucceeded));
         assert_eq!(state.phase, Phase::Succeeded);
+    }
+
+    /// 「待处理」只存一份：hook 写原话时顶掉运行时那句，不留下对不上的种类。线上拆成两个字段，
+    /// 没有时 `pending_question` 是 null。
+    #[test]
+    fn pending_line_is_stored_once_and_split_on_the_wire() {
+        let mut state = SessionState::default();
+        state.pending = Some(PendingLine::Note(
+            smelt_event_protocol::SessionNote::TurnFailed {
+                outcome: smelt_event_protocol::TurnFailure::MaxTokens,
+            },
+        ));
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["pending_question"], "Hit this turn's token limit");
+        assert_eq!(wire["pending_note"]["kind"], "turn_failed", "{wire}");
+
+        apply_agent_event(&mut state, &event(AgentEventKind::PromptSubmitted));
+        let mut wait = event(AgentEventKind::ApprovalRequested);
+        wait.message = Some("rm -rf build".into());
+        apply_agent_event(&mut state, &wait);
+        assert_eq!(
+            state.pending,
+            Some(PendingLine::Said("rm -rf build".into()))
+        );
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["pending_question"], "rm -rf build");
+        assert!(wire.get("pending_note").is_none(), "{wire}");
+
+        state.pending = None;
+        let wire = serde_json::to_value(&state).unwrap();
+        assert!(wire["pending_question"].is_null(), "{wire}");
     }
 
     #[test]
@@ -660,8 +753,8 @@ mod agent_event_reducer_tests {
         apply_agent_event(&mut state, &finished);
         assert_eq!(state.phase, Phase::Thinking);
         assert_eq!(
-            state.pending_question.as_deref(),
-            Some("第 5 步 · Bash: cargo test")
+            state.pending,
+            Some(PendingLine::Said("第 5 步 · Bash: cargo test".into()))
         );
     }
 
@@ -931,7 +1024,7 @@ mod agent_event_reducer_tests {
     fn title_event_updates_metadata_without_touching_the_turn() {
         let mut state = SessionState {
             phase: Phase::ExecutingTool,
-            pending_question: Some("Bash: cargo test".into()),
+            pending: Some(PendingLine::Said("Bash: cargo test".into())),
             ..Default::default()
         };
         let phase_since = state.phase_since;
@@ -943,7 +1036,10 @@ mod agent_event_reducer_tests {
         assert_eq!(state.title.as_deref(), Some("修复 OpenCode 标题"));
         assert_eq!(state.phase, Phase::ExecutingTool);
         assert_eq!(state.phase_since, phase_since);
-        assert_eq!(state.pending_question.as_deref(), Some("Bash: cargo test"));
+        assert_eq!(
+            state.pending,
+            Some(PendingLine::Said("Bash: cargo test".into()))
+        );
         assert!(state.structured_events);
         assert!(!state.turn_events);
 
@@ -1158,7 +1254,7 @@ mod program_status_tests {
         tool.message = Some("Agent".into());
         apply_agent_event(&mut state, &tool);
         assert_eq!(state.phase, Phase::ExecutingTool, "hook 细分出执行工具");
-        assert_eq!(state.pending_question.as_deref(), Some("Agent"));
+        assert_eq!(state.pending, Some(PendingLine::Said("Agent".into())));
         apply_agent_event(&mut state, &hook(AgentEventKind::ToolFinished));
         assert_eq!(state.phase, Phase::Thinking);
 
@@ -1200,7 +1296,10 @@ mod program_status_tests {
                 },
             );
             assert_eq!(state.phase, phase, "{kind:?}");
-            assert_eq!(state.pending_question.as_deref(), Some("运行 rm -rf build"));
+            assert_eq!(
+                state.pending,
+                Some(PendingLine::Said("运行 rm -rf build".into()))
+            );
         }
         // hook 的审批请求不改 7501 报的相位。
         apply_program_status(&mut state, &report(ProgramState::Working));

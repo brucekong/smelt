@@ -1,71 +1,35 @@
-//! 选目录：项目、智能体绑定的目录、要导入的插件都在运行时那台机器上。
+//! 插件要的路径（[`smelt_plugin_api::PICK_PATHS`]）：路径在运行时那台机器上。
 //!
 //! 本机运行时用系统的选择框（macOS 是访达那个，Windows、Linux 是各自系统的），选出来的
 //! 就是运行时能用的路径，常用位置、最近使用、搜索都有。远程运行时在那台机器上逐级浏览：
 //! 系统选择框只看得到这台桌面，路径对远程没有意义。列目录走 `workspace.browse_dirs`，
 //! 渲染只读 [`DirPickerState`] 里缓存的结果。
 
+use rust_i18n::t;
 use std::collections::BTreeSet;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::*;
-use smelt_ui::truncated_line::truncated_line;
 use smelt_runtime_client::protocol::workspace::{
     BrowseDirsParams, BrowseDirsResult, WorkspaceBrowseDirsCall,
 };
+use smelt_ui::scrollbar::{Scrollable, ScrollbarAxis};
+use smelt_ui::truncated_line::truncated_line;
+use smelt_ui::{Icon, IconName};
 
 use crate::{Workspace, ui_theme};
+use smelt_ui::kit::{TYPE, TypeStyled as _};
 
-/// 选好之后拿路径去做什么。
-pub(crate) enum DirPickerPurpose {
-    /// 「打开项目」：选一个目录。
-    OpenProject,
-    /// 给智能体绑定参考目录：可以多选。
-    AgentContextFolders { agent_id: String },
-    /// 插件要的路径（[`smelt_plugin_api::Host::pick_paths`]）：怎么选由插件说，选好交回给它。
-    Plugin {
-        request: smelt_plugin_api::PathRequest,
-        done: smelt_plugin_api::PathsPicked,
-    },
-}
-
-impl DirPickerPurpose {
-    fn title(&self) -> &str {
-        match self {
-            Self::OpenProject => "选择项目目录",
-            Self::AgentContextFolders { .. } => "选择要绑定的目录",
-            Self::Plugin { request, .. } => &request.title,
-        }
-    }
-
-    fn multiple(&self) -> bool {
-        match self {
-            Self::OpenProject => false,
-            Self::AgentContextFolders { .. } => true,
-            Self::Plugin { request, .. } => request.multiple,
-        }
-    }
-
-    /// 系统选择框的确认按钮。
-    fn confirm_label(&self) -> &str {
-        match self {
-            Self::OpenProject => "打开",
-            Self::AgentContextFolders { .. } => "绑定",
-            Self::Plugin { request, .. } => &request.confirm,
-        }
-    }
-
-    fn include_files(&self) -> bool {
-        matches!(self, Self::Plugin { request, .. } if request.files)
-    }
+/// 一次选路径：怎么选由插件说，选好从 `done` 交回；取消时它随选择框扔掉。
+pub(crate) struct PathPick {
+    pub(crate) request: smelt_plugin_api::PathRequest,
+    pub(crate) done: smol::channel::Sender<Vec<String>>,
 }
 
 pub(crate) struct DirPickerState {
     /// 在哪个运行时那台机器上选。
     runtime: crate::runtimes::Runtime,
-    purpose: DirPickerPurpose,
+    pick: PathPick,
     /// 当前列出的目录。`None` 表示还没列过（从主目录开始）。
     listing: Option<Result<BrowseDirsResult, String>>,
     loading: bool,
@@ -73,64 +37,29 @@ pub(crate) struct DirPickerState {
     generation: u64,
     /// 多选时勾上的目录；单选导入扩展时选中的那个文件。
     selected: BTreeSet<String>,
+    /// 目录列表的滚动位置。
+    scroll: ScrollHandle,
 }
 
 impl Workspace {
+    /// 在远程运行时那台机器上逐级浏览。本机运行时用系统选择框（[`pick_local_paths`]），
+    /// 不走这里。
     pub(crate) fn open_dir_picker(
         &mut self,
         runtime: crate::runtimes::Runtime,
-        purpose: DirPickerPurpose,
+        pick: PathPick,
         cx: &mut Context<Self>,
     ) {
-        if runtime.is_local() {
-            self.prompt_local_paths(runtime, purpose, cx);
-            return;
-        }
         self.dir_picker = Some(DirPickerState {
             runtime,
-            purpose,
+            pick,
             listing: None,
             loading: false,
             generation: 0,
             selected: BTreeSet::new(),
+            scroll: ScrollHandle::new(),
         });
         self.dir_picker_navigate(None, cx);
-    }
-
-    /// 本机运行时：弹系统的选择框。走 GPUI 的异步 `prompt_for_paths`，不能在回调里同步跑
-    /// 模态框（见对话输入栏「+」的注释）。
-    fn prompt_local_paths(
-        &mut self,
-        runtime: crate::runtimes::Runtime,
-        purpose: DirPickerPurpose,
-        cx: &mut Context<Self>,
-    ) {
-        let rx = cx.prompt_for_paths(system_prompt_options(&purpose));
-        cx.spawn(async move |this, cx| {
-            let paths = match rx.await {
-                Ok(Ok(Some(paths))) => paths,
-                // 用户取消。
-                Ok(Ok(None)) | Err(_) => return,
-                Ok(Err(error)) => {
-                    crate::status_item::notify_error(format!("打不开系统选择框：{error}"));
-                    return;
-                }
-            };
-            let chosen: Vec<String> = paths
-                .iter()
-                .filter_map(|path| path.to_str().map(str::to_string))
-                .collect();
-            if chosen.len() < paths.len() {
-                crate::status_item::notify_error("有路径不是 UTF-8，没法用，已跳过".to_string());
-            }
-            if chosen.is_empty() {
-                return;
-            }
-            let _ = this.update(cx, |this, cx| {
-                this.use_chosen_paths(&runtime, purpose, chosen, cx);
-            });
-        })
-        .detach();
     }
 
     pub(crate) fn cancel_dir_picker(&mut self, cx: &mut Context<Self>) {
@@ -145,14 +74,14 @@ impl Workspace {
         picker.generation += 1;
         picker.loading = true;
         // 换目录就清掉单选的文件；多选的目录跨目录保留。
-        if !picker.purpose.multiple() {
+        if !picker.pick.request.multiple {
             picker.selected.clear();
         }
         let generation = picker.generation;
         let client = picker.runtime.client().clone();
         let params = BrowseDirsParams {
             path,
-            include_files: picker.purpose.include_files(),
+            include_files: picker.pick.request.files,
         };
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -160,11 +89,8 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     client
-                        .call::<WorkspaceBrowseDirsCall>(
-                            &params,
-                            crate::runtime_call::RUNTIME_CALL_TIMEOUT,
-                        )
-                        .map_err(crate::runtime_call::error_text)
+                        .call::<WorkspaceBrowseDirsCall>(&params, smelt_plugin_api::CALL_TIMEOUT)
+                        .map_err(smelt_plugin_api::call_error_text)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -177,7 +103,11 @@ impl Workspace {
                 };
                 picker.loading = false;
                 match listed {
-                    Ok(listing) => picker.listing = Some(Ok(listing)),
+                    Ok(listing) => {
+                        picker.listing = Some(Ok(listing));
+                        // 新目录从顶上看起，不沿用上一层滚到的位置。
+                        picker.scroll.set_offset(Point::default());
+                    }
                     // 进不去的目录：留在原地，把原因显示出来。
                     Err(error) => {
                         if !matches!(picker.listing, Some(Ok(_))) {
@@ -198,7 +128,7 @@ impl Workspace {
             return;
         };
         if !picker.selected.remove(&path) {
-            if !picker.purpose.multiple() {
+            if !picker.pick.request.multiple {
                 picker.selected.clear();
             }
             picker.selected.insert(path);
@@ -206,12 +136,13 @@ impl Workspace {
         cx.notify();
     }
 
-    fn dir_picker_confirm(&mut self, cx: &mut Context<Self>) {
+    /// 确认按钮和对话框里的 Enter 都走这里。还在读下一层时列表是上一层的，不能确认。
+    pub(crate) fn dir_picker_confirm(&mut self, cx: &mut Context<Self>) {
         let Some(picker) = self.dir_picker.take() else {
             return;
         };
         let current = match &picker.listing {
-            Some(Ok(listing)) => listing.path.clone(),
+            Some(Ok(listing)) if !picker.loading => listing.path.clone(),
             _ => {
                 self.dir_picker = Some(picker);
                 return;
@@ -223,52 +154,34 @@ impl Workspace {
         } else {
             picker.selected.into_iter().collect()
         };
-        self.use_chosen_paths(&picker.runtime, picker.purpose, chosen, cx);
-    }
-
-    /// 选好了：两种选择框都从这里收尾。
-    fn use_chosen_paths(
-        &mut self,
-        runtime: &crate::runtimes::Runtime,
-        purpose: DirPickerPurpose,
-        chosen: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        match purpose {
-            DirPickerPurpose::OpenProject => {
-                if let Some(dir) = chosen.into_iter().next() {
-                    self.add_project(runtime.key().clone(), dir, cx);
-                }
-            }
-            DirPickerPurpose::AgentContextFolders { agent_id } => {
-                self.add_agent_context_folders(agent_id, chosen, cx);
-            }
-            DirPickerPurpose::Plugin { done, .. } => done(chosen, cx),
-        }
+        let _ = picker.pick.done.try_send(chosen);
         cx.notify();
     }
 
-    pub(crate) fn render_dir_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_dir_picker(
+        &self,
+        card: smelt_ui::dialog::Card,
+        cx: &mut Context<Self>,
+    ) -> smelt_ui::dialog::Card {
         let Some(picker) = self.dir_picker.as_ref() else {
-            return div().into_any_element();
+            return card;
         };
-        let (fg, muted, border) = {
-            let theme = cx.theme();
-            (theme.foreground, theme.muted_foreground, theme.border)
-        };
-        let multiple = picker.purpose.multiple();
+        let fg = rgb(ui_theme::text());
+        let muted = rgb(ui_theme::muted());
+        let multiple = picker.pick.request.multiple;
         let listing = picker.listing.as_ref();
         let current = listing.and_then(|listing| listing.as_ref().ok());
 
-        let toolbar = h_flex()
-            .gap_2()
+        let toolbar = div()
+            .flex()
             .items_center()
+            .gap_2()
             .child(
                 smelt_ui::Button::new("dir-picker-up")
                     .quiet()
-                    .compact()
+                    .small()
                     .icon(IconName::ArrowUp)
-                    .tooltip("上一级")
+                    .tooltip(t!("picker.up"))
                     .disabled(current.is_none_or(|listing| listing.parent.is_none()))
                     .on_click(cx.listener(|this, _, _, cx| {
                         let parent = this
@@ -285,8 +198,8 @@ impl Workspace {
             .child(
                 smelt_ui::Button::new("dir-picker-home")
                     .quiet()
-                    .compact()
-                    .label("主目录")
+                    .small()
+                    .label(t!("picker.home"))
                     .on_click(cx.listener(|this, _, _, cx| this.dir_picker_navigate(None, cx))),
             )
             .child(
@@ -294,7 +207,7 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
-                    .text_xs()
+                    .type_style(TYPE.text_xsmall)
                     .text_color(muted)
                     .child(truncated_line(
                         current
@@ -306,36 +219,29 @@ impl Workspace {
         let body: AnyElement = match listing {
             None => div()
                 .py_6()
-                .text_sm()
+                .type_style(TYPE.ui)
                 .text_color(muted)
-                .child("正在读取…")
+                .child(t!("picker.loading"))
                 .into_any_element(),
             Some(Err(error)) => div()
                 .py_6()
-                .text_sm()
-                .text_color(rgb(ui_theme::red()))
+                .type_style(TYPE.ui)
+                .text_color(rgb(ui_theme::bad()))
                 .child(error.clone())
                 .into_any_element(),
             Some(Ok(listing)) if listing.entries.is_empty() => div()
                 .py_6()
-                .text_sm()
+                .type_style(TYPE.ui)
                 .text_color(muted)
-                .child("这里没有子目录")
+                .child(t!("picker.empty"))
                 .into_any_element(),
-            Some(Ok(listing)) => v_flex()
-                .id("dir-picker-list")
-                .h(px(320.))
-                .overflow_y_scrollbar()
-                .border_1()
-                .border_color(border)
-                .rounded(ui_theme::row_radius())
-                .children(listing.entries.iter().enumerate().map(|(ix, entry)| {
+            Some(Ok(listing)) => {
+                let rows = listing.entries.iter().enumerate().map(|(ix, entry)| {
                     let selected = picker.selected.contains(&entry.path);
                     let path = entry.path.clone();
                     let is_dir = entry.is_dir;
                     let toggle_path = entry.path.clone();
                     smelt_ui::ListRow::new(("dir-picker-entry", ix))
-                        .card()
                         .selected(selected)
                         .flex()
                         .px_3()
@@ -356,7 +262,7 @@ impl Workspace {
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
-                                .text_sm()
+                                .type_style(TYPE.ui)
                                 .text_color(fg)
                                 .child(truncated_line(entry.name.clone())),
                         )
@@ -365,13 +271,17 @@ impl Workspace {
                             row.child(
                                 smelt_ui::Button::new(("dir-picker-pick", ix))
                                     .quiet()
-                                    .icon_size()
+                                    .small()
                                     .icon(if selected {
                                         IconName::Check
                                     } else {
                                         IconName::Plus
                                     })
-                                    .tooltip(if selected { "取消选择" } else { "选择" })
+                                    .tooltip(if selected {
+                                        t!("picker.deselect")
+                                    } else {
+                                        t!("picker.select")
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         // 整行点击是进入目录；勾选不能冒泡上去，否则选中的同时就进去了。
                                         cx.stop_propagation();
@@ -386,107 +296,122 @@ impl Workspace {
                                 this.dir_picker_toggle(path.clone(), cx);
                             }
                         }))
-                }))
-                .into_any_element(),
+                });
+                // 边框和圆角在外框上；滚动区填满它，内容滚动时边框不跟着走。
+                div()
+                    .h(px(320.))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(ui_theme::hair())
+                    .rounded(ui_theme::row_radius())
+                    .child(Scrollable::new(
+                        "dir-picker-list",
+                        div().flex().flex_col().children(rows),
+                        &picker.scroll,
+                        ScrollbarAxis::Vertical,
+                    ))
+                    .into_any_element()
+            }
         };
 
-        let confirm_label: SharedString = match (&picker.purpose, picker.selected.len()) {
-            (DirPickerPurpose::AgentContextFolders { .. }, 0) => "绑定当前目录".into(),
-            (DirPickerPurpose::AgentContextFolders { .. }, _) => "绑定所选目录".into(),
-            (DirPickerPurpose::Plugin { request, .. }, 0) => {
-                format!("{}当前目录", request.confirm).into()
-            }
-            (DirPickerPurpose::Plugin { request, .. }, _) => {
-                format!("{}所选项", request.confirm).into()
-            }
-            (DirPickerPurpose::OpenProject, _) => "打开当前目录".into(),
+        let request = &picker.pick.request;
+        let confirm_label: SharedString = if picker.selected.is_empty() {
+            t!("picker.confirm_current", action = request.confirm).into()
+        } else {
+            t!("picker.confirm_selected", action = request.confirm).into()
         };
-        let content = v_flex()
-            .child(Self::modal_title(
-                fg,
-                if picker.runtime.is_local() {
-                    picker.purpose.title().to_string()
-                } else {
-                    format!(
-                        "{}（{}）",
-                        picker.purpose.title(),
-                        crate::runtimes::runtime_name(picker.runtime.key(), cx)
-                    )
-                },
-            ))
+        let title = t!(
+            "picker.title",
+            title = request.title,
+            machine = crate::runtimes::runtime_name(picker.runtime.key(), cx)
+        );
+        let content = smelt_ui::dialog::content(title, None)
             .child(toolbar)
             .child(body)
             .when(multiple && !picker.selected.is_empty(), |content| {
-                content.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("已选 {} 个目录", picker.selected.len())),
-                )
-            })
+                content.child(div().type_style(TYPE.text_xsmall).text_color(muted).child(
+                    SharedString::from(if picker.selected.len() == 1 {
+                        t!("picker.selected.one")
+                    } else {
+                        t!("picker.selected.other", count = picker.selected.len())
+                    }),
+                ))
+            });
+        let footer = smelt_ui::dialog::footer()
+            .child(Self::modal_cancel_button(
+                "cancel-dir-picker",
+                t!("action.cancel"),
+                |this, _, _, cx| this.cancel_dir_picker(cx),
+                cx,
+            ))
             .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(Self::modal_normal_button(
-                        "cancel-dir-picker",
-                        "取消",
-                        |this, _, _, cx| this.cancel_dir_picker(cx),
-                        cx,
-                    ))
-                    .child(
-                        Self::modal_commit_button(
-                            "confirm-dir-picker",
-                            confirm_label,
-                            |this, _, _, cx| this.dir_picker_confirm(cx),
-                            cx,
-                        )
-                        .disabled(current.is_none() || picker.loading),
-                    ),
+                Self::modal_primary_button(
+                    "confirm-dir-picker",
+                    confirm_label,
+                    |this, _, _, cx| this.dir_picker_confirm(cx),
+                    cx,
+                )
+                .disabled(current.is_none() || picker.loading),
             );
-        self.modal_shell(
-            520.,
-            false,
-            content,
-            crate::overlay::ModalLayer::DirPicker,
-            cx,
-        )
+        card.w(px(520.)).child(content).footer(footer)
     }
 }
 
-/// 系统选择框的选项：都能选目录；导入扩展还能选单个文件；绑定目录可以多选。
-fn system_prompt_options(purpose: &DirPickerPurpose) -> PathPromptOptions {
+/// 本机的系统选择框：都能选目录，能不能选文件、多选照插件说的。它不挂在主窗口上，主窗口
+/// 关着也能弹。走 GPUI 的异步 `prompt_for_paths`，不能在回调里同步跑模态框。
+/// 取消、出错、一条能用的路径都没有时交回 `None`。
+pub(crate) fn pick_local_paths(
+    request: &smelt_plugin_api::PathRequest,
+    cx: &mut App,
+) -> Task<Option<Vec<String>>> {
+    let rx = cx.prompt_for_paths(system_prompt_options(request));
+    cx.spawn(async move |_| {
+        let paths = match rx.await {
+            Ok(Ok(Some(paths))) => paths,
+            // 用户取消。
+            Ok(Ok(None)) | Err(_) => return None,
+            Ok(Err(error)) => {
+                crate::status_item::notify_error(
+                    t!("picker.system_failed", error = error).into_owned(),
+                );
+                return None;
+            }
+        };
+        let chosen: Vec<String> = paths
+            .iter()
+            .filter_map(|path| path.to_str().map(str::to_string))
+            .collect();
+        if chosen.len() < paths.len() {
+            crate::status_item::notify_error(t!("picker.non_utf8").into_owned());
+        }
+        (!chosen.is_empty()).then_some(chosen)
+    })
+}
+
+fn system_prompt_options(request: &smelt_plugin_api::PathRequest) -> PathPromptOptions {
     PathPromptOptions {
-        files: purpose.include_files(),
+        files: request.files,
         directories: true,
-        multiple: purpose.multiple(),
-        prompt: Some(purpose.confirm_label().to_string().into()),
+        multiple: request.multiple,
+        prompt: Some(request.confirm.clone().into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     // 不能 `use super::*`：上面 glob 了 `gpui::*`，`gpui::test` 会顶掉 `#[test]`，展开时无限递归。
-    use super::{DirPickerPurpose, system_prompt_options};
+    use super::system_prompt_options;
 
     #[test]
-    fn system_prompt_options_follow_the_purpose() {
-        let project = system_prompt_options(&DirPickerPurpose::OpenProject);
-        assert!(project.directories && !project.files && !project.multiple);
-
-        let folders = system_prompt_options(&DirPickerPurpose::AgentContextFolders {
-            agent_id: "writer".to_string(),
-        });
-        assert!(folders.directories && !folders.files && folders.multiple);
-
-        let plugin = |files, multiple| DirPickerPurpose::Plugin {
-            request: smelt_plugin_api::PathRequest {
-                title: "选择".to_string(),
-                confirm: "导入".to_string(),
-                files,
-                multiple,
-            },
-            done: Box::new(|_, _| {}),
+    fn system_prompt_options_follow_the_request() {
+        let plugin = |files, multiple| smelt_plugin_api::PathRequest {
+            machine: smelt_plugin_api::RuntimeKey::Local,
+            title: "选择".to_string(),
+            confirm: "导入".to_string(),
+            files,
+            multiple,
         };
         let dirs = system_prompt_options(&plugin(false, false));
         assert!(dirs.directories && !dirs.files && !dirs.multiple);

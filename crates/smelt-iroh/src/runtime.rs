@@ -31,6 +31,8 @@ pub const RUNTIME_ALPN: &[u8] = b"smelt/runtime/1";
 const MAX_UNTRUSTED_CONNECTIONS: usize = 8;
 /// 未配对连接超限时的关闭码。
 const CLOSE_BUSY: u32 = 2;
+/// 客户端换了新链路、主动关掉旧连接时的关闭码。
+const CLOSE_REPLACED: u32 = 4;
 /// 未配对的连接最多留多久。到点还没配对就断开，名额不能被一条不说话的流一直占着；
 /// 客户端下次请求时会重拨。
 #[cfg(not(test))]
@@ -469,15 +471,6 @@ impl IrohClient {
         self.endpoint.id()
     }
 
-    /// 告诉 iroh 网络可能变了（切 Wi-Fi / 蜂窝、断网又恢复）：重新探测本机地址、重连 relay、
-    /// 给现有连接找新路径。Android 原生层收不到网络变化，iOS 上也不保证及时，所以由 App 转告。
-    /// 不阻塞。
-    pub fn network_change(&self) {
-        let endpoint = self.endpoint.clone();
-        self.runtime
-            .spawn(async move { endpoint.network_change().await });
-    }
-
     /// 连某个运行时的连接器。
     pub fn connector(
         self: &Arc<Self>,
@@ -492,6 +485,7 @@ impl IrohClient {
             client: Arc::clone(self),
             target: addr,
             conn: tokio::sync::Mutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -504,16 +498,25 @@ impl Drop for IrohClient {
 }
 
 /// 经 iroh 连一个远程运行时。实现 [`smelt_runtime_client::Connector`]，每次 `connect`
-/// 在同一条 QUIC 连接上新开一条流；连接断了就重拨。不能在 tokio 运行时里面调用。
+/// 在同一条 QUIC 连接上新开一条流；连接断了就重拨。[`RuntimeConnector::close`] 之后不再
+/// 重拨。不能在 tokio 运行时里面调用。
 pub struct RuntimeConnector {
     client: Arc<IrohClient>,
     target: EndpointAddr,
+    /// 当前连接。`closed` 只在这把锁下读写，和拨号互斥。
     conn: tokio::sync::Mutex<Option<Connection>>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl RuntimeConnector {
     async fn connection(&self) -> io::Result<Connection> {
         let mut slot = self.conn.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "this link is already closed",
+            ));
+        }
         if let Some(conn) = slot.as_ref()
             && conn.close_reason().is_none()
         {
@@ -525,7 +528,12 @@ impl RuntimeConnector {
             .connect(self.target.clone(), RUNTIME_ALPN);
         let conn = tokio::time::timeout(DIAL_TIMEOUT, dial)
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连不上运行时（超时）"))?
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "couldn't reach the runtime (timed out)",
+                )
+            })?
             .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
         *slot = Some(conn.clone());
         Ok(conn)
@@ -543,6 +551,21 @@ impl RuntimeConnector {
 }
 
 impl RuntimeConnector {
+    /// 关掉当前连接并不再重拨：这条连接上的流立刻结束（读到 EOF），之后 `connect` 直接失败。
+    /// 调用方换了新链路时用它放掉旧连接：旧连接可能已经僵死，不关的话上面的流要挂到 QUIC
+    /// 空闲超时（约 30 秒）才结束，期间旧连接器还会自己重拨。和
+    /// [`smelt_runtime_client::Connector::connect`] 一样不能在 tokio 运行时里调用。
+    pub fn close(&self) {
+        let conn = self.client.runtime.block_on(async {
+            let mut slot = self.conn.lock().await;
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            slot.take()
+        });
+        if let Some(conn) = conn {
+            conn.close(CLOSE_REPLACED.into(), b"replaced");
+        }
+    }
+
     /// 是不是经 `client` 拨号。调用方换了客户端（丢掉旧 endpoint 重建）之后，手里旧的
     /// 连接器还拴在旧 endpoint 上，要按新的重建。
     pub fn uses(&self, client: &Arc<IrohClient>) -> bool {

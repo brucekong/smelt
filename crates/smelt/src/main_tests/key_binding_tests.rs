@@ -6,10 +6,10 @@ use gpui::{Action, KeyBinding, KeyContext, Keymap, Keystroke, TestAppContext};
 use smelt_plugin_api::{self as api, RunCommand};
 
 use crate::keymap::{Overrides, app_key_bindings, bind_commands};
-use crate::{
-    CloseSettingsWindow, DismissWorkspace, FileTreeActivate, FileTreeMoveUp, SidebarOpen,
-    workspace_commands, workspace_key_context,
-};
+use crate::{DismissWorkspace, workspace_commands};
+
+// 站在 Input 上的键，模拟编辑器更深的 Replace / Escape。
+gpui::actions!(key_binding_tests, [Deeper]);
 
 fn keymap() -> Keymap {
     let bindings = TestAppContext::single().update(|cx| {
@@ -18,11 +18,9 @@ fn keymap() -> Keymap {
         app_key_bindings(&bound, cx)
     });
     let mut keymap = Keymap::new(bindings);
-    // 用 SidebarOpen 站在 Input 上，模拟编辑器更深的 Outdent / Replace / Escape。
     keymap.add_bindings([
-        KeyBinding::new("cmd-[", SidebarOpen, Some("Input")),
-        KeyBinding::new("cmd-shift-f", SidebarOpen, Some("Input")),
-        KeyBinding::new("escape", SidebarOpen, Some("Input")),
+        KeyBinding::new("cmd-shift-f", Deeper, Some("Input")),
+        KeyBinding::new("escape", Deeper, Some("Input")),
     ]);
     keymap
 }
@@ -64,71 +62,32 @@ fn first_command(spec: &'static str, stack: &[&str]) -> Option<String> {
 }
 
 #[test]
-fn context_string_only_adds_the_panel_that_is_showing() {
-    assert_eq!(workspace_key_context(false, false), "Workspace");
-    assert_eq!(workspace_key_context(true, false), "Workspace Files");
-    assert_eq!(workspace_key_context(false, true), "Workspace GitChanges");
-    assert_eq!(
-        workspace_key_context(true, true),
-        "Workspace Files GitChanges"
-    );
-}
-
-#[test]
 fn workspace_chords_stay_shallower_than_terminal_and_input() {
     assert_eq!(
         first_command("cmd-k", &["Workspace", "Terminal"]).as_deref(),
         Some("smelt.palette/toggle")
     );
-    assert_eq!(
-        first_command("cmd-s", &["Workspace Files", "Terminal"]).as_deref(),
-        Some("smelt.files/save")
-    );
     assert!(
         matched("cmd-s", &["Workspace", "Terminal"]).is_empty(),
-        "文件页没打开时 Cmd+S 不该命中"
-    );
-    assert_eq!(
-        first_command("f7", &["Workspace GitChanges", "Editor"]).as_deref(),
-        Some("smelt.git/next-hunk")
-    );
-    assert_eq!(
-        first_command("shift-f7", &["Workspace Files GitChanges", "Terminal"]).as_deref(),
-        Some("smelt.git/prev-hunk")
+        "保存归文件视图自己，工作台不绑 Cmd+S"
     );
     assert!(
-        matched("f7", &["Workspace", "Editor"]).is_empty(),
-        "改动页没打开时 F7 不该命中"
-    );
-    assert!(first_is::<FileTreeMoveUp>(
-        "up",
-        &["Workspace Files", "FileTree"]
-    ));
-    assert!(first_is::<FileTreeActivate>(
-        "enter",
-        &["Workspace", "FileTree"]
-    ));
-    assert!(
-        matched("up", &["Workspace Files", "Terminal"]).is_empty(),
-        "文件树没聚焦时方向键不该命中"
+        matched("up", &["Workspace", "Terminal"]).is_empty(),
+        "工作台不该抢终端的方向键"
     );
     assert!(
         matched("enter", &["Workspace", "Terminal"]).is_empty(),
-        "Enter 只属于文件树，不能从 Workspace 抢走终端的回车"
-    );
-
-    let cycle = matched("cmd-[", &["Workspace", "Input"]);
-    assert!(cycle[0].action().as_any().is::<SidebarOpen>());
-    assert!(
-        cycle
-            .iter()
-            .any(|binding| command_of(binding).as_deref() == Some("smelt.stage/prev-pane"))
+        "不能从 Workspace 抢走终端的回车"
     );
 
     let hud = matched("cmd-shift-f", &["Workspace", "Input"]);
-    assert!(hud[0].action().as_any().is::<SidebarOpen>());
+    assert!(hud[0].action().as_any().is::<Deeper>());
+    assert!(
+        hud.iter()
+            .any(|binding| command_of(binding).as_deref() == Some("smelt.app/debug-hud"))
+    );
 
-    assert!(first_is::<SidebarOpen>("escape", &["Workspace", "Input"]));
+    assert!(first_is::<Deeper>("escape", &["Workspace", "Input"]));
     assert!(first_is::<DismissWorkspace>(
         "escape",
         &["Workspace", "Terminal"]
@@ -136,87 +95,18 @@ fn workspace_chords_stay_shallower_than_terminal_and_input() {
 }
 
 #[test]
-fn session_and_split_chords_carry_their_commands() {
-    assert_eq!(
-        first_command("cmd-1", &["Workspace"]).as_deref(),
-        Some("smelt.sessions/activate-1")
-    );
-    assert_eq!(
-        first_command("cmd-9", &["Workspace Files GitChanges"]).as_deref(),
-        Some("smelt.sessions/activate-9")
-    );
-    assert_eq!(
-        first_command("cmd-d", &["Workspace"]).as_deref(),
-        Some("smelt.stage/split-right")
-    );
-    assert_eq!(
-        first_command("shift-cmd-d", &["Workspace"]).as_deref(),
-        Some("smelt.stage/split-down")
-    );
-    assert_eq!(
-        first_command("cmd-w", &["Workspace", "Terminal"]).as_deref(),
-        Some("smelt.stage/close-pane")
-    );
-}
-
-/// 设置和退出在设置窗口里也能按，设置窗口把命令转给主窗口。
-#[test]
-fn app_chords_also_work_in_the_settings_window() {
-    for stack in [&["Workspace", "Terminal"][..], &["SettingsWindow"][..]] {
-        assert_eq!(
-            first_command("cmd-q", stack).as_deref(),
-            Some("smelt.app/quit")
-        );
-        assert_eq!(
-            first_command("cmd-,", stack).as_deref(),
-            Some("smelt.app/settings")
-        );
-    }
-    assert!(
-        matched("cmd-k", &["SettingsWindow"]).is_empty(),
-        "工作台的键不该在设置窗口里命中"
-    );
-}
-
-#[test]
 fn workspace_chords_are_not_bound_at_the_root_context() {
     for spec in [
         "cmd-k",
         "cmd-q",
-        "cmd-[",
-        "cmd-]",
-        "cmd-1",
-        "cmd-d",
-        "shift-cmd-d",
-        "cmd-w",
+        "cmd-,",
         "cmd-s",
         "cmd-shift-f",
-        "f7",
-        "shift-f7",
         "escape",
         "up",
         "enter",
     ] {
         let (bindings, _) = keymap().bindings_for_input(&[stroke(spec)], &contexts(&["Terminal"]));
-        assert!(
-            bindings.is_empty(),
-            "{spec} 不该在没有 Workspace / Files / GitChanges / FileTree 时命中"
-        );
+        assert!(bindings.is_empty(), "{spec} 不该在没有 Workspace 时命中");
     }
-}
-
-/// 与 `app_key_bindings` 里关设置窗口的键一致。`Keystroke::parse` 不接受 `secondary-`。
-#[cfg(target_os = "macos")]
-const CLOSE_SETTINGS_CHORD: &str = "cmd-w";
-#[cfg(not(target_os = "macos"))]
-const CLOSE_SETTINGS_CHORD: &str = "ctrl-w";
-
-/// 设置窗口 Cmd+W（Windows / Linux 是 Ctrl+W）关窗；它是普通窗口，Esc 不关它。
-#[test]
-fn settings_window_closes_on_secondary_w_but_not_escape() {
-    assert!(first_is::<CloseSettingsWindow>(
-        CLOSE_SETTINGS_CHORD,
-        &["SettingsWindow"]
-    ));
-    assert!(matched("escape", &["SettingsWindow"]).is_empty());
 }

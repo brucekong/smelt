@@ -38,7 +38,7 @@ class L10nZh extends L10n {
   }
 
   @override
-  String get agentEditPluginsNone => '这台机器上没有插件。';
+  String get agentEditPluginsNone => '这台机器上没有技能或扩展。';
 
   @override
   String get agentEditMissing => '这台机器上已经没有了';
@@ -54,7 +54,7 @@ class L10nZh extends L10n {
 
   @override
   String agentEditChoicesFailed(String message) {
-    return '这台机器的能力库没读到，模型、插件、MCP 可能列不全：$message';
+    return '这台机器的能力库没读到，模型、技能和扩展、MCP 可能列不全：$message';
   }
 
   @override
@@ -235,7 +235,7 @@ class L10nZh extends L10n {
   String get agentsNoPrompt => '没有设置长期指令。';
 
   @override
-  String get agentsPlugins => '插件';
+  String get agentsPlugins => '技能和扩展';
 
   @override
   String get agentsContext => '上下文';
@@ -1077,7 +1077,7 @@ class L10nZh extends L10n {
   }
 
   @override
-  String get conversationStatusEnded => '会话已结束';
+  String get conversationStatusEnded => '已停止';
 
   @override
   String get conversationStatusCompacting => '正在压缩上下文…';
@@ -1095,9 +1095,6 @@ class L10nZh extends L10n {
 
   @override
   String get conversationHintTicket => '先处理上方的单据';
-
-  @override
-  String get conversationHintEnded => '这段会话已结束';
 
   @override
   String get conversationHintSending => '等机器确认收到…';
@@ -1249,6 +1246,12 @@ class L10nZh extends L10n {
 
   @override
   String get conversationMemoryEmptyBody => '（正文为空）';
+
+  @override
+  String get conversationAskSkipped => '跳过了';
+
+  @override
+  String get conversationAskUnanswered => '没有回答';
 
   @override
   String get filesTitle => '文件';
@@ -1852,7 +1855,7 @@ class L10nZh extends L10n {
   String get elicitationDismiss => '跳过';
 
   @override
-  String get elicitationRequired => '必填';
+  String get elicitationOtherAnswer => '其他答案…';
 
   @override
   String get elicitationOpenLink => '打开链接';

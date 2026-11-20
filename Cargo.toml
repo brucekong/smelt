@@ -30,13 +30,30 @@ members = [
     "crates/smelt-git",
     "crates/smeltd",
     "crates/smelt-ui",
-    "crates/smelt-app-state",
-    "crates/smelt-acp-view",
     "crates/smelt-plugin-api",
+    "crates/plugins/agents",
+    "crates/plugins/archive",
+    "crates/plugins/automations",
+    "crates/plugins/buddies",
     "crates/plugins/capabilities",
+    "crates/plugins/conversation",
+    "crates/plugins/desktop",
+    "crates/plugins/files",
+    "crates/plugins/git",
     "crates/plugins/history",
+    "crates/plugins/ide",
+    "crates/plugins/language",
+    "crates/plugins/launcher",
     "crates/plugins/layouts",
+    "crates/plugins/machines",
+    "crates/plugins/maintenance",
+    "crates/plugins/notifications",
+    "crates/plugins/resources",
+    "crates/plugins/sessions",
+    "crates/plugins/skills",
+    "crates/plugins/terminal",
     "crates/plugins/themes",
+    "crates/plugins/updater",
     "crates/smelt",
     "crates/smelt-iroh",
     "crates/smelt-mobile", # package 名是 smelt_mobile（cargokit 要求，见其 Cargo.toml）
@@ -51,10 +68,16 @@ edition = "2024"
 # 与 rust-toolchain.toml 一致。成员 crate 未一律 inherit，钉编译器靠 toolchain 文件。
 # gpui-pre-macos 0.3.10 起用了 1.98 才稳定的 `Option::map_or_default`。
 rust-version = "1.98.0"
+# 本仓库全部 crate 以 Apache-2.0 开源，只随 app 分发，不发 crates.io。
+# 商业版私有仓里的闭源 crate 自己声明许可，不继承这里。
+license = "Apache-2.0"
+publish = false
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
+# 界面文案（docs/i18n.md）：插件、组件库、宿主各自带 locales/ui.yml。和 gpui-kit 同一套。
+rust-i18n = "4.2"
 
 [patch.crates-io]
 # gpui-kit 0.8.1（611b55e331170ca375214d580b6c5409db858f83）起，gpui-shell 直接依赖
@@ -77,13 +100,12 @@ unnecessary_sort_by = "warn"
 collapsible_if = "warn"
 cloned_ref_to_slice_refs = "warn"
 redundant_clone = "warn"
+# `while let` / `match` / `if let` 条件里拿的锁守卫活到整个代码块结束：在里面等别的线程，
+# 那边要拿同一把锁就互相卡住（补做写回曾因此每次等满 10 秒）。先取值放锁，再判断。
+significant_drop_in_scrutinee = "warn"
 # 正确性闸门：空 dbg/todo 不应进主线。存量 style 警告不在这里 deny，避免一次清不完。
 dbg_macro = "deny"
 todo = "deny"
-# 手型光标只留给链接。路径是 gpui-pre 0.3.11 里 `Styled` 上由
-# `cursor_style_methods!` 生成的方法（`gpui/src/styled.rs`，模块 `gpui::styled`）。
-# macOS CI 不跑 clippy，真正挡住调用点的是 scripts/lint-pointer.sh。
-disallowed_methods = "deny"
 
 # proc-macro 和 build script 只在构建机上用，不发布，不用 strip。
 # rustc 1.97 在 macOS 上用 `rust-objcopy --strip-debug` 实现默认的 strip=debuginfo，处理后的

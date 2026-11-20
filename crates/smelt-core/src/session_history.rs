@@ -12,7 +12,7 @@
 
 pub use smelt_model::session_history::*;
 
-use crate::agent_kind::{ConversationAgentKind, HistorySourceKind, TerminalAgentKind};
+use crate::agent_kind::{ConversationAgentKind, HistorySourceKind};
 use crate::fs::{FileSystem, LocalFs};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -81,6 +81,12 @@ pub(crate) static SESSION_HISTORY_PROVIDERS: &[SessionHistoryProvider] = &[
         list_sessions: list_grok_sessions,
         load_detail: load_grok_session_detail,
     },
+    // TUI 和 `agy acp` 写的是同一份 `~/.gemini/antigravity-cli/`。
+    SessionHistoryProvider {
+        agent: HistorySourceKind::Conversation(ConversationAgentKind::Antigravity),
+        list_sessions: list_antigravity_sessions,
+        load_detail: load_antigravity_session_detail,
+    },
     SessionHistoryProvider {
         agent: HistorySourceKind::Conversation(ConversationAgentKind::Cursor),
         list_sessions: list_cursor_sessions,
@@ -100,12 +106,6 @@ pub(crate) static SESSION_HISTORY_PROVIDERS: &[SessionHistoryProvider] = &[
         agent: HistorySourceKind::Conversation(ConversationAgentKind::Pi),
         list_sessions: list_pi_sessions,
         load_detail: load_pi_session_detail,
-    },
-    // 只有 TUI、没有 ACP，但会话实打实落在 `~/.gemini/antigravity-cli/`。
-    SessionHistoryProvider {
-        agent: HistorySourceKind::TerminalOnly(TerminalAgentKind::Antigravity),
-        list_sessions: list_antigravity_sessions,
-        load_detail: load_antigravity_session_detail,
     },
 ];
 
@@ -1531,10 +1531,10 @@ pub(crate) fn read_pi_session_branch(
     session_id: &str,
 ) -> Result<PiSessionBranch, String> {
     if session_id.is_empty() {
-        return Err("会话 id 为空".to_string());
+        return Err("the session id is empty".to_string());
     }
     let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) else {
-        return Err("没有工作目录，无法定位 Pi 会话文件".to_string());
+        return Err("no working directory, so the Pi session file can't be found".to_string());
     };
     let dir = pi_sessions_dir_for(&LocalFs, agent_dir, session_dir).join(pi_session_cwd_dir(cwd));
     let mut files = Vec::new();
@@ -1548,10 +1548,10 @@ pub(crate) fn read_pi_session_branch(
         })
         .collect::<Vec<_>>();
     match matches.len() {
-        0 => Err(format!("在 {} 找不到会话 {session_id}", dir.display())),
+        0 => Err(format!("session {session_id} isn't in {}", dir.display())),
         1 => parse_pi_session_file(&matches.remove(0), session_id),
         _ => Err(format!(
-            "会话 {session_id} 在 {} 匹配到多份文件",
+            "session {session_id} matched several files in {}",
             dir.display()
         )),
     }
@@ -1559,17 +1559,24 @@ pub(crate) fn read_pi_session_branch(
 
 fn parse_pi_session_file(path: &Path, session_id: &str) -> Result<PiSessionBranch, String> {
     let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("读取 {} 失败：{error}", path.display()))?;
+        .map_err(|error| format!("couldn't read {}: {error}", path.display()))?;
     let header = text
         .lines()
         .next()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .ok_or_else(|| format!("{} 没有会话头", path.display()))?;
-    let header: Value = serde_json::from_str(header)
-        .map_err(|error| format!("{} 的会话头无法解析：{error}", path.display()))?;
+        .ok_or_else(|| format!("{} has no session header", path.display()))?;
+    let header: Value = serde_json::from_str(header).map_err(|error| {
+        format!(
+            "couldn't parse the session header of {}: {error}",
+            path.display()
+        )
+    })?;
     if header.get("type").and_then(Value::as_str) != Some("session") {
-        return Err(format!("{} 的第一行不是 session 头", path.display()));
+        return Err(format!(
+            "the first line of {} isn't a session header",
+            path.display()
+        ));
     }
     let id = header
         .get("id")
@@ -1578,7 +1585,7 @@ fn parse_pi_session_file(path: &Path, session_id: &str) -> Result<PiSessionBranc
         .unwrap_or("");
     if id != session_id {
         return Err(format!(
-            "{} 的会话头 id 是 {id}，不是 {session_id}",
+            "the session header id of {} is {id}, not {session_id}",
             path.display()
         ));
     }
@@ -1976,33 +1983,36 @@ mod tests {
         assert_eq!(registered, HistorySourceKind::ALL);
     }
 
-    /// 历史来源是 ACP 种类的超集：每个 ACP agent 都得能读历史，但反过来不成立。
-    /// 这条测试防的是「新增 ACP agent 却忘了注册历史 Provider」。
+    /// ACP 和历史解析是独立能力。没有解析器时不能把另一家的历史冒充成自己的。
     #[test]
-    fn every_acp_agent_has_a_history_source() {
-        for kind in ConversationAgentKind::ALL {
-            let source = HistorySourceKind::from(kind);
-            assert_eq!(source.acp(), Some(kind), "{}", kind.id());
-            assert!(has_history(source), "{} 没注册历史 Provider", kind.id());
+    fn acp_agents_without_history_parser_have_no_provider() {
+        for kind in [ConversationAgentKind::Custom, ConversationAgentKind::OhMyPi] {
+            assert!(
+                !has_history(kind.into()),
+                "{} 不应冒用历史解析器",
+                kind.id()
+            );
         }
-        assert!(
-            !has_history(ConversationAgentKind::Custom.into()),
-            "通用 ACP 没有本地 transcript"
-        );
     }
 
-    /// Antigravity 只有 TUI，它必须能读历史、但不能被当成 ACP 对象。
-    /// 这条测试钉住本次解耦的核心诉求：两个能力互相独立。
+    /// 每个登记的历史来源都要有解析器，反过来也一样：两张表说的是同一个集合。
     #[test]
-    fn terminal_only_source_reads_history_but_has_no_acp() {
-        let source = HistorySourceKind::TerminalOnly(TerminalAgentKind::Antigravity);
-        assert!(
-            HistorySourceKind::ALL.contains(&source),
-            "应已登记为历史来源"
+    fn every_history_source_has_exactly_one_provider() {
+        for source in HistorySourceKind::ALL {
+            assert_eq!(
+                SESSION_HISTORY_PROVIDERS
+                    .iter()
+                    .filter(|provider| provider.agent == source)
+                    .count(),
+                1,
+                "{}",
+                source.id()
+            );
+        }
+        assert_eq!(
+            SESSION_HISTORY_PROVIDERS.len(),
+            HistorySourceKind::ALL.len()
         );
-        assert_eq!(source.acp(), None, "没有 ACP，不能当迁移目标");
-        assert_eq!(source.terminal(), Some(TerminalAgentKind::Antigravity));
-        assert_eq!(source.id(), "antigravity");
     }
 
     #[test]

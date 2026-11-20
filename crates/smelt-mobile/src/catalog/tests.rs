@@ -51,7 +51,7 @@ fn parse_directory(value: Value) -> WorkspaceDirectory {
 }
 
 /// 目录里的一段对话：ACP 对话的会话 id、终端的终端 id 都是 `id`。`order` 是它在目录里的
-/// 先后，拼目录时按它排。没有用户名字时显示「`id` 目录名」（ACP 的会话标题、终端的启动名）。
+/// 先后，拼目录时按它排。名字由运行时推来，目录里记的标题、启动名手机不再看。
 fn conversation(id: &str, kind: &str, project: Option<(&str, u32)>, order: u32) -> Value {
     let cwd = project.map(|(root, _)| root.to_string());
     let conversation = if kind == "acp" {
@@ -61,7 +61,6 @@ fn conversation(id: &str, kind: &str, project: Option<(&str, u32)>, order: u32) 
                 sid: id.into(),
                 agent: "pi".into(),
                 cwd,
-                session_title: Some(format!("{id} 目录名")),
                 ..WorkspaceAcp::default()
             }),
             ..WorkspaceConversation::default()
@@ -72,7 +71,6 @@ fn conversation(id: &str, kind: &str, project: Option<(&str, u32)>, order: u32) 
             terminals: vec![WorkspaceTerminal {
                 id: Some(id.into()),
                 cwd,
-                launch_label: Some(format!("{id} 目录名")),
                 ..WorkspaceTerminal::default()
             }],
             ..WorkspaceConversation::default()
@@ -141,26 +139,79 @@ fn find<'a>(sessions: &'a [SessionSummary], id: &str) -> &'a SessionSummary {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn archives_are_hidden_and_pins_stay_within_their_project() {
+fn archives_are_hidden_and_the_rest_keep_directory_order() {
     let mut state = CatalogState::default();
     let mut archived = conversation("archived", "terminal", Some(("/repo", 0)), 0);
     archived["archived_at"] = json!(20);
-    let mut pinned = conversation("pinned", "acp", Some(("/repo", 0)), 2);
-    pinned["pinned_at"] = json!(10);
     state.apply(
         snapshot(
             Vec::new(),
             Some(parse_directory(one_project_directory(vec![
                 archived,
                 conversation("normal", "terminal", Some(("/repo", 0)), 1),
-                pinned,
+                conversation("later", "acp", Some(("/repo", 0)), 2),
                 conversation("outside", "acp", Some(("/other", 1)), 3),
             ]))),
             None,
         ),
         Instant::now(),
     );
-    assert_eq!(ids_of(&state.summaries()), ["pinned", "normal", "outside"]);
+    assert_eq!(ids_of(&state.summaries()), ["normal", "later", "outside"]);
+}
+
+/// 绑了工作树的会话归工作树所在的项目，带上任务名和分支；项目里先是没绑的会话，再按
+/// 工作树的次序一棵一棵排。已经不在目录里的工作树当没绑。
+#[test]
+fn worktree_sessions_carry_their_worktree_and_sit_together() {
+    let mut state = CatalogState::default();
+    let bound = |id: &str, kind: &str, workset: &str, order: u32| {
+        let mut value = conversation(
+            id,
+            kind,
+            Some((&format!("/repo/worktrees/{workset}"), 0)),
+            order,
+        );
+        value["workset_id"] = json!(workset);
+        value
+    };
+    let mut directory = one_project_directory(vec![
+        bound("b-1", "acp", "task-b", 0),
+        conversation("plain", "terminal", Some(("/repo", 0)), 1),
+        bound("a-1", "terminal", "task-a", 2),
+        bound("b-2", "terminal", "task-b", 3),
+        bound("gone", "acp", "closed", 4),
+    ]);
+    directory["worksets"] = json!([
+        {"id": "task-a", "project_root": "/repo", "task": "task-a", "branch": "feat/a",
+         "position": 0, "repositories": []},
+        {"id": "task-b", "project_root": "/repo", "task": "task-b", "branch": "fix/b",
+         "position": 1, "repositories": []},
+    ]);
+    state.apply(
+        snapshot(Vec::new(), Some(parse_directory(directory)), None),
+        Instant::now(),
+    );
+
+    let sessions = state.summaries();
+    assert_eq!(ids_of(&sessions), ["plain", "gone", "a-1", "b-1", "b-2"]);
+    for id in ["plain", "gone", "a-1", "b-1", "b-2"] {
+        assert_eq!(
+            find(&sessions, id).project_root.as_deref(),
+            Some("/repo"),
+            "{id}"
+        );
+    }
+    let b = find(&sessions, "b-2");
+    assert_eq!(
+        (
+            b.workset_id.as_deref(),
+            b.workset_task.as_deref(),
+            b.workset_branch.as_deref()
+        ),
+        (Some("task-b"), Some("task-b"), Some("fix/b"))
+    );
+    assert_eq!(find(&sessions, "gone").workset_id, None);
+    assert_eq!(find(&sessions, "plain").workset_id, None);
 }
 
 #[test]
@@ -172,11 +223,6 @@ fn projection_lists_the_directory_and_live_automation_runs() {
         conversation("outside", "acp", Some(("/work/other", 1)), 2),
     ]));
     directory.conversations[2].acp.as_mut().unwrap().agent = "codex".into();
-    directory.conversations[2]
-        .acp
-        .as_mut()
-        .unwrap()
-        .session_title = None;
     let automations = automation_file(json!({
         "schema_version": 2,
         "revision": 1,
@@ -203,7 +249,10 @@ fn projection_lists_the_directory_and_live_automation_runs() {
     );
 
     let outside = find(&sessions, "outside");
-    assert_eq!(outside.title, "codex conversation");
+    assert_eq!(
+        outside.title, "codex conversation",
+        "运行时还没报名字：通用名"
+    );
     assert_eq!(outside.agent, "codex");
     assert_eq!(outside.project_root.as_deref(), Some("/work/other"));
     assert_eq!(outside.project_title.as_deref(), Some("other"));
@@ -234,6 +283,44 @@ fn projection_lists_the_directory_and_live_automation_runs() {
     );
 }
 
+/// 新建会话能选的项目带上各自的工作树，按桌面侧栏的次序（`position`），别的项目的不混进来。
+#[test]
+fn projects_list_their_worksets_for_new_sessions() {
+    let mut state = CatalogState::default();
+    let mut directory = one_project_directory(Vec::new());
+    directory["projects"] = json!(["/repo", "/other"]);
+    directory["worksets"] = json!([
+        {"id": "ws-b", "project_root": "/repo", "task": "b", "branch": "fix/b",
+         "position": 1, "repositories": []},
+        {"id": "ws-x", "project_root": "/other", "task": "x", "branch": "feat/x",
+         "position": 0, "repositories": []},
+        {"id": "ws-a", "project_root": "/repo", "task": "a", "branch": "feat/a",
+         "position": 0, "repositories": []},
+    ]);
+    state.apply(
+        snapshot(Vec::new(), Some(parse_directory(directory)), None),
+        Instant::now(),
+    );
+    let worksets: Vec<(String, Vec<String>)> = state
+        .projects()
+        .into_iter()
+        .map(|project| {
+            let ids = project.worksets.into_iter().map(|w| w.id).collect();
+            (project.root, ids)
+        })
+        .collect();
+    assert_eq!(
+        worksets,
+        [
+            (
+                "/repo".to_string(),
+                vec!["ws-a".to_string(), "ws-b".to_string()]
+            ),
+            ("/other".to_string(), vec!["ws-x".to_string()]),
+        ]
+    );
+}
+
 /// 运行时一个项目都没开：会话按 cwd 自成一组，但没有能新建会话的项目。
 #[test]
 fn conversations_outside_every_project_still_list() {
@@ -245,11 +332,9 @@ fn conversations_outside_every_project_still_list() {
         0,
     )]));
     directory.projects.clear();
-    directory.conversations[0].custom_title = Some("构建".into());
     state.apply(snapshot(Vec::new(), Some(directory), None), Instant::now());
     let sessions = state.summaries();
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].title, "构建");
     assert_eq!(sessions[0].project_root.as_deref(), Some("/srv/app"));
     assert!(
         state.projects().is_empty(),
@@ -257,26 +342,29 @@ fn conversations_outside_every_project_still_list() {
     );
 }
 
+/// 名字认运行时算好的那一格的名字（和桌面侧栏同一条规则，见 smeltd `session_names`），
+/// 不再自己拿目录里的用户名字、会话标题拼。
 #[test]
-fn title_prefers_the_custom_name_then_the_session_title_then_the_directory() {
-    let mut custom = conversation("custom", "acp", Some(("/repo", 0)), 0);
-    custom["custom_title"] = json!("我起的名");
+fn title_is_the_name_the_runtime_reports() {
+    let mut custom = conversation("named", "acp", Some(("/repo", 0)), 0);
+    custom["custom_title"] = json!("目录里的名字");
     let directory = parse_directory(one_project_directory(vec![
         custom,
-        conversation("auto", "acp", Some(("/repo", 0)), 1),
-        conversation("untitled", "acp", Some(("/repo", 0)), 2),
+        conversation("unnamed", "terminal", Some(("/repo", 0)), 1),
     ]));
-    let titled = |id: &str| DaemonSessionState {
-        title: Some("agent 起的名".into()),
-        ..daemon(id, DaemonPhase::Idle)
-    };
     let mut state = CatalogState::default();
     state.apply(
         snapshot(
             vec![
-                titled("custom"),
-                titled("auto"),
-                daemon("untitled", DaemonPhase::Idle),
+                DaemonSessionState {
+                    title: Some("agent 起的名".into()),
+                    name: Some("运行时算的名字".into()),
+                    ..daemon("named", DaemonPhase::Idle)
+                },
+                DaemonSessionState {
+                    title: Some("agent 起的名".into()),
+                    ..daemon("unnamed", DaemonPhase::Idle)
+                },
             ],
             Some(directory),
             None,
@@ -284,9 +372,12 @@ fn title_prefers_the_custom_name_then_the_session_title_then_the_directory() {
         Instant::now(),
     );
     let sessions = state.summaries();
-    assert_eq!(find(&sessions, "custom").title, "我起的名");
-    assert_eq!(find(&sessions, "auto").title, "agent 起的名");
-    assert_eq!(find(&sessions, "untitled").title, "untitled 目录名");
+    assert_eq!(find(&sessions, "named").title, "运行时算的名字");
+    assert_eq!(
+        find(&sessions, "unnamed").title,
+        "Terminal",
+        "运行时还没报名字（旧运行时）：通用名"
+    );
 }
 
 #[test]
@@ -1068,12 +1159,16 @@ fn dto(id: &str, revision: u64, phase: CoreSessionPhase) -> SessionStateChanged 
         provider: None,
         conversation_id: None,
         custom_title: None,
-        title: Some(format!("{id} r{revision}")),
+        title: None,
+        conversation_name: None,
+        name: Some(format!("{id} r{revision}")),
         phase,
         phase_since_unix_seconds: 1,
         turn_started_at_unix_seconds: 1,
         pending_question: None,
         pending_request: None,
+        pending_note: None,
+        completed_delivery_id: None,
         tokens_used: None,
         branch: None,
         dirty_files: Vec::new(),
@@ -1381,6 +1476,9 @@ fn cached_list_shows_until_the_live_snapshot_then_the_live_list_is_saved() {
         automation: None,
         agent_definition_id: None,
         profile_id: None,
+        workset_id: None,
+        workset_task: None,
+        workset_branch: None,
     };
     cache.save_session_list("ep-a", &vec![old.clone()]);
     let source = FakeSource::new(Some(Arc::clone(&cache)));
@@ -1510,7 +1608,7 @@ fn new_session_catalog() -> Value {
         ],
         "sections": {
             "common": [
-                {"key": "terminal:blank", "label": "空白终端", "kind": "terminal",
+                {"key": "terminal:blank", "label": "Shell", "kind": "terminal",
                  "pinned": true, "target": "blankTerminal"}
             ],
             "terminal": [
@@ -1678,6 +1776,7 @@ fn create_session_sends_only_the_given_fields() {
     let id = catalog
         .create_session(CreateSession {
             project_root: "/repo".into(),
+            workset_id: Some("ws-1".into()),
             agent_option_id: Some("profile:work".into()),
             launch_key: Some(" ".into()),
             resume_id: Some("r1".into()),
@@ -1688,6 +1787,7 @@ fn create_session_sends_only_the_given_fields() {
     catalog
         .create_session(CreateSession {
             project_root: "/repo".into(),
+            workset_id: Some(" ".into()),
             agent_option_id: None,
             launch_key: None,
             resume_id: None,
@@ -1700,7 +1800,8 @@ fn create_session_sends_only_the_given_fields() {
     assert_eq!(
         runtime.controls("session.create"),
         [
-            json!({"project_root": "/repo", "agent_option_id": "profile:work", "resume_id": "r1",
+            json!({"project_root": "/repo", "workset_id": "ws-1",
+                   "agent_option_id": "profile:work", "resume_id": "r1",
                    "kind": "acp", "request_id": "6f1c2b8e-4d5a-4f3b-9c2d-1e0f9a8b7c6d"}),
             json!({"project_root": "/repo", "kind": "terminal"}),
         ]
@@ -1797,7 +1898,11 @@ fn a_finished_run_reads_its_archived_record_and_transcript() {
     let detail = catalog.automation_run_detail("r-1").unwrap();
     assert_eq!(
         runtime.controls("automation.run_detail"),
-        [json!({"run_id": "r-1", "include_archived_run": true})]
+        [json!({
+            "run_id": "r-1",
+            "include_archived_run": true,
+            "entry_version": smelt_model::acp_chat::ACP_ENTRY_VERSION,
+        })]
     );
     assert_eq!(detail.run.id, "r-1");
     assert_eq!(detail.automation_id, "a1");

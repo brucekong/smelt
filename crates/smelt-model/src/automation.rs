@@ -6,6 +6,8 @@ use chrono::{
 use serde::de::{Deserializer, Error as DeError};
 use serde::{Deserialize, Serialize};
 
+pub use smelt_runtime_client::protocol::reason::{AutomationProblem, AutomationRunFailure};
+
 /// v2：删掉从未投递过的飞书 / Webhook 通知 sink，旧数据在载入时迁移。
 pub const AUTOMATION_FILE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_RUNS_PER_AUTOMATION: usize = 50;
@@ -83,13 +85,6 @@ impl AutomationAction {
         }
     }
 
-    pub fn kind_label(&self) -> &'static str {
-        match self {
-            Self::Agent { .. } => "智能体",
-            Self::Shell { .. } => "Shell 脚本",
-        }
-    }
-
     pub fn agent_definition_id(&self) -> Option<&str> {
         match self {
             Self::Agent {
@@ -107,21 +102,21 @@ impl AutomationAction {
         }
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), AutomationProblem> {
         match self {
             Self::Agent {
                 agent_definition_id,
                 ..
             } => {
                 if agent_definition_id.trim().is_empty() {
-                    Err("请选择已配置的智能体".to_string())
+                    Err(AutomationProblem::NoAgent)
                 } else {
                     Ok(())
                 }
             }
             Self::Shell { command, .. } => {
                 if command.trim().is_empty() {
-                    Err("请填写要执行的 Shell 命令".to_string())
+                    Err(AutomationProblem::NoShellCommand)
                 } else {
                     Ok(())
                 }
@@ -133,27 +128,83 @@ impl AutomationAction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AutomationSink {
-    Local,
+    /// 跑完在 App 里弹通知。
+    Local {
+        /// 只在没跑成（失败、跳过）时弹。默认不写：线上还是 `{"type": "local"}`，不认识这个
+        /// 字段的旧版本读成「每次都弹」。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        failures_only: bool,
+    },
     /// 明确关闭通知。空 `sinks` 仍表示沿用应用通知（旧数据）。
     Off,
 }
 
 impl AutomationSink {
+    /// 每次跑完都弹通知。
+    pub fn local() -> Self {
+        Self::Local {
+            failures_only: false,
+        }
+    }
+
     pub fn is_off(&self) -> bool {
         matches!(self, Self::Off)
     }
 
     pub fn is_local(&self) -> bool {
-        matches!(self, Self::Local)
+        matches!(self, Self::Local { .. })
     }
 }
 
-/// 空列表沿用应用通知；`Off` 明确关闭。
-pub fn automation_notifies_app(sinks: &[AutomationSink]) -> bool {
-    if sinks.iter().any(AutomationSink::is_off) {
-        false
-    } else {
-        sinks.is_empty() || sinks.iter().any(AutomationSink::is_local)
+/// 一条自动化跑完弹不弹通知。由 `sinks` 推出来，不另存。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutomationNotify {
+    Never,
+    FailuresOnly,
+    Always,
+}
+
+impl AutomationNotify {
+    /// 空列表沿用应用通知（旧数据）；`Off` 明确关闭，盖过别的。
+    pub fn from_sinks(sinks: &[AutomationSink]) -> Self {
+        if sinks.iter().any(AutomationSink::is_off) {
+            return Self::Never;
+        }
+        let mut locals = sinks.iter().filter_map(|sink| match sink {
+            AutomationSink::Local { failures_only } => Some(*failures_only),
+            AutomationSink::Off => None,
+        });
+        match locals.next() {
+            None if sinks.is_empty() => Self::Always,
+            None => Self::Never,
+            // 有一个每次都弹的就每次都弹。
+            Some(failures_only) => {
+                if failures_only && locals.all(|only| only) {
+                    Self::FailuresOnly
+                } else {
+                    Self::Always
+                }
+            }
+        }
+    }
+
+    pub fn to_sinks(self) -> Vec<AutomationSink> {
+        match self {
+            Self::Never => vec![AutomationSink::Off],
+            Self::FailuresOnly => vec![AutomationSink::Local {
+                failures_only: true,
+            }],
+            Self::Always => vec![AutomationSink::local()],
+        }
+    }
+
+    /// 这次运行要不要弹：`failed` 是没跑成（失败、跳过）。
+    pub fn notifies(self, failed: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::FailuresOnly => failed,
+            Self::Always => true,
+        }
     }
 }
 
@@ -311,13 +362,13 @@ impl AutomationTrigger {
     }
 
     pub fn webhook_token(&self) -> Option<&str> {
-        self.webhooks.iter().find_map(webhook_ingress_token)
+        self.webhooks.iter().find_map(WebhookIngress::token)
     }
 
     pub fn matches_webhook_token(&self, token: &str) -> bool {
         self.webhooks
             .iter()
-            .any(|webhook| webhook_ingress_token(webhook) == Some(token))
+            .any(|webhook| webhook.token() == Some(token))
     }
 
     pub fn event(topic: impl Into<String>, filter: Option<String>) -> Self {
@@ -327,43 +378,6 @@ impl AutomationTrigger {
                 filter,
             }],
             ..Self::default()
-        }
-    }
-
-    pub fn kind_label(&self) -> &'static str {
-        match (
-            !self.schedules.is_empty(),
-            !self.webhooks.is_empty(),
-            !self.events.is_empty(),
-        ) {
-            (true, false, false) => "定时",
-            (false, true, false) => "外部触发",
-            (false, false, true) => "事件",
-            (false, false, false) => "未配置触发条件",
-            _ => "多种触发条件",
-        }
-    }
-
-    pub fn summary(&self) -> String {
-        let mut parts = self
-            .schedules
-            .iter()
-            .map(AutomationSchedule::summary)
-            .collect::<Vec<_>>();
-        for webhook in &self.webhooks {
-            parts.push(if webhook_ingress_token(webhook).is_none() {
-                "未配置外部触发".to_string()
-            } else {
-                "外部触发".to_string()
-            });
-        }
-        for event in &self.events {
-            parts.push(format!("事件 · {}", event.topic));
-        }
-        if parts.is_empty() {
-            "未配置触发条件".to_string()
-        } else {
-            parts.join("；")
         }
     }
 
@@ -394,7 +408,7 @@ impl AutomationTrigger {
         })
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), AutomationProblem> {
         let mut any = false;
         if !self.schedules.is_empty() {
             any = true;
@@ -407,9 +421,9 @@ impl AutomationTrigger {
             if self
                 .webhooks
                 .iter()
-                .any(|webhook| webhook_ingress_token(webhook).is_none())
+                .any(|webhook| webhook.token().is_none())
             {
-                return Err("外部触发缺少接收令牌".to_string());
+                return Err(AutomationProblem::NoWebhookToken);
             }
         }
         if !self.events.is_empty() {
@@ -422,7 +436,7 @@ impl AutomationTrigger {
         if any {
             Ok(())
         } else {
-            Err("请至少添加一条触发条件".to_string())
+            Err(AutomationProblem::NoTrigger)
         }
     }
 }
@@ -434,7 +448,7 @@ const REDACTED_WEBHOOK_ENDPOINT: &str = "<redacted>";
 pub fn redact_automation_credentials(mut file: AutomationFile) -> AutomationFile {
     for automation in &mut file.automations {
         for webhook in &mut automation.trigger.webhooks {
-            if webhook_ingress_token(webhook).is_some() {
+            if webhook.token().is_some() {
                 webhook.endpoint = REDACTED_WEBHOOK_ENDPOINT.into();
                 webhook.secret = None;
             }
@@ -456,16 +470,18 @@ fn restore_redacted_webhooks(incoming: &mut Automation, stored: &Automation) {
     }
 }
 
-fn webhook_ingress_token(webhook: &WebhookIngress) -> Option<&str> {
-    webhook
-        .secret
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            let endpoint = webhook.endpoint.trim();
-            (!endpoint.is_empty()).then_some(endpoint)
-        })
+impl WebhookIngress {
+    /// 外部请求要带的接收令牌；没配就是 `None`。
+    pub fn token(&self) -> Option<&str> {
+        self.secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                let endpoint = self.endpoint.trim();
+                (!endpoint.is_empty()).then_some(endpoint)
+            })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -473,7 +489,8 @@ pub struct Automation {
     pub id: String,
     pub name: String,
     pub enabled: bool,
-    /// Daemon-managed workspace assigned from the stable automation id.
+    /// 在哪个目录里跑。用户选的原样用；没选（`None`）或是托管目录（见
+    /// [`is_managed_workspace`]）时由运行时按 id 分配，换了智能体也跟着换。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_dir: Option<String>,
     pub trigger: AutomationTrigger,
@@ -562,27 +579,63 @@ impl<'de> Deserialize<'de> for Automation {
     }
 }
 
+/// 运行时给自动化分配的托管目录的名字：按 id 算的固定哈希，放在某个 `automations/` 下。
+pub fn managed_workspace_name(automation_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut digest = Sha256::new();
+    digest.update(b"smelt.automation-workspace.v1\0");
+    digest.update((automation_id.len() as u64).to_be_bytes());
+    digest.update(automation_id.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut name, byte| {
+            let _ = write!(name, "{byte:02x}");
+            name
+        })
+}
+
+/// `path` 是不是运行时给这条自动化分配的托管目录（不管在哪个根下）。
+pub fn is_managed_workspace(path: &str, automation_id: &str) -> bool {
+    let path = std::path::Path::new(path);
+    path.file_name()
+        .is_some_and(|name| name.to_str() == Some(&managed_workspace_name(automation_id)))
+        && path
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|parent| parent == "automations")
+}
+
 impl Automation {
-    pub fn notifies_app(&self) -> bool {
-        automation_notifies_app(&self.sinks)
+    pub fn notify(&self) -> AutomationNotify {
+        AutomationNotify::from_sinks(&self.sinks)
+    }
+
+    /// 用户自己选的工作目录；没选、用的是托管目录时是 `None`。
+    pub fn custom_workspace(&self) -> Option<&str> {
+        self.workspace_dir
+            .as_deref()
+            .filter(|dir| !dir.trim().is_empty() && !is_managed_workspace(dir, &self.id))
     }
 
     pub fn is_ready(&self) -> bool {
         self.validate().is_ok()
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), AutomationProblem> {
         if self.id.trim().is_empty() {
-            return Err("自动化缺少 id".to_string());
+            return Err(AutomationProblem::NoId);
         }
         if self.name.trim().is_empty() {
-            return Err("请填写自动化名称".to_string());
+            return Err(AutomationProblem::NoName);
         }
         self.action.validate()?;
         self.trigger.validate()
     }
 
-    pub fn validate_execution_context(&self) -> Result<(), String> {
+    pub fn validate_execution_context(&self) -> Result<(), AutomationProblem> {
         self.validate()?;
         let workspace_dir = self
             .workspace_dir
@@ -590,18 +643,18 @@ impl Automation {
             .map(str::trim)
             .unwrap_or_default();
         if workspace_dir.is_empty() {
-            return Err("自动化的 Smelt 工作区尚未就绪".to_string());
+            return Err(AutomationProblem::WorkspaceNotReady);
         }
         if !std::path::Path::new(workspace_dir).is_dir() {
-            return Err(format!(
-                "自动化的 Smelt 工作区不存在或不是目录: {workspace_dir}"
-            ));
+            return Err(AutomationProblem::WorkspaceMissing {
+                path: workspace_dir.to_string(),
+            });
         }
         Ok(())
     }
 
     /// 客户端保存前的检查，和运行时收到保存时的规则一致（工作区由运行时分配，不在这里查）。
-    pub fn validate_for_save(&self) -> Result<(), String> {
+    pub fn validate_for_save(&self) -> Result<(), AutomationProblem> {
         self.validate()?;
         self.validate_scheduled_instruction()
     }
@@ -609,7 +662,7 @@ impl Automation {
     /// 定时触发不带外部内容，智能体只能从指令里知道这次要做什么。只在保存时
     /// 检查：放进 `validate` 会让一条旧数据拖垮整库载入，旧数据到点时由
     /// [`AutomationRunContext::validate_input`] 记成失败。
-    fn validate_scheduled_instruction(&self) -> Result<(), String> {
+    fn validate_scheduled_instruction(&self) -> Result<(), AutomationProblem> {
         let blank = match &self.action {
             AutomationAction::Agent { prompt, .. } => prompt
                 .as_deref()
@@ -617,7 +670,7 @@ impl Automation {
             AutomationAction::Shell { .. } => false,
         };
         if blank && !self.trigger.schedules.is_empty() {
-            return Err("定时触发不会带入外部内容，请填写指令".to_string());
+            return Err(AutomationProblem::NoInstruction);
         }
         Ok(())
     }
@@ -642,7 +695,6 @@ pub const SCHEDULE_DAY_SUN: u8 = 1 << 6;
 pub const SCHEDULE_WEEKDAYS_MASK: u8 =
     SCHEDULE_DAY_MON | SCHEDULE_DAY_TUE | SCHEDULE_DAY_WED | SCHEDULE_DAY_THU | SCHEDULE_DAY_FRI;
 pub const SCHEDULE_ALL_DAYS_MASK: u8 = SCHEDULE_WEEKDAYS_MASK | SCHEDULE_DAY_SAT | SCHEDULE_DAY_SUN;
-pub const SCHEDULE_DAY_LABELS: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -773,35 +825,7 @@ impl AutomationSchedule {
         )
     }
 
-    pub fn summary(&self) -> String {
-        match *self {
-            Self::EveryMinutes { minutes } => format!("每隔 {minutes} 分钟"),
-            Self::EveryHours { hours } => format!("每隔 {hours} 小时"),
-            Self::Daily { hour, minute } => format!("每天 {hour:02}:{minute:02}"),
-            Self::Weekly { days, hour, minute } => {
-                format!("{} · {hour:02}:{minute:02}", weekly_days_summary(days))
-            }
-            Self::During {
-                minutes,
-                days,
-                start_hour,
-                start_minute,
-                end_hour,
-                end_minute,
-            } => {
-                let days = weekly_days_summary(if days == 0 {
-                    SCHEDULE_ALL_DAYS_MASK
-                } else {
-                    days
-                });
-                format!(
-                    "{days} {start_hour:02}:{start_minute:02}–{end_hour:02}:{end_minute:02} · 每隔 {minutes} 分钟"
-                )
-            }
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), AutomationProblem> {
         match *self {
             Self::Daily { hour, minute } | Self::Weekly { hour, minute, .. }
                 if hour < 24 && minute < 60 =>
@@ -809,17 +833,15 @@ impl AutomationSchedule {
                 if let Self::Weekly { days, .. } = *self
                     && days & SCHEDULE_ALL_DAYS_MASK == 0
                 {
-                    return Err("请至少选择一天".to_string());
+                    return Err(AutomationProblem::NoDays);
                 }
                 Ok(())
             }
-            Self::Daily { .. } | Self::Weekly { .. } => {
-                Err("请输入 00:00 到 23:59 之间的时间".to_string())
-            }
+            Self::Daily { .. } | Self::Weekly { .. } => Err(AutomationProblem::TimeOutOfRange),
             Self::EveryMinutes { minutes } if (1..=24 * 60).contains(&minutes) => Ok(()),
-            Self::EveryMinutes { .. } => Err("执行间隔需为 1 到 1440 分钟".to_string()),
+            Self::EveryMinutes { .. } => Err(AutomationProblem::MinutesOutOfRange),
             Self::EveryHours { hours } if (1..=24 * 7).contains(&hours) => Ok(()),
-            Self::EveryHours { .. } => Err("执行间隔需为 1 到 168 小时".to_string()),
+            Self::EveryHours { .. } => Err(AutomationProblem::HoursOutOfRange),
             Self::During {
                 minutes,
                 days,
@@ -829,16 +851,16 @@ impl AutomationSchedule {
                 end_minute,
             } => {
                 if !(1..=24 * 60).contains(&minutes) {
-                    return Err("执行间隔需为 1 到 1440 分钟".to_string());
+                    return Err(AutomationProblem::MinutesOutOfRange);
                 }
                 if start_hour > 23 || end_hour > 23 || start_minute > 59 || end_minute > 59 {
-                    return Err("请输入 00:00 到 23:59 之间的时间".to_string());
+                    return Err(AutomationProblem::TimeOutOfRange);
                 }
                 if clock_minutes(start_hour, start_minute) >= clock_minutes(end_hour, end_minute) {
-                    return Err("结束时间需晚于开始时间".to_string());
+                    return Err(AutomationProblem::EndBeforeStart);
                 }
                 if days != 0 && days & SCHEDULE_ALL_DAYS_MASK == 0 {
-                    return Err("请至少选择一天".to_string());
+                    return Err(AutomationProblem::NoDays);
                 }
                 Ok(())
             }
@@ -927,22 +949,6 @@ where
     now + Duration::minutes(i64::from(interval))
 }
 
-fn weekly_days_summary(days: u8) -> String {
-    let days = days & SCHEDULE_ALL_DAYS_MASK;
-    if days == SCHEDULE_ALL_DAYS_MASK {
-        return "每天".to_string();
-    }
-    let labels = (0..7)
-        .filter(|index| days & (1 << index) != 0)
-        .map(|index| SCHEDULE_DAY_LABELS[index])
-        .collect::<Vec<_>>();
-    if labels.is_empty() {
-        "未选择星期".to_string()
-    } else {
-        format!("每周{}", labels.join("、"))
-    }
-}
-
 fn next_calendar_occurrence<Tz>(
     now: DateTime<Tz>,
     hour: u8,
@@ -1006,17 +1012,6 @@ pub enum AutomationRunSource {
     Scheduled,
     Webhook,
     Event,
-}
-
-impl AutomationRunSource {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Manual => "手动运行",
-            Self::Scheduled => "定时触发",
-            Self::Webhook => "外部触发",
-            Self::Event => "事件触发",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1172,14 +1167,14 @@ impl AutomationRunContext {
     }
 
     /// 智能体 Run 不投递空消息：指令和触发内容都为空时，这次运行无事可做。
-    fn validate_input(&self) -> Result<(), String> {
+    fn validate_input(&self) -> Result<(), AutomationProblem> {
         let empty = matches!(self.action, AutomationAction::Agent { .. })
             && self
                 .prompt
                 .as_deref()
                 .is_none_or(|prompt| prompt.trim().is_empty());
         if empty {
-            Err("这次运行没有可发送的内容，请在自动化里填写指令".to_string())
+            Err(AutomationProblem::NothingToSend)
         } else {
             Ok(())
         }
@@ -1210,6 +1205,10 @@ pub struct AutomationRun {
     pub provider_session_id: Option<String>,
     #[serde(default)]
     pub output: Option<String>,
+    /// 没成的原因种类，客户端按语言说；运行时记的旧记录没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<AutomationRunFailure>,
+    /// 有种类时是底层报错的细节；没有种类时是整句（旧记录，或成功了但 stderr 有输出）。
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
@@ -1217,6 +1216,14 @@ pub struct AutomationRun {
 }
 
 impl AutomationRun {
+    /// 给人看的报错：有种类按当前语言说并接上细节，没有种类原样给 `error`。
+    pub fn error_text(&self) -> Option<String> {
+        match self.error_code {
+            Some(code) => Some(code.describe(self.error.as_deref())),
+            None => self.error.clone(),
+        }
+    }
+
     pub fn blocks_overlap(&self) -> bool {
         if self.status.is_active() {
             return true;
@@ -1345,7 +1352,9 @@ impl AutomationFile {
         }
         let mut ids = HashSet::new();
         for automation in &self.automations {
-            automation.validate()?;
+            automation
+                .validate()
+                .map_err(|problem| format!("自动化 {} 不合法：{problem}", automation.id))?;
             if !ids.insert(automation.id.as_str()) {
                 return Err(format!("自动化 id 重复: {}", automation.id));
             }
@@ -1504,7 +1513,7 @@ pub fn apply_automation_command<Tz>(
     file: &mut AutomationFile,
     command: AutomationCommand,
     now: DateTime<Tz>,
-) -> Result<AutomationCommandResult, String>
+) -> Result<AutomationCommandResult, AutomationProblem>
 where
     Tz: TimeZone,
 {
@@ -1547,9 +1556,9 @@ where
         AutomationCommand::Delete { automation_id } => {
             if let Some(run) = file.active_run_for(&automation_id) {
                 return Err(if run.status.is_active() {
-                    "自动化正在运行，暂时不能删除".to_string()
+                    AutomationProblem::DeleteWhileRunning
                 } else {
-                    "自动化运行现场正在清理，请稍后再删除".to_string()
+                    AutomationProblem::DeleteWhileCleaningUp
                 });
             }
             let before = file.automations.len();
@@ -1571,7 +1580,7 @@ where
                 .iter()
                 .position(|automation| automation.id == automation_id)
             else {
-                return Err("自动化不存在".to_string());
+                return Err(AutomationProblem::NotFound);
             };
             if file.automations[index].enabled == enabled {
                 return Ok(AutomationCommandResult::Applied(false));
@@ -1589,7 +1598,7 @@ where
                 .runs
                 .iter_mut()
                 .find(|run| run.id == run_id)
-                .ok_or_else(|| "AutomationRun 不存在".to_string())?;
+                .ok_or(AutomationProblem::RunNotFound)?;
             if run.status.is_terminal() {
                 return Ok(AutomationCommandResult::Applied(false));
             }
@@ -1619,7 +1628,7 @@ fn execute_trigger<Tz>(
     source: AutomationRunSource,
     payload: Option<serde_json::Value>,
     now: DateTime<Tz>,
-) -> Result<AutomationCommandResult, String>
+) -> Result<AutomationCommandResult, AutomationProblem>
 where
     Tz: TimeZone,
 {
@@ -1628,13 +1637,15 @@ where
         .iter()
         .find(|automation| automation.id == automation_id)
     else {
-        return Err("自动化不存在".to_string());
+        return Err(AutomationProblem::NotFound);
     };
     automation.validate_execution_context()?;
     let context = AutomationRunContext::from_automation_with_payload(automation, payload);
     context.validate_input()?;
     if let Some(run) = file.active_run_for(&automation_id) {
-        return Err(format!("自动化已有运行中的 Run: {}", run.id));
+        return Err(AutomationProblem::AlreadyRunning {
+            run: run.id.clone(),
+        });
     }
     let run = AutomationRun {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1651,6 +1662,7 @@ where
         session_id: None,
         provider_session_id: None,
         output: None,
+        error_code: None,
         error: None,
         runtime_released_at: None,
     };
@@ -1671,7 +1683,7 @@ pub struct AutomationInboundEvent {
 }
 
 impl AutomationInboundEvent {
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), AutomationProblem> {
         validate_event_topic(&self.topic)?;
         validate_event_id(&self.event_id)?;
         Ok(())
@@ -1702,13 +1714,13 @@ pub fn normalize_event_topic(topic: &str) -> String {
     topic.trim().to_ascii_lowercase()
 }
 
-pub fn validate_event_topic(topic: &str) -> Result<String, String> {
+pub fn validate_event_topic(topic: &str) -> Result<String, AutomationProblem> {
     let topic = normalize_event_topic(topic);
     if topic.is_empty() {
-        return Err("请填写事件主题".to_string());
+        return Err(AutomationProblem::EventTopicMissing);
     }
     if topic.len() > MAX_EVENT_TOPIC_BYTES {
-        return Err("事件主题过长".to_string());
+        return Err(AutomationProblem::EventTopicTooLong);
     }
     let segments = topic.split('.').collect::<Vec<_>>();
     if segments.len() < 2
@@ -1721,35 +1733,35 @@ pub fn validate_event_topic(topic: &str) -> Result<String, String> {
                 })
         })
     {
-        return Err("事件主题须为小写点分名，例如 lark.message.received".to_string());
+        return Err(AutomationProblem::EventTopicMalformed);
     }
     Ok(topic)
 }
 
-pub fn validate_event_id(event_id: &str) -> Result<String, String> {
+pub fn validate_event_id(event_id: &str) -> Result<String, AutomationProblem> {
     let event_id = event_id.trim();
     if event_id.is_empty() {
-        return Err("请填写 event_id".to_string());
+        return Err(AutomationProblem::EventIdMissing);
     }
     if event_id.len() > MAX_EVENT_ID_BYTES {
-        return Err("event_id 过长".to_string());
+        return Err(AutomationProblem::EventIdTooLong);
     }
     if event_id
         .chars()
         .any(|ch| ch.is_control() || matches!(ch, '/' | '\\'))
     {
-        return Err("event_id 含非法字符".to_string());
+        return Err(AutomationProblem::EventIdInvalid);
     }
     Ok(event_id.to_string())
 }
 
-pub fn validate_event_filter(filter: Option<&str>) -> Result<Option<String>, String> {
+pub fn validate_event_filter(filter: Option<&str>) -> Result<Option<String>, AutomationProblem> {
     let Some(raw) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(serde_json::Value::Object(_)) => Ok(Some(raw.to_string())),
-        _ => Err("事件过滤须为 JSON 对象，例如 {\"chat_id\":\"oc_123\"}".to_string()),
+        _ => Err(AutomationProblem::EventFilterNotObject),
     }
 }
 
@@ -1776,7 +1788,7 @@ pub fn publish_automation_event<Tz>(
     file: &mut AutomationFile,
     event: &AutomationInboundEvent,
     now: DateTime<Tz>,
-) -> Result<AutomationEventPublished, String>
+) -> Result<AutomationEventPublished, AutomationProblem>
 where
     Tz: TimeZone,
 {
@@ -1811,23 +1823,25 @@ where
             .validate_execution_context()
             .and_then(|()| context.validate_input())
             .err();
-        let (status, error, finished_at, runtime_released_at) = if let Some(error) = context_error {
-            (
-                AutomationRunStatus::Failed,
-                Some(error),
-                Some(now.timestamp()),
-                Some(now.timestamp()),
-            )
-        } else if overlapping {
-            (
-                AutomationRunStatus::Skipped,
-                Some("上一条 Run 仍在执行，本次事件已跳过".to_string()),
-                Some(now.timestamp()),
-                Some(now.timestamp()),
-            )
-        } else {
-            (AutomationRunStatus::Starting, None, None, None)
-        };
+        let (status, failure, finished_at, runtime_released_at) =
+            if let Some(problem) = context_error {
+                (
+                    AutomationRunStatus::Failed,
+                    Some(AutomationRunFailure::for_problem(&problem)),
+                    Some(now.timestamp()),
+                    Some(now.timestamp()),
+                )
+            } else if overlapping {
+                (
+                    AutomationRunStatus::Skipped,
+                    Some((AutomationRunFailure::PreviousRunActive, None)),
+                    Some(now.timestamp()),
+                    Some(now.timestamp()),
+                )
+            } else {
+                (AutomationRunStatus::Starting, None, None, None)
+            };
+        let (error_code, error) = failure.unzip();
         let run = AutomationRun {
             id: run_id,
             automation_id: automation.id.clone(),
@@ -1843,7 +1857,8 @@ where
             session_id: None,
             provider_session_id: None,
             output: None,
-            error,
+            error_code,
+            error: error.flatten(),
             runtime_released_at,
         };
         ensure_state(file, &automation.id);
@@ -1887,16 +1902,20 @@ where
             continue;
         }
         let context = AutomationRunContext::from_automation(&automation);
-        let (status, error) = if let Err(error) = context.validate_input() {
-            (AutomationRunStatus::Failed, Some(error))
+        let (status, failure) = if let Err(problem) = context.validate_input() {
+            (
+                AutomationRunStatus::Failed,
+                Some(AutomationRunFailure::for_problem(&problem)),
+            )
         } else if file.active_run_for(&automation.id).is_some() {
             (
                 AutomationRunStatus::Skipped,
-                Some("上一条 Run 仍在执行，本次计划已跳过".to_string()),
+                Some((AutomationRunFailure::PreviousRunActive, None)),
             )
         } else {
             (AutomationRunStatus::Starting, None)
         };
+        let (error_code, error) = failure.unzip();
         let settled = status != AutomationRunStatus::Starting;
         let run = AutomationRun {
             id: run_id,
@@ -1913,7 +1932,8 @@ where
             session_id: None,
             provider_session_id: None,
             output: None,
-            error,
+            error_code,
+            error: error.flatten(),
             runtime_released_at: settled.then_some(now.timestamp()),
         };
         file.state_for_mut(&automation.id).unwrap().last_run_id = Some(run.id.clone());
@@ -2089,5 +2109,260 @@ mod redaction_tests {
 
         assert_eq!(edited.name, "Renamed");
         assert_eq!(edited.trigger.webhooks, stored.trigger.webhooks);
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use chrono::{FixedOffset, TimeZone};
+
+    fn at(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+    ) -> chrono::DateTime<FixedOffset> {
+        FixedOffset::east_opt(8 * 3600)
+            .expect("CST")
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .expect("valid local time")
+    }
+
+    #[test]
+    fn legacy_weekdays_json_loads_as_weekly_days() {
+        let loaded: AutomationSchedule = serde_json::from_value(serde_json::json!({
+            "type": "weekdays",
+            "hour": 9,
+            "minute": 35
+        }))
+        .unwrap();
+        assert_eq!(
+            loaded,
+            AutomationSchedule::Weekly {
+                days: SCHEDULE_WEEKDAYS_MASK,
+                hour: 9,
+                minute: 35,
+            }
+        );
+        let stored = serde_json::to_value(loaded).unwrap();
+        assert_eq!(stored["type"], "weekly");
+        assert!(stored.get("days").is_some());
+    }
+
+    #[test]
+    fn weekday_schedule_skips_the_weekend() {
+        let schedule = AutomationSchedule::Weekly {
+            days: SCHEDULE_WEEKDAYS_MASK,
+            hour: 9,
+            minute: 35,
+        };
+        assert_eq!(
+            schedule.next_after(at(2026, 9, 4, 18, 0)),
+            at(2026, 9, 7, 9, 35)
+        );
+    }
+
+    #[test]
+    fn weekly_schedule_honors_selected_days() {
+        let schedule = AutomationSchedule::Weekly {
+            days: SCHEDULE_DAY_MON | SCHEDULE_DAY_WED,
+            hour: 9,
+            minute: 35,
+        };
+        assert_eq!(
+            schedule.next_after(at(2026, 9, 4, 18, 0)),
+            at(2026, 9, 7, 9, 35)
+        );
+        assert_eq!(
+            schedule.next_after(at(2026, 9, 7, 10, 0)),
+            at(2026, 9, 9, 9, 35)
+        );
+    }
+
+    /// 立即运行不要求先有一段对话：上下文全来自自动化本身。
+    #[test]
+    fn automation_run_does_not_require_an_existing_conversation() {
+        let workspace = std::env::temp_dir().to_string_lossy().into_owned();
+        let automation = Automation {
+            id: "open-scan".into(),
+            name: "开盘扫描".into(),
+            enabled: true,
+            workspace_dir: Some(workspace.clone()),
+            trigger: AutomationTrigger::schedule(AutomationSchedule::daily_morning()),
+            action: AutomationAction::Agent {
+                agent_definition_id: "quant".into(),
+                prompt: Some("拉取行情并输出".into()),
+            },
+            sinks: Vec::new(),
+        };
+        let mut file = AutomationFile::default();
+        apply_automation_command(
+            &mut file,
+            AutomationCommand::Upsert {
+                automation: Box::new(automation),
+            },
+            chrono::Utc::now(),
+        )
+        .unwrap();
+
+        let run = apply_automation_command(
+            &mut file,
+            AutomationCommand::RunOnce {
+                automation_id: "open-scan".into(),
+            },
+            chrono::Utc::now(),
+        )
+        .unwrap()
+        .run()
+        .unwrap();
+
+        assert_eq!(run.context.prompt.as_deref(), Some("拉取行情并输出"));
+        assert_eq!(run.context.action.agent_definition_id(), Some("quant"));
+        assert_eq!(run.context.cwd, workspace);
+        assert_eq!(run.context.automation_name, "开盘扫描");
+    }
+
+    /// 没选工作目录也能存（就绪、校验通过），只是执行前的上下文校验不过。
+    #[test]
+    fn automation_definition_does_not_require_a_user_selected_workspace() {
+        let automation = Automation {
+            id: "open-scan".into(),
+            name: "开盘扫描".into(),
+            enabled: true,
+            workspace_dir: None,
+            trigger: AutomationTrigger::schedule(AutomationSchedule::daily_morning()),
+            action: AutomationAction::Agent {
+                agent_definition_id: "quant".into(),
+                prompt: Some("拉取行情并输出".into()),
+            },
+            sinks: Vec::new(),
+        };
+
+        assert!(automation.is_ready());
+        assert!(automation.validate().is_ok());
+        assert!(automation.validate_execution_context().is_err());
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    fn with_dir(dir: Option<&str>) -> Automation {
+        Automation {
+            id: "automation-1".into(),
+            name: "日报".into(),
+            enabled: true,
+            workspace_dir: dir.map(str::to_owned),
+            trigger: AutomationTrigger::default(),
+            action: AutomationAction::shell("true", Vec::new()),
+            sinks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn managed_dirs_under_any_root_are_not_custom() {
+        let name = managed_workspace_name("automation-1");
+        assert_eq!(name.len(), 64);
+        for root in [
+            "/h/.smelt/workspaces/automations",
+            "/h/.smelt/agents/a/automations",
+        ] {
+            let dir = format!("{root}/{name}");
+            assert!(is_managed_workspace(&dir, "automation-1"));
+            assert_eq!(with_dir(Some(&dir)).custom_workspace(), None);
+        }
+        assert!(!is_managed_workspace(
+            &format!("/h/x/{name}"),
+            "automation-1"
+        ));
+        assert!(!is_managed_workspace(
+            &format!("/h/.smelt/workspaces/automations/{name}"),
+            "automation-2"
+        ));
+    }
+
+    #[test]
+    fn a_chosen_dir_is_custom() {
+        assert_eq!(with_dir(None).custom_workspace(), None);
+        assert_eq!(with_dir(Some(" ")).custom_workspace(), None);
+        assert_eq!(
+            with_dir(Some("/work/repo")).custom_workspace(),
+            Some("/work/repo")
+        );
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+
+    /// 「仅失败时」加在 `local` 上的字段：每次都弹的线上形状不变，旧版本读到带字段的也认得，
+    /// 只是当成每次都弹。
+    #[test]
+    fn failures_only_is_an_optional_field_old_readers_accept() {
+        assert_eq!(
+            serde_json::to_value(AutomationSink::local()).unwrap(),
+            serde_json::json!({ "type": "local" })
+        );
+        let failures = serde_json::to_value(AutomationSink::Local {
+            failures_only: true,
+        })
+        .unwrap();
+        assert_eq!(
+            failures,
+            serde_json::json!({ "type": "local", "failures_only": true })
+        );
+
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldSink {
+            Local,
+            Off,
+        }
+        assert_eq!(
+            serde_json::from_value::<OldSink>(failures).unwrap(),
+            OldSink::Local
+        );
+        assert_eq!(
+            serde_json::from_value::<AutomationSink>(serde_json::json!({ "type": "local" }))
+                .unwrap(),
+            AutomationSink::local()
+        );
+    }
+
+    #[test]
+    fn notify_reads_sinks_and_round_trips() {
+        use AutomationNotify::*;
+        assert_eq!(
+            AutomationNotify::from_sinks(&[]),
+            Always,
+            "旧数据沿用应用通知"
+        );
+        assert_eq!(
+            AutomationNotify::from_sinks(&[AutomationSink::local(), AutomationSink::Off]),
+            Never,
+            "Off 盖过别的"
+        );
+        assert_eq!(
+            AutomationNotify::from_sinks(&[
+                AutomationSink::Local {
+                    failures_only: true
+                },
+                AutomationSink::local(),
+            ]),
+            Always,
+            "有一个每次都弹就每次都弹"
+        );
+        for notify in [Never, FailuresOnly, Always] {
+            assert_eq!(AutomationNotify::from_sinks(&notify.to_sinks()), notify);
+        }
+        assert!(FailuresOnly.notifies(true));
+        assert!(!FailuresOnly.notifies(false));
+        assert!(Always.notifies(false));
+        assert!(!Never.notifies(true));
     }
 }

@@ -3,6 +3,7 @@
 //! 运行时执行 git（`smelt-git`），客户端只拿这里的结果做展示，不自己起 git 进程。
 //! 这里不许出现子进程和文件读写：手机端也要编它。
 
+use rust_i18n::t;
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -120,10 +121,19 @@ impl BranchList {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoInfo {
     /// 当前分支；detached 时是 `HEAD`。
     pub branch: String,
+    /// 当前分支推送去的远端的 URL：有 upstream 用它的远端，没有就用 `origin`，再没有用第一个远端。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    /// 那个远端的默认分支（`refs/remotes/<远端>/HEAD` 指向的分支名）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    /// 当前分支 upstream 在远端上的分支名（不带远端前缀）。没设 upstream 时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_branch: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -142,14 +152,6 @@ impl DiffScope {
             Self::All => &["diff", "HEAD", "--"],
             Self::Staged => &["diff", "--staged", "--"],
             Self::Unstaged => &["diff", "--"],
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::All => "全部",
-            Self::Staged => "已暂存",
-            Self::Unstaged => "未暂存",
         }
     }
 }
@@ -409,7 +411,7 @@ fn parse_diff_inner(text: &str, show_file_headers: bool) -> ParsedDiff {
     };
     if text.trim().is_empty() {
         return ParsedDiff {
-            lines: vec![make(None, None, DiffKind::Meta, "（无差异）")],
+            lines: vec![make(None, None, DiffKind::Meta, &t!("diff.no_changes"))],
             header: String::new(),
             hunks: Vec::new(),
         };
@@ -626,10 +628,6 @@ git_calls! {
     GitDiscoverCall => GitDiscover(GitRootParams) -> Discovery;
     /// 仓库身份：当前分支。非 git 目录返回 `None`。
     GitRepoInfoCall => GitRepoInfo(GitRootParams) -> GitRepoInfoResult;
-    /// 关注 `root` 所在仓库的 HEAD：切分支、detach 时运行时发 `project.changed{root}`。
-    /// 只看 HEAD 一个文件，比 `project.watch` 轻得多，侧栏每个项目的分支名靠它。幂等；
-    /// 不在 git 仓库里报错。
-    GitWatchHeadCall => GitWatchHead(GitRootParams) -> EmptyParams;
     GitStatusCall => GitStatus(GitRootParams) -> GitStatusData;
     GitBranchesCall => GitBranches(GitRootParams) -> BranchList;
     GitCheckoutCall => GitCheckout(GitBranchParams) -> EmptyParams;

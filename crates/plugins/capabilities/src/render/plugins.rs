@@ -1,269 +1,310 @@
-//! 设置页：智能体插件（Pi 的技能与扩展）。
+//! 能力库「技能」「扩展」页签：Pi 的技能或扩展，各一页。
 //!
-//! 这里只管「装了什么、还在不在、谁在用」，勾选在智能体编辑器里做。
-//! 只列全局目录和随 smelt-agent 发布的内置技能：智能体对话的工作目录是一次性空目录，
+//! 管「装了什么、还在不在、谁在用」；每行能直接勾给哪些智能体用（[`uses`]），智能体编辑器
+//! 里也能勾，改的是同一份配置。
+//! 只列用户级目录和随 smelt-agent 发布的内置技能：智能体对话的工作目录是一次性空目录，
 //! 项目级插件永远扫不到。内置技能跟着运行时更新，不能删。
+//!
+//! 技能以 `~/.agents/skills` 为准（运行时那边见 `smelt_core::skill_home`）：放在旧位置的
+//! 一键移过去，同名几份的挑一份为准，别的进回收目录。
 
+use super::uses::{self};
 use super::*;
+use crate::agents::Usable;
 use api::model::pi_plugin_catalog::{
     PiPlugin, PiPluginKind, global_extension_root, global_skill_roots,
 };
+use smelt_plugin_api::ui::kit::TYPE;
 
 pub(super) fn pi_plugin_page(
     entity: Entity<CapabilitiesPage>,
     page: &CapabilitiesPage,
-    _cx: &App,
-) -> SettingPage {
-    let plugins = page.pi_plugins();
+    kind: PiPluginKind,
+    cx: &App,
+) -> SettingsPage {
+    let plugins = page
+        .pi_plugins()
+        .into_iter()
+        .filter(|plugin| plugin.kind == kind)
+        .collect::<Vec<_>>();
     let usable = plugins.iter().filter(|plugin| plugin.is_usable()).count();
     let broken = plugins.len() - usable;
+    let summary = match (kind, broken) {
+        (PiPluginKind::Skill, 0) => t!("plugins.summary.skill", usable = usable),
+        (PiPluginKind::Extension, 0) => t!("plugins.summary.extension", usable = usable),
+        (PiPluginKind::Skill, _) => {
+            t!(
+                "plugins.summary_broken.skill",
+                usable = usable,
+                broken = broken
+            )
+        }
+        (PiPluginKind::Extension, _) => t!(
+            "plugins.summary_broken.extension",
+            usable = usable,
+            broken = broken
+        ),
+    };
 
-    let mut groups = vec![overview_group(entity.clone(), &plugins)];
-    if let Some(error) = page.pi_plugin_error.clone() {
-        groups.push(
-            SettingGroup::new()
-                .title("上一次操作失败")
-                .item(SettingItem::render(move |_, _, cx: &mut App| {
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(error.clone())
-                        .into_any_element()
-                })),
+    SettingsPage::new(match kind {
+        PiPluginKind::Skill => "capabilities-pane:skills",
+        PiPluginKind::Extension => "capabilities-pane:extensions",
+    })
+    .child(page_intro(summary))
+    .child(overview_section(entity.clone(), kind))
+    .children(page.pi_plugin_error.clone().map(|error| {
+        SettingsSection::new()
+            .title(t!("plugins.last_failed"))
+            .child(
+                div()
+                    .type_style(TYPE.text_xsmall)
+                    .text_color(rgb(ui_theme::bad()))
+                    .child(error),
+            )
+    }))
+    .child(list_section(entity, page, kind, &plugins, cx))
+}
+
+fn overview_section(entity: Entity<CapabilitiesPage>, kind: PiPluginKind) -> SettingsSection {
+    let roots = match kind {
+        PiPluginKind::Skill => global_skill_roots(),
+        PiPluginKind::Extension => vec![global_extension_root()],
+    }
+    .into_iter()
+    .map(|path| path.display().to_string())
+    .collect::<Vec<_>>();
+
+    let import_entity = entity.clone();
+    let refresh_entity = entity;
+    let (import_label, import_description, sources) = match kind {
+        PiPluginKind::Skill => (
+            t!("plugins.import_skill"),
+            t!("plugins.import_description.skill"),
+            t!("plugins.sources_description.skill"),
+        ),
+        PiPluginKind::Extension => (
+            t!("plugins.import_extension"),
+            t!("plugins.import_description.extension"),
+            t!("plugins.sources_description.extension"),
+        ),
+    };
+    // 目录路径长，列在说明里，不挤到行右边。扫到几个页首已经说了。
+    let scan = SettingsRow::new(t!("plugins.scan"))
+        .description(roots.join("\n"))
+        .child(
+            Button::new("refresh-pi-plugins")
+                .quiet()
+                .small()
+                .label(t!("plugins.rescan"))
+                .on_click(move |_, _, cx| {
+                    refresh_entity.update(cx, |workspace, cx| {
+                        workspace.refresh_pi_plugins(cx);
+                    });
+                }),
+        );
+    let import = SettingsRow::new(t!("plugins.import_confirm"))
+        .description(import_description)
+        .child(
+            Button::new("import-pi-plugin")
+                .small()
+                .label(import_label)
+                .on_click(move |_, _, cx| {
+                    import_entity.update(cx, |workspace, cx| {
+                        workspace.import_pi_plugin(kind, cx);
+                    });
+                }),
+        );
+    SettingsSection::new()
+        .title(t!("plugins.sources"))
+        .description(sources)
+        .child(scan)
+        .child(import)
+}
+
+fn list_section(
+    entity: Entity<CapabilitiesPage>,
+    page: &CapabilitiesPage,
+    kind: PiPluginKind,
+    plugins: &[PiPlugin],
+    cx: &App,
+) -> SettingsSection {
+    let section = SettingsSection::new().title(t!("plugins.installed"));
+    if plugins.is_empty() {
+        return section.child(
+            div()
+                .type_style(TYPE.text_xsmall)
+                .text_color(rgb(ui_theme::muted()))
+                .child(match kind {
+                    PiPluginKind::Skill => t!("plugins.none.skill").into_owned(),
+                    PiPluginKind::Extension => t!("plugins.none.extension").into_owned(),
+                }),
         );
     }
-    groups.push(list_group(
-        entity,
-        &plugins,
-        page.pi_plugin_pending_delete.clone(),
-        page,
-    ));
 
-    SettingPage::new("智能体插件")
-        .description(if broken == 0 {
-            format!("已装 {usable} 个可用插件。创建智能体时勾选需要的插件，对话只加载勾选项。")
-        } else {
-            format!(
-                "已装 {usable} 个可用插件，另有 {broken} 个失效条目（多半是断掉的软链），建议删掉。"
-            )
-        })
-        .groups(groups)
-}
-
-fn overview_group(entity: Entity<CapabilitiesPage>, plugins: &[PiPlugin]) -> SettingGroup {
-    let skill_count = plugins
-        .iter()
-        .filter(|plugin| plugin.kind == PiPluginKind::Skill)
-        .count();
-    let extension_count = plugins
-        .iter()
-        .filter(|plugin| plugin.kind == PiPluginKind::Extension)
-        .count();
-
-    let roots = global_skill_roots()
-        .into_iter()
-        .chain(std::iter::once(global_extension_root()))
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>();
-
-    SettingGroup::new()
-        .title("插件来源")
-        .description("技能是 markdown 能力包，扩展是注册工具/命令的 TypeScript 模块。")
-        .item(
-            SettingItem::new(
-                "扫描目录",
-                SettingField::render(move |_, _, cx: &mut App| {
-                    let muted = cx.theme().muted_foreground;
-                    v_flex()
-                        .gap_1()
-                        .children(roots.iter().map(|path| {
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(path.clone())
-                                .into_any_element()
-                        }))
-                        .into_any_element()
-                }),
-            )
-            .description(format!(
-                "当前扫到 {skill_count} 个技能、{extension_count} 个扩展。"
-            )),
-        )
-        .item(
-            SettingItem::new(
-                "导入",
-                SettingField::render(move |_, _, _| {
-                    let skill_entity = entity.clone();
-                    let extension_entity = entity.clone();
-                    let refresh_entity = entity.clone();
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("import-pi-skill")
-                                .compact()
-                                .label("导入技能目录")
-                                .on_click(move |_, _, cx| {
-                                    skill_entity.update(cx, |workspace, cx| {
-                                        workspace.import_pi_plugin(PiPluginKind::Skill, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("import-pi-extension")
-                                .compact()
-                                .label("导入扩展")
-                                .on_click(move |_, _, cx| {
-                                    extension_entity.update(cx, |workspace, cx| {
-                                        workspace.import_pi_plugin(PiPluginKind::Extension, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("refresh-pi-plugins")
-                                .quiet()
-                                .compact()
-                                .label("重新扫描")
-                                .on_click(move |_, _, cx| {
-                                    refresh_entity.update(cx, |workspace, cx| {
-                                        workspace.refresh_pi_plugins(cx);
-                                    });
-                                }),
-                        )
-                        .into_any_element()
-                }),
-            )
-            .description("把本地的技能目录（含 SKILL.md）或扩展文件拷进全局插件目录，原目录不动。"),
-        )
-}
-
-fn list_group(
-    entity: Entity<CapabilitiesPage>,
-    plugins: &[PiPlugin],
-    pending_delete: Option<String>,
-    page: &CapabilitiesPage,
-) -> SettingGroup {
-    if plugins.is_empty() {
-        return SettingGroup::new()
-            .title("已安装")
-            .item(SettingItem::render(move |_, _, cx: &mut App| {
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("还没有装任何插件。")
-                    .into_any_element()
-            }));
-    }
-
-    let items = plugins
-        .iter()
-        .map(|plugin| {
-            plugin_item(
-                entity.clone(),
-                plugin,
-                pending_delete.as_deref() == Some(plugin.id.as_str()),
+    let pending_delete = page.pi_plugin_pending_delete.as_deref();
+    section
+        .description(t!("plugins.installed_description"))
+        .children(uses::agent_edit_error(page))
+        .children(plugins.iter().map(|plugin| {
+            plugin_row(
+                &entity,
                 page,
+                plugin,
+                pending_delete == Some(plugin.id.as_str()),
+                cx,
             )
-        })
-        .collect::<Vec<_>>();
-
-    SettingGroup::new()
-        .title("已安装")
-        .description("删除会直接删掉磁盘上的文件，并把所有智能体里对它的勾选一起清掉。")
-        .items(items)
+        }))
 }
 
-fn plugin_item(
-    entity: Entity<CapabilitiesPage>,
+/// 旧位置的「移到通用目录」，或同名几份时「以哪份为准」的菜单。都不是就没有。
+fn adopt_button(entity: &Entity<CapabilitiesPage>, plugin: &PiPlugin) -> Option<AnyElement> {
+    if plugin.kind != PiPluginKind::Skill || plugin.builtin {
+        return None;
+    }
+    let id = plugin.id.clone();
+    if plugin.duplicates.is_empty() {
+        if !plugin.legacy_location {
+            return None;
+        }
+        let entity = entity.clone();
+        let path = plugin.path.display().to_string();
+        return Some(
+            Button::new(format!("adopt-pi-plugin-{id}"))
+                .small()
+                .label(t!("plugins.move"))
+                .on_click(move |_, _, cx| {
+                    let (id, path) = (id.clone(), path.clone());
+                    entity.update(cx, |page, cx| page.adopt_pi_plugin(id, path, cx));
+                })
+                .into_any_element(),
+        );
+    }
+    let copies: Vec<String> = std::iter::once(&plugin.path)
+        .chain(plugin.duplicates.iter())
+        .map(|path| path.display().to_string())
+        .collect();
+    let entity = entity.clone();
+    let menu_id = format!("adopt-pi-plugin-{id}");
+    Some(
+        MenuTrigger::dropdown(
+            SharedString::from(format!("{menu_id}-menu")),
+            Button::new(SharedString::from(menu_id))
+                .small()
+                .label(t!("plugins.pick_copy"))
+                .dropdown_caret(true),
+            move |_, _| {
+                let mut menu = Menu::new();
+                for path in &copies {
+                    let entity = entity.clone();
+                    let (id, path) = (id.clone(), path.clone());
+                    menu = menu.item(MenuItem::new(path.clone()).on_click(move |_, _, cx| {
+                        let (id, path) = (id.clone(), path.clone());
+                        entity.update(cx, |page, cx| page.adopt_pi_plugin(id, path, cx));
+                    }));
+                }
+                menu
+            },
+        )
+        .into_any_element(),
+    )
+}
+
+/// 它在哪：内置的写随谁发布；别的写扫描目录下的那一项。路径取自扫描它的那台机器
+/// （`origin` 已把那边的家目录缩成 `~`），不拿本机的家目录去缩。
+fn location(plugin: &PiPlugin) -> String {
+    if plugin.builtin {
+        return t!("plugins.origin_builtin", origin = plugin.origin).into_owned();
+    }
+    match plugin.path.file_name() {
+        Some(name) => format!("{}/{}", plugin.origin, name.to_string_lossy()),
+        None => plugin.origin.clone(),
+    }
+}
+
+fn plugin_row(
+    entity: &Entity<CapabilitiesPage>,
+    page: &CapabilitiesPage,
     plugin: &PiPlugin,
     pending: bool,
-    page: &CapabilitiesPage,
-) -> SettingItem {
-    let users = page
-        .agent_names_using_plugin
-        .get(&plugin.id)
-        .cloned()
-        .unwrap_or_default();
+    cx: &App,
+) -> SettingsRow {
+    let usable = Usable::Plugin(plugin.id.clone());
+    let used_by = uses::used_by_line(&page.machine, &usable, cx);
+    // 失效的勾上也加载不了，不给勾。
+    let uses_button = plugin
+        .is_usable()
+        .then(|| uses::uses_button(entity, page, usable, &plugin.id, cx))
+        .flatten();
+    let entity = entity.clone();
     let id = plugin.id.clone();
-    let name = plugin.name.clone();
-    let kind_label = plugin.kind.label();
-    let origin = plugin.origin.clone();
-    let path = plugin.path.display().to_string();
-    let broken = plugin.broken.clone();
-    let description = plugin.description.clone();
-    let builtin = plugin.builtin;
 
-    let title = format!("{name}（{kind_label}）");
-    let mut detail = Vec::new();
-    if !description.is_empty() {
-        detail.push(description);
+    // 自述是写给模型看的，常常一大段：收成两行，悬停看全文。下面一行是哪来的、谁在用，
+    // 再往下才是要处理的状态。
+    let mut note = vec![match used_by {
+        Some(used_by) => format!("{} · {used_by}", location(plugin)),
+        None => location(plugin),
+    }];
+    if let Some(reason) = &plugin.broken {
+        note.push(t!("plugins.broken", reason = reason).into_owned());
     }
-    if builtin {
-        detail.push(format!("来源：{origin}，跟着 Smelt 更新"));
-    } else {
-        detail.push(format!("来源：{origin} · {path}"));
+    if plugin.legacy_location && plugin.duplicates.is_empty() {
+        note.push(t!("plugins.legacy").into_owned());
     }
-    if let Some(reason) = &broken {
-        detail.push(format!("失效：{reason}"));
-    }
-    if users.is_empty() {
-        detail.push("暂时没有智能体勾选它。".to_string());
-    } else {
-        detail.push(format!("正在被 {} 使用。", users.join("、")));
+    if !plugin.duplicates.is_empty() {
+        note.push(t!("plugins.duplicates", count = plugin.duplicates.len()).into_owned());
     }
 
-    SettingItem::new(
-        title,
-        SettingField::render(move |_, _, _| {
-            if builtin {
-                return div().into_any_element();
-            }
-            let id_for_request = id.clone();
-            let id_for_confirm = id.clone();
-            let request_entity = entity.clone();
-            let confirm_entity = entity.clone();
-            let cancel_entity = entity.clone();
-            if pending {
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new(format!("confirm-delete-pi-plugin-{id}"))
-                            .danger()
-                            .compact()
-                            .label("确认删除")
-                            .on_click(move |_, _, cx| {
-                                let id = id_for_confirm.clone();
-                                confirm_entity.update(cx, |workspace, cx| {
-                                    workspace.confirm_pi_plugin_delete(id, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new(format!("cancel-delete-pi-plugin-{id}"))
-                            .quiet()
-                            .compact()
-                            .label("取消")
-                            .on_click(move |_, _, cx| {
-                                cancel_entity.update(cx, |workspace, cx| {
-                                    workspace.cancel_pi_plugin_delete(cx);
-                                });
-                            }),
-                    )
-                    .into_any_element()
-            } else {
-                Button::new(format!("delete-pi-plugin-{id}"))
-                    .quiet()
-                    .compact()
-                    .label("删除")
-                    .on_click(move |_, _, cx| {
-                        let id = id_for_request.clone();
-                        request_entity.update(cx, |workspace, cx| {
-                            workspace.request_pi_plugin_delete(id, cx);
-                        });
-                    })
-                    .into_any_element()
-            }
-        }),
-    )
-    .description(detail.join("\n"))
+    let mut row = SettingsRow::new(plugin.name.clone()).note(note.join("\n"));
+    if !plugin.description.is_empty() {
+        row = row
+            .description(plugin.description.clone())
+            .clamp_description(format!("pi-plugin-description-{id}"), 2);
+    }
+    let row = row
+        .children(adopt_button(&entity, plugin))
+        .children(uses_button);
+    // 内置的跟着运行时更新，不能删。
+    if plugin.builtin {
+        return row;
+    }
+    if pending {
+        let confirm_entity = entity.clone();
+        let cancel_entity = entity;
+        row.child(
+            Button::new(format!("confirm-delete-pi-plugin-{id}"))
+                .danger()
+                .small()
+                .label(t!("plugins.confirm_delete"))
+                .on_click(move |_, _, cx| {
+                    let id = id.clone();
+                    confirm_entity.update(cx, |workspace, cx| {
+                        workspace.confirm_pi_plugin_delete(id, cx);
+                    });
+                }),
+        )
+        .child(
+            Button::new(format!("cancel-delete-pi-plugin-{}", plugin.id))
+                .quiet()
+                .small()
+                .label(t!("common.cancel"))
+                .on_click(move |_, _, cx| {
+                    cancel_entity.update(cx, |workspace, cx| {
+                        workspace.cancel_pi_plugin_delete(cx);
+                    });
+                }),
+        )
+    } else {
+        row.child(
+            Button::new(format!("delete-pi-plugin-{id}"))
+                .quiet()
+                .small()
+                .label(t!("common.delete"))
+                .on_click(move |_, _, cx| {
+                    let id = id.clone();
+                    entity.update(cx, |workspace, cx| {
+                        workspace.request_pi_plugin_delete(id, cx);
+                    });
+                }),
+        )
+    }
 }

@@ -154,7 +154,7 @@ abstract class L10n {
   /// No description provided for @agentEditPluginsNone.
   ///
   /// In en, this message translates to:
-  /// **'No plugins on this machine.'**
+  /// **'No skills or extensions on this machine.'**
   String get agentEditPluginsNone;
 
   /// No description provided for @agentEditMissing.
@@ -184,7 +184,7 @@ abstract class L10n {
   /// No description provided for @agentEditChoicesFailed.
   ///
   /// In en, this message translates to:
-  /// **'Couldn\'t read this machine\'s capability library, so models, plugins and MCP may be incomplete: {message}'**
+  /// **'Couldn\'t read this machine\'s capability library, so models, skills, extensions and MCP may be incomplete: {message}'**
   String agentEditChoicesFailed(String message);
 
   /// No description provided for @agentEditFolders.
@@ -484,7 +484,7 @@ abstract class L10n {
   /// No description provided for @agentsPlugins.
   ///
   /// In en, this message translates to:
-  /// **'Plugins'**
+  /// **'Skills & Extensions'**
   String get agentsPlugins;
 
   /// No description provided for @agentsContext.
@@ -1966,7 +1966,7 @@ abstract class L10n {
   /// No description provided for @conversationStatusEnded.
   ///
   /// In en, this message translates to:
-  /// **'Session ended'**
+  /// **'Stopped'**
   String get conversationStatusEnded;
 
   /// No description provided for @conversationStatusCompacting.
@@ -1998,12 +1998,6 @@ abstract class L10n {
   /// In en, this message translates to:
   /// **'Handle the ticket above first'**
   String get conversationHintTicket;
-
-  /// No description provided for @conversationHintEnded.
-  ///
-  /// In en, this message translates to:
-  /// **'This session has ended'**
-  String get conversationHintEnded;
 
   /// No description provided for @conversationHintSending.
   ///
@@ -2262,6 +2256,18 @@ abstract class L10n {
   /// In en, this message translates to:
   /// **'(empty)'**
   String get conversationMemoryEmptyBody;
+
+  /// No description provided for @conversationAskSkipped.
+  ///
+  /// In en, this message translates to:
+  /// **'Skipped'**
+  String get conversationAskSkipped;
+
+  /// No description provided for @conversationAskUnanswered.
+  ///
+  /// In en, this message translates to:
+  /// **'Not answered'**
+  String get conversationAskUnanswered;
 
   /// No description provided for @filesTitle.
   ///
@@ -3277,11 +3283,11 @@ abstract class L10n {
   /// **'Skip'**
   String get elicitationDismiss;
 
-  /// No description provided for @elicitationRequired.
+  /// No description provided for @elicitationOtherAnswer.
   ///
   /// In en, this message translates to:
-  /// **'Required'**
-  String get elicitationRequired;
+  /// **'Other answer…'**
+  String get elicitationOtherAnswer;
 
   /// No description provided for @elicitationOpenLink.
   ///

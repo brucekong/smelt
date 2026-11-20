@@ -1,6 +1,7 @@
 # 远程机器与手机端的自动化
 
-状态：已实现（#79）。对应 issue #79（跟踪 issue #76）。
+状态：已实现（#79）。对应 issue #79（跟踪 issue #76）。后来智能体、自动化拆成了内置插件（`crates/plugins/agents`、`crates/plugins/automations`），
+自动化投影存在插件自己那里、按机器分；文中宿主里的路径和 `AgentHostState` 是当时的位置，已经不在了。
 
 两件事：
 
@@ -23,7 +24,9 @@
   （裁掉了运行输出、触发载荷和指令快照，正文用 `run_detail` 取），附带这台机器的 `webhook_base_url`。
 - 定义 `Automation`（`crates/smelt-model/src/automation.rs`）：`id`（客户端生成）、`name`、`enabled`、
   `trigger{schedules, webhooks, events}`（至少一条）、`action`（`Agent{agent_definition_id, prompt}` 或
-  `Shell{command, args}`）、`sinks`；`workspace_dir` 由运行时分配。调度规则五种：每天、每周（星期位掩码）、
+  `Shell{command, args}`）、`sinks`；`workspace_dir` 是用户选的目录，原样用（不在就拒绝保存、运行失败）；没选或是托管目录
+  （按 id 算的固定名字，见 `is_managed_workspace`）时由运行时分配：智能体的在它 space 下的
+  `automations/`，Shell 的在 `~/.smelt/workspaces/automations`，换了智能体跟着换。调度规则五种：每天、每周（星期位掩码）、
   每 N 分钟、每 N 小时、时段内按间隔。没有 cron。
 - **upsert 是整对象覆盖，没有版本检查**；webhook 令牌下发时换成 `<redacted>`，upsert 时按位置换回真令牌。
 
@@ -41,7 +44,7 @@
   `missing_fields`、删智能体时关联自动化的检查也只看本机。
 - 通知标识 `smelt.automation.run.{run_id}`、跳转 `JumpToAutomationRun{automation_id, run_id}` 不带机器；
   终态提醒去重按 `session_id` 比，不看机器。
-- 导航 `AutomationsView::List / Editor`（`workspace_nav.rs`）里的自动化只用 `id` 指。
+- 自动化插件页面（`crates/plugins/automations/src/page.rs`）的编辑状态里，自动化只用 `id` 指。
 
 ### 手机：只能看、开关、跑一次
 

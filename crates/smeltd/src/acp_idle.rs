@@ -1,6 +1,6 @@
 //! 闲置会话挂起。
 //!
-//! 每场对话的驱动和它的 agent 子进程都在这个 smeltd 里。对话几个小时没人碰，
+//! 每场对话的驱动和它的 agent 子进程都在这个 smeltd 里。对话停下以后没人碰，
 //! 这些进程也一直占着内存。这里把闲置够久的 runtime 停掉，也就是挂起，并丢掉
 //! 内存里已经提交的历史前缀。回收线程睡到最早的闲置截止才醒；一个可能变闲置的
 //! 会话都没有时就一直睡，直到下一次活动。
@@ -9,8 +9,10 @@
 //! provider 会话占用都不动，客户端看到的仍是空闲。之后真要用 runtime 时，入口先调
 //! [`wake_suspended_acp_session`]。会按记录的启动规格带 `--session` 重新拉起，
 //! 等 Pi 重放完历史，再把动作交过去。往上翻历史走同一条唤醒。会用到 runtime 的
-//! 情况包括：发消息、改配置、往上翻历史、跨智能体投递。客户端重新 `acp_open`
-//! 时，`ensure_acp_session` 本来就会拉起没有 runtime 的会话。
+//! 情况包括：改配置、往上翻历史、跨智能体投递。用户发消息走
+//! [`launch_for_user_input`]：不等就绪，消息在启动闸后面排队；上次因失败停下的
+//! 也一样拉起。客户端重新 `acp_open` 时，`ensure_acp_session` 本来就会拉起没有
+//! runtime 的会话。
 //!
 //! 只挂起确定安全的会话，条件是以下全部满足：
 //! - 有活着的 runtime；
@@ -31,15 +33,21 @@
 use super::*;
 
 /// 没有任何活动这么久之后挂起。
-pub(crate) const ACP_IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(30 * 60);
+///
+/// 一个闲着的 Pi 常驻约 160MB。唤醒代价因 agent 而异：Pi 拉起、重放两三百条历史到就绪约
+/// 0.1–0.3 秒，察觉不到；Gemini 这类由 agent 自己续接历史的要 2–12 秒，回来发的第一条消息
+/// 就得陪着等。所有 agent 统一一个时限，取 20 分钟，让短暂离开不触发慢唤醒。提示缓存在
+/// 服务端，跟进程无关；Smelt 默认只在回合进行中续热（`agent/src/cache-warming-default.ts`），
+/// 挂起不丢缓存。用户在 Pi 设置里自己打开空闲续热的，续热会随挂起一起停。
+pub(crate) const ACP_IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(20 * 60);
 /// 到点该挂起、却抢不到会话生命周期锁或 spawn 闸门时，隔多久再试。锁被占着说明
 /// 有人正在操作这个会话（拉起、重启），这样的操作多半会记一次活动，把截止往后推。
 /// 上限取改成事件驱动之前的扫描周期。
 // 轮询例外：生命周期锁和 spawn 闸门放开时没有通知可等；周期 1 秒起翻倍，上限 1 分钟。
 const ACP_IDLE_RETRY_FIRST: Duration = Duration::from_secs(1);
 const ACP_IDLE_RETRY_MAX: Duration = Duration::from_secs(60);
-/// 唤醒后等 Pi 恢复历史的上限。超时只让这一次动作失败，会话照常继续恢复。
-const ACP_WAKE_READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// 拉起后等 Pi 恢复历史的上限。超时只让这一次动作失败，会话照常继续恢复。
+pub(crate) const ACP_WAKE_READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// 唤醒后每一步配置恢复等 agent 确认的上限。超时只记日志，用户的动作照常送达。
 const ACP_CONFIG_RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -365,7 +373,7 @@ pub(crate) fn suspend_idle_acp_sessions(
     sweep
 }
 
-/// 挂起那一刻生效的会话配置，唤醒后照它写回。
+/// 拉起前那一刻生效的会话配置（或新建时客户端带来的初始配置），就绪后照它写回。
 ///
 /// 模型单独放：换模型会把 Pi 的推理强度重置成模型默认值，必须先换模型、
 /// 等确认后再写其它项。
@@ -376,6 +384,40 @@ pub(crate) struct SuspendedConfig {
 }
 
 impl SuspendedConfig {
+    /// 客户端带来的 `[配置 id, 值 id]`。`model` 是跨 adapter 的模型占位名；agent 自己的
+    /// 模型配置 id 要等 runtime 报上来才认得，先跟其它项放在一起，写回时再挑出来先换。
+    pub(crate) fn from_values(values: &[(String, String)]) -> Self {
+        let mut config = Self::default();
+        for (config_id, value) in values {
+            if config_id.trim().is_empty() || value.trim().is_empty() {
+                continue;
+            }
+            if config_id == "model" {
+                config.model = Some(value.clone());
+            } else {
+                config.options.push((config_id.clone(), value.clone()));
+            }
+        }
+        config
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.model.is_none() && self.options.is_empty()
+    }
+
+    /// 用 `newer` 里写了的项盖掉这份，没写的保留。
+    pub(crate) fn override_with(&mut self, newer: Self) {
+        if newer.model.is_some() {
+            self.model = newer.model;
+        }
+        for (config_id, value) in newer.options {
+            match self.options.iter_mut().find(|(id, _)| *id == config_id) {
+                Some(slot) => slot.1 = value,
+                None => self.options.push((config_id, value)),
+            }
+        }
+    }
+
     pub(crate) fn capture(reduced: &smelt_core::acp_session::AcpSessionState) -> Self {
         let model_config_id = reduced.model.as_ref().map(|model| model.config_id.as_str());
         Self {
@@ -399,8 +441,13 @@ impl SuspendedConfig {
         &self,
         reduced: &smelt_core::acp_session::AcpSessionState,
     ) -> Option<smelt_core::acp_session::AcpUserAction> {
-        let wanted = self.model.as_ref()?;
         let model = reduced.model.as_ref()?;
+        let wanted = self.model.as_ref().or_else(|| {
+            self.options
+                .iter()
+                .find(|(config_id, _)| config_id == &model.config_id)
+                .map(|(_, value)| value)
+        })?;
         if &model.current_value == wanted
             || (!model.options.is_empty()
                 && !model.options.iter().any(|(value, _)| value == wanted))
@@ -419,8 +466,11 @@ impl SuspendedConfig {
         &self,
         reduced: &smelt_core::acp_session::AcpSessionState,
     ) -> Vec<smelt_core::acp_session::AcpUserAction> {
+        let model_config_id = reduced.model.as_ref().map(|model| model.config_id.as_str());
         self.options
             .iter()
+            // 模型由 `model_action` 先换，这里不再写一遍。
+            .filter(|(config_id, _)| Some(config_id.as_str()) != model_config_id)
             .filter_map(|(config_id, wanted)| {
                 let config = reduced
                     .config_options
@@ -456,9 +506,9 @@ pub(crate) fn config_value(config: &smelt_core::acp_conn::SessionConfigState) ->
         .map(|(value, _)| value.clone())
 }
 
-/// 用到 runtime 之前调用。挂起的会话按记录的启动规格拉起，等 Pi 重放完历史，
-/// 再把挂起前的会话配置写回去；没挂起就只记一次活动。错误串说明这一次为什么
-/// 用不了。
+/// 用到 runtime 之前调用。挂起的会话按记录的启动规格拉起；拉起后还有没补完的配置
+/// 或首条消息（见 `acp_supervise`），等 runtime 就绪、把它们做完再放行，用户的动作
+/// 不会跑在它们前面。没挂起也没要补的就只记一次活动。错误串说明这一次为什么用不了。
 pub(crate) fn wake_suspended_acp_session(
     id: &str,
     slot: &Arc<AcpSlot<AcpSession>>,
@@ -467,35 +517,60 @@ pub(crate) fn wake_suspended_acp_session(
 ) -> Result<(), String> {
     let sess = &slot.value;
     sess.idle.touch();
-    if !sess.idle.is_suspended() {
-        return Ok(());
-    }
-    let saved = {
+    let was_suspended = sess.idle.is_suspended();
+    if was_suspended {
         let _lifecycle = slot.lifecycle.lock();
         if !acp_sessions.is_current(id, slot) {
             return Err("ACP session was replaced".to_string());
         }
-        // 等锁期间别人可能已经拉起了。
+        // 等锁期间别人可能已经拉起了。拉起时记下挂起前的配置，就绪后写回。
         if sess.idle.is_suspended() && !acp_runtime_alive(sess) {
             crate::dlog(&format!("acp 唤醒闲置会话 id={id}"));
-            // 拉起会清掉镜像里的模型，必须在那之前记下。挂起期间改不了配置
-            // （改配置要 runtime，会先走到这里），所以镜像就是挂起时的值。
-            let saved = SuspendedConfig::capture(&sess.reduced.lock());
             relaunch_recorded_acp_runtime(id, slot, acp_sessions, subscribers)
                 .map_err(str::to_string)?;
-            Some(saved)
-        } else {
-            None
         }
-    };
-    wait_for_acp_ready(sess, ACP_WAKE_READY_TIMEOUT)?;
-    if let Some(saved) = saved {
-        restore_suspended_config(id, sess, &saved, subscribers);
     }
+    if !was_suspended && !crate::acp_supervise::after_ready_pending(sess) {
+        return Ok(());
+    }
+    wait_for_acp_ready(sess, ACP_WAKE_READY_TIMEOUT)?;
+    crate::acp_supervise::run_after_ready(id, sess, subscribers);
     Ok(())
 }
 
-/// 把挂起前的配置写回刚拉起的 runtime。先模型、再其它项，每一步等 agent 确认：
+/// 用户发消息要用到 runtime：没在跑就按记录的启动规格拉起，带上自己的历史身份。闲置挂起
+/// 的、上次因失败停下的（没登录、进程退出、恢复失败、自动重连用完）都一样：用户发消息
+/// 就是要接着用，登录好了这一下就能接上，不让人先去点「重新开始」。
+///
+/// 不等就绪：启动闸关着，这条消息进守护的排队，配置写回、首条消息发出后按序放；起不来
+/// 就退回输入框（见 [`crate::acp_host::return_queued_user_prompts`]）。只有用户自己发的
+/// 消息走这里。别的对话、任务的投递不会把失败停下的对话拉起来，免得一个起不来的进程被
+/// 反复拉。
+pub(crate) fn launch_for_user_input(
+    id: &str,
+    slot: &Arc<AcpSlot<AcpSession>>,
+    acp_sessions: &AcpSessions,
+    subscribers: &EventHubHandle,
+) -> Result<(), String> {
+    let sess = &slot.value;
+    sess.idle.touch();
+    if acp_runtime_alive(sess) {
+        return Ok(());
+    }
+    let _lifecycle = slot.lifecycle.lock();
+    if !acp_sessions.is_current(id, slot) {
+        return Err("ACP session was replaced".to_string());
+    }
+    if acp_runtime_alive(sess) {
+        return Ok(());
+    }
+    crate::dlog(&format!("acp 用户发消息，拉起没在跑的会话 id={id}"));
+    // 用户明确要接着用：之前自动重连失败的次数不再算数。
+    sess.reconnect.lock().reset();
+    relaunch_recorded_acp_runtime(id, slot, acp_sessions, subscribers).map_err(str::to_string)
+}
+
+/// 把拉起前的配置写回刚拉起的 runtime。先模型、再其它项，每一步等 agent 确认：
 /// 动作之后紧跟的就是用户的消息，配置没落定就开回合会用错模型或权限。
 /// 写不回去（模型下架、agent 不再提供某项）只记日志，不挡用户的动作。
 pub(crate) fn restore_suspended_config(
@@ -579,24 +654,27 @@ pub(crate) fn copy_session_config(
     Ok(())
 }
 
-fn wait_for_acp_ready(sess: &AcpSession, timeout: Duration) -> Result<(), String> {
+pub(crate) fn wait_for_acp_ready(sess: &AcpSession, timeout: Duration) -> Result<(), String> {
     // `reduced` 每改一次醒一次，超时只是上限。
     let (reduced, _) = sess
         .reduced
         .wait_timeout_while(timeout, |reduced| acp_ready_outcome(reduced).is_none());
-    acp_ready_outcome(&reduced).unwrap_or_else(|| Err("会话恢复超时".to_string()))
+    acp_ready_outcome(&reduced)
+        .unwrap_or_else(|| Err("Timed out restoring the session".to_string()))
 }
 
 /// 恢复有没有结果。`None` 表示还在建连或重放历史。
-fn acp_ready_outcome(
+pub(crate) fn acp_ready_outcome(
     reduced: &smelt_core::acp_session::AcpSessionState,
 ) -> Option<Result<(), String>> {
     use smelt_core::daemon_state::DaemonPhase;
     match reduced.phase {
         DaemonPhase::Dead => {
-            let reason = reduced.end_reason.trim();
+            let reason =
+                smelt_core::acp_session::end_text(reduced.end_code.as_ref(), &reduced.end_reason);
+            let reason = reason.trim();
             Some(Err(if reason.is_empty() {
-                "会话恢复失败".to_string()
+                "Couldn't restore the session".to_string()
             } else {
                 reason.to_string()
             }))

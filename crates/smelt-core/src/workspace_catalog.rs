@@ -5,16 +5,28 @@
 //! 原子执行，按 id 幂等，不带基准版本，多个客户端同时改不会互相覆盖；真改了才推进版本。
 //! 改完返回整份目录，由守护经 `workspace.changed` 推给所有客户端。
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use smelt_model::agent_kind::ConversationLaunchSpec;
-use smelt_model::conversation::ConversationBinding;
 use smelt_model::workspace_directory::{
-    WorkspaceAcp, WorkspaceConversation, WorkspaceDirectory, WorkspaceTerminal,
+    WorkspaceAcp, WorkspaceConversation, WorkspaceDirectory, WorkspaceProjectRepository,
+    WorkspaceTerminal, WorkspaceWorkset, WorkspaceWorksetRepository,
 };
 
 /// 改动和随后读回整份目录要连在一起，见 [`change_on`]。
 static CATALOG_LOCK: Mutex<()> = Mutex::new(());
+
+pub struct CatalogGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
+pub fn lock_catalog() -> CatalogGuard {
+    CatalogGuard {
+        _guard: CATALOG_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+    }
+}
 
 /// 单条改动（`workspace.conversation.*`、`workspace.project.*`）失败的原因。
 #[derive(Debug, PartialEq, Eq)]
@@ -46,6 +58,12 @@ impl From<smelt_store::StoreError> for DirectoryError {
             | StoreError::AcpConversationMissingSid { .. }
             | StoreError::DuplicateSessionId { .. }
             | StoreError::EmptyProjectRoot => Self::Invalid(error.to_string()),
+            StoreError::WorkspaceWorksetInUse { .. }
+            | StoreError::WorkspaceWorksetConflict { .. }
+            | StoreError::InvalidWorksetRestore { .. }
+            | StoreError::WorksetCwdOutside { .. }
+            | StoreError::ClosedWorksetRestoreRequired { .. } => Self::Invalid(error.to_string()),
+            StoreError::WorkspaceWorksetNotFound { .. } => Self::NotFound(error.to_string()),
             StoreError::ConversationArchived { .. } => Self::Invalid(error.to_string()),
             error => Self::Store(error.to_string()),
         }
@@ -60,7 +78,13 @@ pub struct DirectoryChange {
 }
 
 pub fn directory_on(store: &smelt_store::Store) -> Result<WorkspaceDirectory, DirectoryError> {
-    let _guard = CATALOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_catalog();
+    directory_on_locked(store)
+}
+
+pub fn directory_on_locked(
+    store: &smelt_store::Store,
+) -> Result<WorkspaceDirectory, DirectoryError> {
     let (version, snapshot) = store.workspace_directory()?;
     Ok(directory_from_snapshot(version, snapshot))
 }
@@ -120,16 +144,15 @@ pub fn archive_conversation_on(
     })
 }
 
-pub fn pin_conversation_on(
+pub fn restore_conversation_into_workset_on(
     store: &smelt_store::Store,
     id: &str,
-    pinned: bool,
+    workset_id: &str,
 ) -> Result<DirectoryChange, DirectoryError> {
     change_on(store, |store| {
-        let timestamp = pinned.then(|| chrono::Utc::now().timestamp());
         Ok((
             store
-                .set_workspace_conversation_pinned(id, timestamp)?
+                .restore_workspace_conversation_into_workset(id, workset_id)?
                 .changed,
             None,
         ))
@@ -145,6 +168,99 @@ pub fn close_project_on(
     })
 }
 
+pub fn set_project_repositories_on(
+    store: &smelt_store::Store,
+    project_root: &str,
+    repositories: &[WorkspaceProjectRepository],
+) -> Result<DirectoryChange, DirectoryError> {
+    let _guard = lock_catalog();
+    set_project_repositories_on_locked(store, project_root, repositories)
+}
+
+pub fn set_project_repositories_on_locked(
+    store: &smelt_store::Store,
+    project_root: &str,
+    repositories: &[WorkspaceProjectRepository],
+) -> Result<DirectoryChange, DirectoryError> {
+    change_on_locked(store, |store| {
+        let repositories = repositories
+            .iter()
+            .enumerate()
+            .map(
+                |(position, repository)| smelt_store::WorkspaceProjectRepositoryRecord {
+                    project_root: repository.project_root.clone(),
+                    name: repository.name.clone(),
+                    root: repository.root.clone(),
+                    position: position as u32,
+                    managed_link: repository.managed_link.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let commit = store.set_workspace_project_repositories(project_root, &repositories)?;
+        Ok((commit.changed, None))
+    })
+}
+
+pub fn create_workset_on(
+    store: &smelt_store::Store,
+    workset: &WorkspaceWorkset,
+) -> Result<DirectoryChange, DirectoryError> {
+    change_on(store, |store| {
+        let commit = store.create_workspace_workset(&workset_record(workset))?;
+        Ok((commit.changed, None))
+    })
+}
+
+pub fn create_workset_on_locked(
+    store: &smelt_store::Store,
+    workset: &WorkspaceWorkset,
+) -> Result<DirectoryChange, DirectoryError> {
+    change_on_locked(store, |store| {
+        let commit = store.create_workspace_workset(&workset_record(workset))?;
+        Ok((commit.changed, None))
+    })
+}
+
+pub fn rename_workset_on(
+    store: &smelt_store::Store,
+    workset: &WorkspaceWorkset,
+) -> Result<DirectoryChange, DirectoryError> {
+    change_on(store, |store| {
+        let commit = store.rename_workspace_workset(&workset_record(workset))?;
+        Ok((commit.changed, None))
+    })
+}
+
+pub fn rename_workset_on_locked(
+    store: &smelt_store::Store,
+    workset: &WorkspaceWorkset,
+) -> Result<DirectoryChange, DirectoryError> {
+    change_on_locked(store, |store| {
+        let commit = store.rename_workspace_workset(&workset_record(workset))?;
+        Ok((commit.changed, None))
+    })
+}
+
+pub fn delete_workset_on(
+    store: &smelt_store::Store,
+    id: &str,
+) -> Result<DirectoryChange, DirectoryError> {
+    change_on(store, |store| {
+        let commit = store.delete_workspace_workset(id)?;
+        Ok((commit.changed, None))
+    })
+}
+
+pub fn delete_workset_on_locked(
+    store: &smelt_store::Store,
+    id: &str,
+) -> Result<DirectoryChange, DirectoryError> {
+    change_on_locked(store, |store| {
+        let commit = store.delete_workspace_workset(id)?;
+        Ok((commit.changed, None))
+    })
+}
+
 /// 一个会话被删掉了（手机、命令行的 `session.delete`；进程调用方已经收掉）：从目录里摘掉。
 /// ACP 会话删整段对话；终端只摘这一格，摘完没有终端了删整段对话。不在目录里的会话
 /// （只在远程目录里的）不改。读和改在同一把锁里，不会夹进别的改动。
@@ -156,7 +272,10 @@ pub fn forget_session_on(
         let (version, snapshot) = store.workspace_directory()?;
         let directory = directory_from_snapshot(version, snapshot);
         let Some(conversation) = directory.conversations.into_iter().find(|conversation| {
-            conversation.acp.as_ref().is_some_and(|acp| acp.sid == session_id)
+            conversation
+                .acp
+                .as_ref()
+                .is_some_and(|acp| acp.sid == session_id)
                 || conversation
                     .terminals
                     .iter()
@@ -237,6 +356,18 @@ pub fn set_acp_session_title_on(
     })
 }
 
+/// 守护在跑着的 ACP 会话里看到的状态变了（见 [`smelt_store::AcpLiveChange`]）。只由守护写：
+/// 新建之后客户端不再改这些。
+pub fn update_acp_live_on(
+    store: &smelt_store::Store,
+    sid: &str,
+    change: smelt_store::AcpLiveChange<'_>,
+) -> Result<DirectoryChange, DirectoryError> {
+    change_on(store, |store| {
+        Ok((store.update_workspace_acp_live(sid, change)?.changed, None))
+    })
+}
+
 /// 一段 provider 对话的名字（历史页改名、认得出身份的终端分屏改名），`None` 是清掉。
 pub fn set_history_title_on(
     store: &smelt_store::Store,
@@ -263,7 +394,16 @@ fn change_on(
         &smelt_store::Store,
     ) -> Result<(bool, Option<WorkspaceConversation>), smelt_store::StoreError>,
 ) -> Result<DirectoryChange, DirectoryError> {
-    let _guard = CATALOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_catalog();
+    change_on_locked(store, change)
+}
+
+fn change_on_locked(
+    store: &smelt_store::Store,
+    change: impl FnOnce(
+        &smelt_store::Store,
+    ) -> Result<(bool, Option<WorkspaceConversation>), smelt_store::StoreError>,
+) -> Result<DirectoryChange, DirectoryError> {
     let (changed, removed) = change(store)?;
     let (version, snapshot) = store.workspace_directory()?;
     Ok(DirectoryChange {
@@ -289,6 +429,40 @@ fn directory_from_snapshot(
         epoch: version.epoch,
         revision: version.revision,
         projects: snapshot.projects,
+        repositories: snapshot
+            .repositories
+            .into_iter()
+            .map(|repository| WorkspaceProjectRepository {
+                project_root: repository.project_root,
+                name: repository.name,
+                root: repository.root,
+                position: repository.position,
+                managed_link: repository.managed_link,
+            })
+            .collect(),
+        worksets: snapshot
+            .worksets
+            .into_iter()
+            .map(|workset| WorkspaceWorkset {
+                id: workset.id,
+                project_root: workset.project_root,
+                task: workset.task,
+                branch: workset.branch,
+                position: workset.position,
+                repositories: workset
+                    .repositories
+                    .into_iter()
+                    .map(|repository| WorkspaceWorksetRepository {
+                        name: repository.name,
+                        root: repository.root,
+                        worktree: repository.worktree,
+                        base_ref: repository.base_ref,
+                        branch_created: repository.branch_created,
+                        position: repository.position,
+                    })
+                    .collect(),
+            })
+            .collect(),
         conversations: snapshot
             .sessions
             .into_iter()
@@ -305,7 +479,8 @@ fn conversation_record(
         custom_title: conversation.custom_title.clone(),
         last_updated_at: conversation.last_updated_at,
         archived_at: conversation.archived_at,
-        pinned_at: conversation.pinned_at,
+        workset_id: conversation.workset_id.clone(),
+        closed_workset_root: conversation.closed_workset_root.clone(),
         terminals: conversation
             .terminals
             .iter()
@@ -318,6 +493,31 @@ fn conversation_record(
             })
             .collect(),
         acp: conversation.acp.as_ref().map(acp_record),
+    }
+}
+
+fn workset_record(workset: &WorkspaceWorkset) -> smelt_store::WorkspaceWorksetRecord {
+    smelt_store::WorkspaceWorksetRecord {
+        id: workset.id.clone(),
+        project_root: workset.project_root.clone(),
+        task: workset.task.clone(),
+        branch: workset.branch.clone(),
+        position: workset.position,
+        repositories: workset
+            .repositories
+            .iter()
+            .enumerate()
+            .map(
+                |(position, repository)| smelt_store::WorkspaceWorksetRepositoryRecord {
+                    name: repository.name.clone(),
+                    root: repository.root.clone(),
+                    worktree: repository.worktree.clone(),
+                    base_ref: repository.base_ref.clone(),
+                    branch_created: repository.branch_created,
+                    position: position as u32,
+                },
+            )
+            .collect(),
     }
 }
 
@@ -335,16 +535,10 @@ fn acp_record(acp: &WorkspaceAcp) -> smelt_store::WorkspaceAcpRecord {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
-        refresh_launch_from_settings: acp.refresh_launch_from_settings,
         pending_prompt: acp.pending_prompt.clone(),
-        pending_delivery_id: acp.pending_delivery_id.clone(),
         agent_definition_id: acp.agent_definition_id.clone(),
         automation_id: acp.automation_id.clone(),
         config_values: acp.config_values.clone(),
-        binding_automation_run_id: match &acp.conversation_binding {
-            ConversationBinding::Automation { run_id } => Some(run_id.clone()),
-            ConversationBinding::Direct => None,
-        },
         pending_agent_preset: acp.pending_agent_preset.clone(),
         session_title: acp.session_title.clone(),
     }
@@ -356,7 +550,8 @@ fn conversation_from_record(record: smelt_store::WorkspaceSessionRecord) -> Work
         custom_title: record.custom_title,
         last_updated_at: record.last_updated_at,
         archived_at: record.archived_at,
-        pinned_at: record.pinned_at,
+        workset_id: record.workset_id,
+        closed_workset_root: record.closed_workset_root,
         terminals: record
             .terminals
             .into_iter()
@@ -383,14 +578,8 @@ fn acp_from_record(acp: smelt_store::WorkspaceAcpRecord) -> WorkspaceAcp {
             command: acp.launch_command,
             env: acp.launch_env.into_iter().collect(),
         },
-        refresh_launch_from_settings: acp.refresh_launch_from_settings,
-        conversation_binding: match acp.binding_automation_run_id {
-            Some(run_id) => ConversationBinding::Automation { run_id },
-            None => ConversationBinding::Direct,
-        },
         config_values: acp.config_values,
         pending_prompt: acp.pending_prompt,
-        pending_delivery_id: acp.pending_delivery_id,
         pending_agent_preset: acp.pending_agent_preset,
         session_title: acp.session_title,
         agent_definition_id: acp.agent_definition_id,
@@ -419,7 +608,8 @@ mod tests {
             custom_title: Some("标题".to_string()),
             last_updated_at: 7,
             archived_at: None,
-            pinned_at: None,
+            workset_id: None,
+            closed_workset_root: None,
             terminals: Vec::new(),
             acp: Some(WorkspaceAcp {
                 cwd: Some("/repo".to_string()),
@@ -428,13 +618,8 @@ mod tests {
                 profile_id: Some("work".to_string()),
                 history_session_id: Some("history-1".to_string()),
                 launch: ConversationLaunchSpec::from_command("claude").with_env("A", "1"),
-                refresh_launch_from_settings: true,
-                conversation_binding: ConversationBinding::Automation {
-                    run_id: "run-1".to_string(),
-                },
                 config_values: vec![("model".to_string(), "opus".to_string())],
                 pending_prompt: Some("hi".to_string()),
-                pending_delivery_id: Some("delivery".to_string()),
                 pending_agent_preset: Some("preset".to_string()),
                 session_title: Some("会话".to_string()),
                 agent_definition_id: Some("agent-1".to_string()),
@@ -454,6 +639,10 @@ mod tests {
         let change = create_conversation_on(&store, &conversation).unwrap();
         assert!(change.changed);
         assert_eq!(change.directory.revision, 1);
+        // 最近活动时间由守护按新建那一刻写，不用客户端带来的。
+        let stamped = change.directory.conversations[0].last_updated_at;
+        assert_ne!(stamped, conversation.last_updated_at);
+        conversation.last_updated_at = stamped;
         assert_eq!(change.directory.conversations, [conversation.clone()]);
 
         let removed = delete_conversation_on(&store, "conv-1").unwrap();

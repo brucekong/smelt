@@ -11,48 +11,174 @@
 //! 不等空闲——对不上时桌面什么都用不了，等也没有意义。
 //!
 //! 连不上和对不上都退避重探；「重新连接」（[`reconnect`]）叫醒线程立刻再试，退避从头算。
-//! 远程机器回来不会通知这台桌面，离线时的退避翻倍到分钟级；应用回到前台、打开设置窗口时
+//! 远程机器回来不会通知这台桌面，离线时的退避翻倍到分钟级；应用回到前台、打开设置时
 //! （[`probe_remotes`]）叫醒连不上的再探一次。
 //!
 //! 订阅线程是远程运行时连通性的唯一来源：每次探测的结果、订阅断开，都报回 [`RuntimeHub`]，
-//! 侧栏的「离线」跟着它走，不是只在启动时探一次。
+//! 插件看到的「离线」跟着它走，不是只在启动时探一次。
 //!
 //! 运行时比桌面旧时先请它升到桌面的版本（设计文档 D7，见 [`upgrade_then_probe`]），升完
 //! 再探；每条订阅线程只请一次，升了还对不上就照常标不兼容，不反复请，人点「重新连接」
 //! 才再请一次。人也可以随时点「升级运行时」（[`upgrade_remote`]）：连得上就请，不管兼不兼容。
 //!
-//! 别处要读运行时的（工作区目录、配置、额度、终端重连），用 [`wait_online`] 等这里探到
-//! 在线再读，不各自拨号重试。
-//!
-//! 不进核心订阅的话题（见 `smelt_event_protocol` 模块文档）每一轮在核心订阅之前分别
-//! 订阅，核心订阅断了就关掉，下一轮重开。运行时不认识某个话题时只拒绝那条单独订阅，
-//! 核心订阅和其他话题不受影响。本机外观回执请求也走独立订阅。
+//! 核心订阅以外的话题由插件登记（`smelt_plugin_api::register_topics`），宿主不认识它们：
+//! 按所有插件要的并集，每一轮在核心订阅之前每个话题单独订一条，核心订阅断了就关掉，下一轮
+//! 重开；一轮当中登记变了，就地增减（见 [`OpenTopics`]）。运行时不认识某个话题时只拒绝那条
+//! 单独订阅，核心订阅和其他话题不受影响。本机外观回执请求宿主自己要处理，也走独立订阅。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use rust_i18n::t;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use gpui::{App, AsyncApp, Global, Subscription};
+use gpui::{App, Global, Subscription};
 
 use crate::runtimes::{IncompatibleFix, Runtime, RuntimeHub, RuntimeKey, RuntimeStatus};
-use crate::terminal::DaemonStateEvent;
-use smelt_client::daemon_state::{TopicMessage, TopicSubscription, TopicSubscriptionCloser};
+use smelt_client::daemon_state::{
+    DaemonStateEvent, TopicMessage, TopicSubscription, TopicSubscriptionCloser,
+    daemon_reconnect_backoff, subscribe_daemon_states_blocking,
+};
 
 pub(crate) type RuntimeEvent = (RuntimeKey, DaemonStateEvent);
-/// 单独订阅收到的：哪台运行时的。
-pub(crate) type RuntimeTopicEvent = (RuntimeKey, TopicMessage);
+/// 单独订阅收到的：哪台运行时、哪条订阅的话题。宿主不解读，原样转给插件
+/// （`HostEvent::RuntimeTopic`）。
+pub(crate) type RuntimeTopicEvent = (RuntimeKey, String, TopicMessage);
 
-/// 单独订的话题，各占一条订阅：后加的话题旧运行时不认，会拒掉整条订阅，不能连累别的。
-pub(crate) const SEPARATE_TOPICS: &[&str] = &[
-    smelt_client::daemon_state::CORE_TOPIC_PI_CONFIG_CHANGED,
-    smelt_client::daemon_state::CORE_TOPIC_HISTORY_CHANGED,
-];
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 插件要订的话题和各自的序号（`smelt_plugin_api::subscribed_topics`），主线程写、订阅线程读。
+#[derive(Clone, Default)]
+pub(crate) struct WantedTopics(Arc<Mutex<BTreeMap<String, u64>>>);
+
+impl WantedTopics {
+    fn get(&self) -> BTreeMap<String, u64> {
+        lock(&self.0).clone()
+    }
+
+    fn set(&self, topics: BTreeMap<String, u64>) {
+        *lock(&self.0) = topics;
+    }
+}
+
+/// 一条订阅线程这一轮开着的话题订阅；不在一轮里（离线、版本对不上、断开后退避中）是 `None`。
+type RoundTopics = Arc<Mutex<Option<OpenTopics>>>;
+
+/// 一轮里开着的话题订阅，每个话题一条：后加的话题旧运行时不认，会拒掉整条订阅，不能连累
+/// 别的。各记着订上时的序号。
+struct OpenTopics {
+    runtime: Runtime,
+    sender: smol::channel::Sender<RuntimeTopicEvent>,
+    open: BTreeMap<String, (u64, SeparateSubscription)>,
+}
+
+impl OpenTopics {
+    fn new(runtime: &Runtime, sender: &smol::channel::Sender<RuntimeTopicEvent>) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            sender: sender.clone(),
+            open: BTreeMap::new(),
+        }
+    }
+
+    /// 关掉不要了的，订上新要的；开着的话题又有插件新要了（序号变大）就重订，新来的也拿到
+    /// 快照（见 `smelt_plugin_api` 的 topic 模块文档）。阻塞（连运行时），不在主线程调。上一次
+    /// 没连上的、没重订成的，这次再试。
+    fn reconcile(&mut self, wanted: &BTreeMap<String, u64>) {
+        let opened = self
+            .open
+            .iter()
+            .map(|(topic, (requested, _))| (topic, *requested));
+        for (topic, change) in topic_changes(opened, wanted) {
+            match change {
+                TopicChange::Close => {
+                    if let Some((_, subscription)) = self.open.remove(&topic) {
+                        subscription.close();
+                    }
+                }
+                TopicChange::Renew(requested) => {
+                    // 先告诉原来订着的插件按积压处理（带快照的等重订上的那份，没有的重读），
+                    // 再开新的；开上了才关旧的。开不上旧的照常推，序号不动，下次再试。
+                    let _ = self.sender.try_send((
+                        self.runtime.key().clone(),
+                        topic.clone(),
+                        TopicMessage::Lagged,
+                    ));
+                    if let Some(renewed) = self.subscribe(&topic)
+                        && let Some((_, old)) = self.open.insert(topic, (requested, renewed))
+                    {
+                        old.close();
+                    }
+                }
+                TopicChange::Open(requested) => {
+                    if let Some(subscription) = self.subscribe(&topic) {
+                        self.open.insert(topic, (requested, subscription));
+                    }
+                }
+            }
+        }
+    }
+
+    /// 向这台机器单独订一个话题，推来的转进 `sender`。连不上是 `None`（已记日志）。
+    fn subscribe(&self, topic: &str) -> Option<SeparateSubscription> {
+        let key = self.runtime.key().clone();
+        let sender = self.sender.clone();
+        let name = topic.to_string();
+        SeparateSubscription::open(&self.runtime, topic.to_string(), move |message| {
+            sender
+                .try_send((key.clone(), name.clone(), message))
+                .is_ok()
+        })
+    }
+
+    fn close(self) {
+        for (_, (_, subscription)) in self.open {
+            subscription.close();
+        }
+    }
+}
+
+/// 一个话题的订阅要怎么变。
+#[derive(Debug, PartialEq, Eq)]
+enum TopicChange {
+    /// 没人要了。
+    Close,
+    /// 订上之后又有插件新要了：重订，记新的序号。
+    Renew(u64),
+    /// 要了还没开着（新要的，或上次没连上）。
+    Open(u64),
+}
+
+/// 对照开着的（话题和订上时的序号）和要的，列出要变的话题，按话题名排。
+fn topic_changes<'a>(
+    opened: impl Iterator<Item = (&'a String, u64)>,
+    wanted: &BTreeMap<String, u64>,
+) -> Vec<(String, TopicChange)> {
+    let opened: BTreeMap<&String, u64> = opened.collect();
+    let closed = opened
+        .keys()
+        .filter(|topic| !wanted.contains_key(**topic))
+        .map(|topic| ((*topic).clone(), TopicChange::Close));
+    let changed = wanted
+        .iter()
+        .filter_map(|(topic, &requested)| match opened.get(topic) {
+            Some(&at) if at >= requested => None,
+            Some(_) => Some((topic.clone(), TopicChange::Renew(requested))),
+            None => Some((topic.clone(), TopicChange::Open(requested))),
+        });
+    let mut changes: Vec<_> = closed.chain(changed).collect();
+    changes.sort_by(|a, b| a.0.cmp(&b.0));
+    changes
+}
 
 /// 事件的接收端：核心订阅的，和单独订阅的。
 pub(crate) struct RuntimeEventReceivers {
     pub(crate) states: smol::channel::Receiver<RuntimeEvent>,
     pub(crate) topics: smol::channel::Receiver<RuntimeTopicEvent>,
+    /// 命令行转来的 App 命令，只有本机运行时有。
+    pub(crate) commands: smol::channel::Receiver<smelt_event_protocol::AppCommandRequested>,
 }
 
 /// 核心事件和单独话题的发送端，每条订阅线程一份。
@@ -60,16 +186,21 @@ pub(crate) struct RuntimeEventReceivers {
 pub(crate) struct RuntimeEventSenders {
     pub(crate) states: smol::channel::Sender<RuntimeEvent>,
     pub(crate) topics: smol::channel::Sender<RuntimeTopicEvent>,
+    pub(crate) commands: smol::channel::Sender<smelt_event_protocol::AppCommandRequested>,
 }
 
 struct RuntimeSubscriptions {
     sender: RuntimeEventSenders,
+    /// 插件要订的话题，各条订阅线程共用。
+    wanted: WantedTopics,
     /// 订阅线程把远程运行时的连通性报给主线程：哪个运行时、现在怎样。
     status: smol::channel::Sender<(RuntimeKey, RuntimeStatus)>,
     /// 本机那条。
-    _local: SubscriptionHandle,
+    local: SubscriptionHandle,
     remotes: HashMap<RuntimeKey, SubscriptionHandle>,
     _hub_watch: Option<Subscription>,
+    /// 插件登记的话题变了就增减订阅（[`sync_topics`]）。
+    _topics_watch: Subscription,
     /// 系统睡醒：换掉远程机器共用的 iroh endpoint，见 [`crate::runtimes::reset_iroh_after_wake`]。
     _system_wake: Subscription,
 }
@@ -89,6 +220,8 @@ enum Wake {
 pub(crate) struct SubscriptionHandle {
     stop: Arc<AtomicBool>,
     wake: std::sync::mpsc::Sender<Wake>,
+    /// 这条线程眼下这一轮开着的话题订阅。
+    round: RoundTopics,
 }
 
 impl SubscriptionHandle {
@@ -117,7 +250,7 @@ fn incompatible_backoff(attempt: u32) -> Duration {
 /// 几秒内就能接回；关机好几天的，一小时只拨十来次。
 // 轮询例外：远程机器开机、联网后不会通知这台桌面，连上之前收不到它的任何东西，只能隔一阵
 // 拨一次；每次拨号都要过 relay 和地址发现，关机时一直勤探白白耗电耗流量，所以封顶拉到分钟
-// 级，应用回到前台、打开设置窗口（[`probe_remotes`]）和「重新连接」会立刻叫醒；周期 250ms
+// 级，应用回到前台、打开设置（[`probe_remotes`]）和「重新连接」会立刻叫醒；周期 250ms
 // 起翻倍，上限 5min。
 fn remote_offline_backoff(attempt: u32) -> Duration {
     (Duration::from_millis(250) * 2u32.pow(attempt.min(11))).min(Duration::from_secs(300))
@@ -153,7 +286,9 @@ pub(crate) fn upgrade_remote(key: &RuntimeKey, cx: &mut App) {
     crate::runtimes::set_upgrade_note(key, None, cx);
     let _ = status_tx.try_send((
         key.clone(),
-        RuntimeStatus::Upgrading(format!("正在升级到 v{DESKTOP_VERSION}")),
+        RuntimeStatus::Upgrading(
+            t!("upgrade.upgrading_to", version = DESKTOP_VERSION).into_owned(),
+        ),
     ));
     let key = key.clone();
     cx.spawn(async move |cx| {
@@ -170,18 +305,24 @@ pub(crate) fn upgrade_remote(key: &RuntimeKey, cx: &mut App) {
             .await;
         let note = match outcome {
             PushUpgrade::Restarting => None,
-            PushUpgrade::Current => Some(format!("已经是 v{DESKTOP_VERSION}，没有可升的")),
-            PushUpgrade::Staged(reason) => Some(format!("新版本已装好，{reason}")),
-            PushUpgrade::Unsupported => Some(format!(
-                "这台运行时太旧，不会自动升级，到那台机器上执行一次：{}",
-                crate::runtimes::manual_upgrade_command()
-            )),
-            PushUpgrade::Failed(error) => Some(format!("升级失败：{error}")),
+            PushUpgrade::Current => {
+                Some(t!("upgrade.current", version = DESKTOP_VERSION).into_owned())
+            }
+            PushUpgrade::Staged(reason) => Some(t!("upgrade.staged", reason = reason).into_owned()),
+            PushUpgrade::Unsupported => Some(
+                t!(
+                    "upgrade.unsupported",
+                    command = crate::runtimes::manual_upgrade_command()
+                )
+                .into_owned(),
+            ),
+            PushUpgrade::Failed(error) => Some(t!("upgrade.failed", error = error).into_owned()),
         };
         let restarting = note.is_none();
         let _ = status_tx.try_send((
             key.clone(),
-            status.unwrap_or_else(|| RuntimeStatus::Upgrading("正在重启".to_string())),
+            status
+                .unwrap_or_else(|| RuntimeStatus::Upgrading(t!("upgrade.restarting").into_owned())),
         ));
         cx.update(|cx| {
             crate::runtimes::set_upgrade_note(&key, note, cx);
@@ -198,7 +339,7 @@ pub(crate) fn upgrade_remote(key: &RuntimeKey, cx: &mut App) {
     .detach();
 }
 
-/// 请连不上、版本对不上的远程运行时立刻再探一次（打开设置窗口、应用回到前台时），不重新
+/// 请连不上、版本对不上的远程运行时立刻再探一次（打开设置、应用回到前台时），不重新
 /// 请求升级。在线的连着订阅，断了自己会知道；连接中、升级中的正在探，都不用叫。
 pub(crate) fn probe_remotes(cx: &App) {
     if let Some(subscriptions) = cx.try_global::<RuntimeSubscriptions>() {
@@ -210,46 +351,18 @@ pub(crate) fn probe_remotes(cx: &App) {
     }
 }
 
-/// 读运行时之前等它在线。连通性由订阅线程探、记在 [`RuntimeHub`] 上，这里只看着它：在线
-/// 了才往下走，等的时候自己不拨号，远程机器关着也只有订阅线程按它的节奏去探。
-///
-/// `failures` 是这次之前已经连着失败了几次：不是 0 就先退避一会儿再看在不在线，在线却
-/// 失败（刚断线订阅还没察觉、运行时那边出错、会话又断了）时不会对着它连环重试。运行时被
-/// 移除了（远程机器删掉了）或应用要退出了返回 `false`，调用方就此停下。
-pub(crate) async fn wait_online(key: &RuntimeKey, failures: u32, cx: &AsyncApp) -> bool {
-    if let Some(previous) = failures.checked_sub(1) {
-        // 轮询例外：运行时在线、上一次却没成，没有「可以再试了」的事件可等；离线时不走这里，
-        // 退避完回去等在线；周期 250ms 起翻倍，上限 8s。
-        cx.background_executor()
-            .timer(crate::terminal::daemon_reconnect_backoff(previous))
-            .await;
-    }
-    let key = key.clone();
-    let ready = move |cx: &App| online_or_removed(&key, cx);
-    smelt_ui::global_wait::wait_for_global::<RuntimeHub, bool>(cx, ready)
-        .await
-        .unwrap_or(false)
-}
-
-/// 在线是 `Some(true)`，移除了是 `Some(false)`；还没探过、离线、版本对不上、升级中都是
-/// `None`，接着等。
-fn online_or_removed(key: &RuntimeKey, cx: &App) -> Option<bool> {
-    if crate::runtimes::runtime_online(key, cx) {
-        Some(true)
-    } else if crate::runtimes::client(key, cx).is_none() {
-        Some(false)
-    } else {
-        None
-    }
-}
-
 impl Global for RuntimeSubscriptions {}
 
 /// 起本机和已登记远程运行时的订阅，返回事件的接收端。要在 [`RuntimeHub`] 装好之后调。
 pub(crate) fn start(cx: &mut App) -> RuntimeEventReceivers {
     let (states, states_rx) = smol::channel::unbounded();
     let (topics, topics_rx) = smol::channel::unbounded();
-    let sender = RuntimeEventSenders { states, topics };
+    let (commands, commands_rx) = smol::channel::unbounded();
+    let sender = RuntimeEventSenders {
+        states,
+        topics,
+        commands,
+    };
     let (status, status_rx) = smol::channel::unbounded::<(RuntimeKey, RuntimeStatus)>();
     cx.spawn(async move |cx| {
         while let Ok((key, status)) = status_rx.recv().await {
@@ -258,21 +371,36 @@ pub(crate) fn start(cx: &mut App) -> RuntimeEventReceivers {
                 if matches!(status, RuntimeStatus::Incompatible { .. })
                     && !crate::runtimes::runtime_incompatible(&key, cx)
                 {
-                    forget_states(&key, cx);
+                    crate::DaemonStates::forget_runtime(&key, cx);
                 }
                 crate::runtimes::set_status(&key, status, cx);
             });
         }
     })
     .detach();
-    let local = spawn_subscription(Runtime::local(), sender.clone(), status.clone());
+    // 插件在这之前已经登记好（`plugin_host::install`），本机这条第一轮就订上它们要的话题。
+    let wanted = WantedTopics::default();
+    wanted.set(smelt_plugin_api::subscribed_topics(cx));
+    let local = spawn_subscription(
+        Runtime::local(),
+        sender.clone(),
+        status.clone(),
+        wanted.clone(),
+    );
     let system_wake = cx.on_system_wake(crate::runtimes::reset_iroh_after_wake);
+    let topics_watch = cx.subscribe(&smelt_plugin_api::events(cx), |_, event, cx| {
+        if matches!(event, smelt_plugin_api::HostEvent::TopicsChanged) {
+            sync_topics(cx);
+        }
+    });
     cx.set_global(RuntimeSubscriptions {
         sender,
+        wanted,
         status,
-        _local: local,
+        local,
         remotes: HashMap::new(),
         _hub_watch: None,
+        _topics_watch: topics_watch,
         _system_wake: system_wake,
     });
     sync_remote_subscriptions(cx);
@@ -281,11 +409,30 @@ pub(crate) fn start(cx: &mut App) -> RuntimeEventReceivers {
     RuntimeEventReceivers {
         states: states_rx,
         topics: topics_rx,
+        commands: commands_rx,
     }
 }
 
 /// 外观请求单独订阅，不让新话题进入 v7 核心订阅。丢事件时请求方会得到结果未知，
 /// 不重放可能已经执行过的操作。
+/// App 命令请求也单独订阅，理由和外观一样；丢了的请求方得到结果未知。
+fn app_command_event(message: TopicMessage) -> Option<smelt_event_protocol::AppCommandRequested> {
+    match message {
+        TopicMessage::Event { topic, payload }
+            if topic == smelt_event_protocol::CORE_TOPIC_APP_COMMAND_REQUESTED =>
+        {
+            serde_json::from_value(payload)
+                .inspect_err(|error| eprintln!("[runtime-events] App 命令请求载荷无效：{error}"))
+                .ok()
+        }
+        TopicMessage::Lagged => {
+            eprintln!("[runtime-events] App 命令请求订阅积压，丢失的请求不会重放");
+            None
+        }
+        _ => None,
+    }
+}
+
 fn appearance_event(message: TopicMessage) -> Option<DaemonStateEvent> {
     match message {
         TopicMessage::Event { topic, payload }
@@ -307,7 +454,23 @@ fn appearance_event(message: TopicMessage) -> Option<DaemonStateEvent> {
             eprintln!("[runtime-events] 外观请求订阅积压，丢失的请求不会重放");
             None
         }
-        TopicMessage::Event { .. } => None,
+        TopicMessage::Unavailable(reason) => {
+            eprintln!("[runtime-events] 收不到外观请求：{reason}");
+            None
+        }
+        TopicMessage::Event { .. } | TopicMessage::Snapshot { .. } => None,
+    }
+}
+
+/// 单独订阅停下的原因，给人看。
+fn unavailable_reason(error: &smelt_client::daemon_state::DaemonEventClientError) -> String {
+    use smelt_client::daemon_state::DaemonEventClientError;
+    match error {
+        DaemonEventClientError::Server {
+            code: smelt_event_protocol::SubscribeErrorCode::Rejected,
+            ..
+        } => t!("runtime.events_rejected").into_owned(),
+        error => t!("runtime.events_failed", error = error).into_owned(),
     }
 }
 
@@ -315,7 +478,8 @@ fn appearance_event(message: TopicMessage) -> Option<DaemonStateEvent> {
 ///
 /// 连接自己断了（核心订阅还连着）就在线程里退避重订，订上后先交一条
 /// [`TopicMessage::Lagged`]：断开期间可能错过了推送，收的一方当作每个话题都推过一次。
-/// 运行时拒掉订阅（多半是比这些话题旧）就停，等下一轮核心订阅再试。
+/// 运行时拒掉订阅（多半是比这些话题旧）或推来的解不开就交一条
+/// [`TopicMessage::Unavailable`] 后停下，等下一轮核心订阅再试。
 struct SeparateSubscription {
     shared: Arc<SeparateShared>,
     reader: std::thread::JoinHandle<()>,
@@ -343,11 +507,11 @@ impl SeparateShared {
 }
 
 /// 连上一条单独订阅，连同关它的把手。
-fn open_topics(
+fn open_topic(
     client: &smelt_runtime_client::RuntimeClient,
-    topics: &[&'static str],
+    topic: &str,
 ) -> Result<(TopicSubscriptionCloser, TopicSubscription), String> {
-    TopicSubscription::open(client, topics.to_vec())
+    TopicSubscription::open(client, vec![topic])
         .and_then(|subscription| Ok((subscription.closer()?, subscription)))
 }
 
@@ -355,12 +519,12 @@ impl SeparateSubscription {
     /// 第一次连不上、起不了线程就不订，记日志；下一轮核心订阅再试。
     fn open(
         runtime: &Runtime,
-        topics: Vec<&'static str>,
+        topic: String,
         mut emit: impl FnMut(TopicMessage) -> bool + Send + 'static,
     ) -> Option<Self> {
         let key = runtime.key().clone();
         let client = runtime.client().clone();
-        let (closer, first) = match open_topics(&client, &topics) {
+        let (closer, first) = match open_topic(&client, &topic) {
             Ok(opened) => opened,
             Err(error) => {
                 eprintln!("[runtime-events] {key:?} 单独订阅连不上：{error}");
@@ -393,6 +557,7 @@ impl SeparateSubscription {
                         });
                         if let Err(error) = result {
                             eprintln!("[runtime-events] {thread_key:?} 单独订阅停了：{error}");
+                            emit(TopicMessage::Unavailable(unavailable_reason(&error)));
                             return;
                         }
                         if receiver_gone {
@@ -405,7 +570,7 @@ impl SeparateSubscription {
                     }
                     // 轮询例外：只有这条订阅断了时，对端能再连不会通知我们；周期 250ms 起
                     // 翻倍，上限 8s。关掉时由 Condvar 立刻叫醒。
-                    let pause = crate::terminal::daemon_reconnect_backoff(attempt);
+                    let pause = daemon_reconnect_backoff(attempt);
                     attempt = attempt.saturating_add(1);
                     let state = shared.lock();
                     let (state, _) = shared
@@ -416,7 +581,7 @@ impl SeparateSubscription {
                         return;
                     }
                     drop(state);
-                    match open_topics(&client, &topics) {
+                    match open_topic(&client, &topic) {
                         Ok((closer, subscription)) => {
                             let mut state = shared.lock();
                             if state.closed {
@@ -439,7 +604,8 @@ impl SeparateSubscription {
         match reader {
             Ok(reader) => Some(Self { shared, reader }),
             Err(error) => {
-                if let Some(closer) = shared.lock().closer.take() {
+                let closer = shared.lock().closer.take();
+                if let Some(closer) = closer {
                     closer.close();
                 }
                 eprintln!("[runtime-events] {key:?} 起单独订阅线程失败：{error}");
@@ -465,13 +631,16 @@ pub(crate) fn spawn_subscription(
     runtime: Runtime,
     sender: RuntimeEventSenders,
     status_tx: smol::channel::Sender<(RuntimeKey, RuntimeStatus)>,
+    wanted: WantedTopics,
 ) -> SubscriptionHandle {
     let key = runtime.key().clone();
     let stop = Arc::new(AtomicBool::new(false));
     let (wake, woken) = std::sync::mpsc::channel();
+    let round: RoundTopics = Arc::default();
     let handle = SubscriptionHandle {
         stop: Arc::clone(&stop),
         wake,
+        round: Arc::clone(&round),
     };
     std::thread::Builder::new()
         .name(format!("smelt-events-{key:?}"))
@@ -501,11 +670,12 @@ pub(crate) fn spawn_subscription(
                         // 请不动它：说清到哪儿去更新，不发注定失败的升级请求。
                         status = RuntimeStatus::Incompatible {
                             version,
-                            detail: format!(
-                                "{detail}。这台运行时随那台机器上的 Smelt 一起更新，不能远程升级：\
-                                 到那台机器上把 Smelt 更新到 v{}",
-                                crate::runtimes::DESKTOP_VERSION
-                            ),
+                            detail: t!(
+                                "upgrade.update_smelt_there",
+                                detail = detail,
+                                version = crate::runtimes::DESKTOP_VERSION
+                            )
+                            .into_owned(),
                             fix,
                         };
                     } else if !upgrade_requested && smelt_version::RELEASE.is_some() {
@@ -529,7 +699,7 @@ pub(crate) fn spawn_subscription(
                         let pause = if runtime.is_local() {
                             // 轮询例外：本机守护拉不起来时没有「现在能起了」的事件，探一次就是
                             // 再拉一次；周期 250ms 起翻倍，上限 8s。
-                            crate::terminal::daemon_reconnect_backoff(reconnect_attempt)
+                            daemon_reconnect_backoff(reconnect_attempt)
                         } else {
                             remote_offline_backoff(reconnect_attempt)
                         };
@@ -538,24 +708,23 @@ pub(crate) fn spawn_subscription(
                     }
                     _ => {
                         incompatible_attempt = 0;
-                        // 非核心话题分别订阅：旧运行时拒绝新话题时，不能连带其他话题或
-                        // 会话状态一起断开。外观只由本机桌面处理。
-                        let separate: Vec<SeparateSubscription> = SEPARATE_TOPICS
-                            .iter()
-                            .filter_map(|topic| {
-                                let topic_key = key.clone();
-                                let topic_sender = sender.topics.clone();
-                                SeparateSubscription::open(&runtime, vec![topic], move |message| {
-                                    topic_sender.try_send((topic_key.clone(), message)).is_ok()
-                                })
-                            })
-                            .collect();
+                        // 插件要的话题分别订阅：旧运行时拒绝新话题时，不能连带其他话题或
+                        // 会话状态一起断开。在核心订阅之前订上，插件收到重连时话题已经在推。
+                        // 持着锁订，这一轮当中登记变了的增减（[`sync_topics`]）排在后面。
+                        {
+                            let mut current = lock(&round);
+                            let mut topics = OpenTopics::new(&runtime, &sender.topics);
+                            topics.reconcile(&wanted.get());
+                            *current = Some(topics);
+                        }
+                        // 外观只由本机桌面处理。
                         let appearance = if runtime.is_local() {
                             let appearance_key = key.clone();
                             let state_sender = sender.states.clone();
                             SeparateSubscription::open(
                                 &runtime,
-                                vec![smelt_event_protocol::CORE_TOPIC_APPEARANCE_APPLY_REQUESTED],
+                                smelt_event_protocol::CORE_TOPIC_APPEARANCE_APPLY_REQUESTED
+                                    .to_string(),
                                 move |message| match appearance_event(message) {
                                     Some(event) => state_sender
                                         .try_send((appearance_key.clone(), event))
@@ -566,7 +735,21 @@ pub(crate) fn spawn_subscription(
                         } else {
                             None
                         };
-                        crate::terminal::subscribe_daemon_states_blocking(
+                        // 命令登记在桌面里，只接本机运行时转来的。
+                        let commands = if runtime.is_local() {
+                            let command_sender = sender.commands.clone();
+                            SeparateSubscription::open(
+                                &runtime,
+                                smelt_event_protocol::CORE_TOPIC_APP_COMMAND_REQUESTED.to_string(),
+                                move |message| match app_command_event(message) {
+                                    Some(request) => command_sender.try_send(request).is_ok(),
+                                    None => true,
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        subscribe_daemon_states_blocking(
                             runtime.client(),
                             runtime.is_local(),
                             |event| {
@@ -574,11 +757,17 @@ pub(crate) fn spawn_subscription(
                                     && sender.states.try_send((key.clone(), event)).is_ok()
                             },
                         );
-                        for separate in separate {
-                            separate.close();
+                        // 先取出来放锁再关：关要等各订阅的读线程退出，不拿着锁让
+                        // [`sync_topics`] 陪着等。取走后它看到的是空，不会再动这一轮。
+                        let topics = lock(&round).take();
+                        if let Some(topics) = topics {
+                            topics.close();
                         }
                         if let Some(appearance) = appearance {
                             appearance.close();
+                        }
+                        if let Some(commands) = commands {
+                            commands.close();
                         }
                         if stop.load(Ordering::Acquire) {
                             return;
@@ -587,7 +776,7 @@ pub(crate) fn spawn_subscription(
                         // 是退出了的话，下一轮探测会把它拉起来。
                         let _ = status_tx.try_send((
                             key.clone(),
-                            RuntimeStatus::Offline("连接断开".to_string()),
+                            RuntimeStatus::Offline(t!("runtime.disconnected").into_owned()),
                         ));
                         let _ = sender
                             .states
@@ -599,7 +788,7 @@ pub(crate) fn spawn_subscription(
                         }
                         // 轮询例外：订阅断了，对端重新能连时不会通知我们，只能隔一会儿再探；
                         // 周期 250ms 起翻倍，上限 8s（再探仍连不上就转到上面离线的退避）。
-                        let pause = crate::terminal::daemon_reconnect_backoff(reconnect_attempt);
+                        let pause = daemon_reconnect_backoff(reconnect_attempt);
                         reconnect_attempt = reconnect_attempt.saturating_add(1);
                         pause
                     }
@@ -611,7 +800,7 @@ pub(crate) fn spawn_subscription(
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 };
                 // 攒着的几次叫醒并成一次，有人点过「重新连接」就按它算。只是再探一次
-                // （回到前台、开设置窗口）的不动退避，见 [`Wake::Probe`]。
+                // （回到前台、打开设置）的不动退避，见 [`Wake::Probe`]。
                 let reconnect = std::iter::once(wake)
                     .chain(woken.try_iter())
                     .any(|wake| wake == Wake::Reconnect);
@@ -642,13 +831,13 @@ fn upgrade_local_then_probe(
 
     let _ = status_tx.try_send((
         runtime.key().clone(),
-        RuntimeStatus::Upgrading("正在重启本机运行时".to_string()),
+        RuntimeStatus::Upgrading(t!("upgrade.restarting_local").into_owned()),
     ));
     match crate::local_daemon::upgrade_daemon() {
         UpgradeOutcome::Upgraded => crate::runtimes::local_status(runtime.client()),
         UpgradeOutcome::Failed => RuntimeStatus::Incompatible {
             version: version.to_string(),
-            detail: format!("{detail}。本机运行时没有换成当前版本，可在设置里重启守护进程"),
+            detail: t!("upgrade.local_failed", detail = detail).into_owned(),
             fix,
         },
     }
@@ -671,10 +860,10 @@ fn upgrade_then_probe(
     };
     let still_incompatible = |note: String| RuntimeStatus::Incompatible {
         version: version.to_string(),
-        detail: format!("{detail}。{note}"),
+        detail: t!("upgrade.detail_note", detail = detail, note = note).into_owned(),
         fix: IncompatibleFix::UpgradeRuntime,
     };
-    report(format!("正在升级到 v{DESKTOP_VERSION}"));
+    report(t!("upgrade.upgrading_to", version = DESKTOP_VERSION).into_owned());
     match push_upgrade(runtime.client()) {
         PushUpgrade::Restarting => {}
         // 老运行时正忙时会先装好、等空闲再换。
@@ -682,18 +871,21 @@ fn upgrade_then_probe(
             return still_incompatible(reason);
         }
         PushUpgrade::Current => {
-            return still_incompatible(format!(
-                "运行时已经是 v{DESKTOP_VERSION}，仍对不上：这个桌面多半是还没发布的开发构建"
-            ));
+            return still_incompatible(
+                t!("upgrade.still_mismatched_dev", version = DESKTOP_VERSION).into_owned(),
+            );
         }
         PushUpgrade::Unsupported => {
-            return still_incompatible(format!(
-                "这台运行时太旧，不会自动升级，到那台机器上执行一次：{}",
-                crate::runtimes::manual_upgrade_command()
-            ));
+            return still_incompatible(
+                t!(
+                    "upgrade.unsupported",
+                    command = crate::runtimes::manual_upgrade_command()
+                )
+                .into_owned(),
+            );
         }
         PushUpgrade::Failed(error) => {
-            return still_incompatible(format!("自动升级失败：{error}"));
+            return still_incompatible(t!("upgrade.auto_failed", error = error).into_owned());
         }
     }
     // 重启时旧进程连同 iroh 端点一起退出，新进程重新上线要几秒。
@@ -715,13 +907,48 @@ fn upgrade_then_probe(
                     fix,
                 } => RuntimeStatus::Incompatible {
                     version,
-                    detail: format!(
-                        "{detail}。请它升到 v{DESKTOP_VERSION} 后仍对不上，详见那台机器的 ~/.smelt/daemon.log"
-                    ),
+                    detail: t!(
+                        "upgrade.still_mismatched",
+                        detail = detail,
+                        version = DESKTOP_VERSION
+                    )
+                    .into_owned(),
                     fix,
                 },
                 status => status,
             };
+        }
+    }
+}
+
+/// 插件登记的话题变了：记下新的并集，在后台把各条线程这一轮开着的订阅增减到它（订阅要连
+/// 运行时，不在主线程做）。不在一轮里的线程不用管，下一轮开始时按新的并集订。
+fn sync_topics(cx: &mut App) {
+    let Some(subscriptions) = cx.try_global::<RuntimeSubscriptions>() else {
+        return;
+    };
+    subscriptions
+        .wanted
+        .set(smelt_plugin_api::subscribed_topics(cx));
+    let wanted = subscriptions.wanted.clone();
+    let rounds: Vec<RoundTopics> = std::iter::once(&subscriptions.local)
+        .chain(subscriptions.remotes.values())
+        .map(|handle| Arc::clone(&handle.round))
+        .collect();
+    // 订阅要连运行时、会阻塞（远程机器可能很慢），不占后台执行器的线程；每台机器一条
+    // 线程，慢的不拖累别的。话题变化只在插件装上、卸下时有，线程起得不多。
+    for round in rounds {
+        let wanted = wanted.clone();
+        let spawned = std::thread::Builder::new()
+            .name("smelt-topics".into())
+            .spawn(move || {
+                // 先拿这一轮的锁再读并集：几次变化挤在一起时，后跑的按最新的增减。
+                if let Some(topics) = lock(&round).as_mut() {
+                    topics.reconcile(&wanted.get());
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("[runtime] 起不了同步话题订阅的线程：{error}");
         }
     }
 }
@@ -758,18 +985,12 @@ fn sync_remote_subscriptions(cx: &mut App) {
             runtime,
             subscriptions.sender.clone(),
             subscriptions.status.clone(),
+            subscriptions.wanted.clone(),
         );
         subscriptions.remotes.insert(key, handle);
     }
     for key in removed {
-        forget_states(&key, cx);
-    }
-}
-
-/// 丢掉一个运行时的会话状态镜像，连同上面会话的提醒。
-fn forget_states(key: &RuntimeKey, cx: &mut App) {
-    for id in crate::DaemonStates::forget_runtime(key, cx) {
-        crate::AttentionGlobal::remove_session(&id, cx);
+        crate::DaemonStates::forget_runtime(&key, cx);
     }
 }
 
@@ -805,6 +1026,30 @@ mod tests {
                 payload: serde_json::json!({}),
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn topics_are_closed_when_dropped_and_renewed_when_requested_again() {
+        let opened: BTreeMap<String, u64> = [("kept", 1), ("dropped", 2), ("renewed", 3)]
+            .into_iter()
+            .map(|(topic, requested)| (topic.to_string(), requested))
+            .collect();
+        let wanted: BTreeMap<String, u64> = [("kept", 1), ("renewed", 5), ("new", 6)]
+            .into_iter()
+            .map(|(topic, requested)| (topic.to_string(), requested))
+            .collect();
+        let changes = topic_changes(
+            opened.iter().map(|(topic, requested)| (topic, *requested)),
+            &wanted,
+        );
+        assert_eq!(
+            changes,
+            [
+                ("dropped".to_string(), TopicChange::Close),
+                ("new".to_string(), TopicChange::Open(6)),
+                ("renewed".to_string(), TopicChange::Renew(5)),
+            ]
         );
     }
 

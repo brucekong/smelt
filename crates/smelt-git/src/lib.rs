@@ -4,6 +4,8 @@
 //! 把同一套逻辑跑到别的执行世界（远程 / 沙箱）里；便捷包装让本地调用点保持简短。
 
 pub mod discovery;
+pub mod project_repository;
+pub mod worktree;
 
 use smelt_core::fs::FileSystem as _;
 pub use smelt_core::subprocess::{LocalSubprocess, Output, Subprocess};
@@ -12,9 +14,60 @@ pub use smelt_runtime_client::protocol::git::{
     GitPatchAction, GitSeenChange, GitStatusData, LOG_FORMAT, LogScope, ParsedDiff, RepoInfo,
     parse_diff, parse_diff_with_file_headers, parse_log, parse_name_status,
 };
+use smelt_runtime_client::protocol::reason::ControlReason;
+use std::fmt;
 use std::path::Path;
 
 pub type GitOutput = Output;
+
+/// git 写操作没做成。用户自己能处理的几种（看完又变了、不知道推到哪、合并有冲突）带
+/// `reason`，客户端按自己的语言说；其余是 git 或系统的原话。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitError {
+    message: String,
+    reason: Option<ControlReason>,
+}
+
+impl GitError {
+    fn because(reason: ControlReason) -> Self {
+        Self {
+            message: reason.text().unwrap_or_default(),
+            reason: Some(reason),
+        }
+    }
+
+    /// 运行时按自己的默认语言说的一句话。
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn reason(&self) -> Option<&ControlReason> {
+        self.reason.as_ref()
+    }
+}
+
+impl From<String> for GitError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            reason: None,
+        }
+    }
+}
+
+impl From<&str> for GitError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl fmt::Display for GitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GitError {}
 
 pub fn run_git_with(
     subprocess: &dyn Subprocess,
@@ -237,9 +290,11 @@ pub fn worktree_hash(root: &str, path: &str) -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
-/// 丢弃前的校验失败时给人看的话。
-fn stale_view_error(path: &str) -> String {
-    format!("{path} 在你查看之后又变了，没有丢弃。请刷新后再确认一次。")
+/// 丢弃前的校验失败：用户看到的和磁盘上的对不上。
+fn stale_view_error(path: &str) -> GitError {
+    GitError::because(ControlReason::GitChangedSinceViewed {
+        path: path.to_string(),
+    })
 }
 
 pub fn load_branches_with(subprocess: &dyn Subprocess, root: &str) -> BranchList {
@@ -281,7 +336,50 @@ pub fn load_repo_info_with(subprocess: &dyn Subprocess, root: &str) -> Option<Re
         return None;
     }
     let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Some(RepoInfo { branch })
+    let stdout = |args: &[&str]| {
+        run_git_with(subprocess, root, args)
+            .ok()
+            .filter(GitOutput::success)
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let remotes = stdout(&["remote"]).unwrap_or_default();
+    let remotes = remotes.lines().map(str::trim).collect::<Vec<_>>();
+    let upstream_remote = stdout(&["config", "--get", &format!("branch.{branch}.remote")])
+        .filter(|remote| remotes.contains(&remote.as_str()));
+    let remote = upstream_remote.clone().or_else(|| {
+        remotes
+            .iter()
+            .find(|remote| **remote == "origin")
+            .or(remotes.first())
+            .map(|remote| remote.to_string())
+    });
+    let (remote_url, default_branch) = match &remote {
+        Some(remote) => (
+            stdout(&["remote", "get-url", remote]),
+            stdout(&[
+                "symbolic-ref",
+                "--quiet",
+                &format!("refs/remotes/{remote}/HEAD"),
+            ])
+            .and_then(|head| {
+                head.strip_prefix(&format!("refs/remotes/{remote}/"))
+                    .map(str::to_string)
+            }),
+        ),
+        None => (None, None),
+    };
+    let upstream_branch = upstream_remote.and_then(|_| {
+        stdout(&["config", "--get", &format!("branch.{branch}.merge")])?
+            .strip_prefix("refs/heads/")
+            .map(str::to_string)
+    });
+    Some(RepoInfo {
+        branch,
+        remote_url,
+        default_branch,
+        upstream_branch,
+    })
 }
 
 pub fn load_repo_info(root: &str) -> Option<RepoInfo> {
@@ -293,11 +391,11 @@ pub fn load_repo_info(root: &str) -> Option<RepoInfo> {
 pub fn git_dir(root: &str) -> Result<std::path::PathBuf, String> {
     let out = run_git(root, &["rev-parse", "--absolute-git-dir"]).map_err(|e| e.to_string())?;
     if !out.success() {
-        return Err(git_err(&out, "不是 git 仓库"));
+        return Err(git_err(&out, "not a git repository"));
     }
     let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if dir.is_empty() {
-        return Err("git 没有给出仓库目录".to_string());
+        return Err("git didn't report the repository directory".to_string());
     }
     Ok(std::path::PathBuf::from(dir))
 }
@@ -321,7 +419,7 @@ fn run_git_net_with(subprocess: &dyn Subprocess, root: &str, args: &[&str]) -> R
             None,
             &[("GIT_OPTIONAL_LOCKS", "0"), ("GIT_TERMINAL_PROMPT", "0")],
         ),
-        "git 命令失败",
+        "git command failed",
     )
 }
 
@@ -335,24 +433,24 @@ pub fn push_current_with(
     subprocess: &dyn Subprocess,
     root: &str,
     branch: &str,
-) -> Result<(), String> {
+) -> Result<(), GitError> {
     let env = [("GIT_OPTIONAL_LOCKS", "0"), ("GIT_TERMINAL_PROMPT", "0")];
     if branch.is_empty() || has_upstream(subprocess, root) {
-        return checked(
+        return Ok(checked(
             subprocess.run("git", &["-C", root, "push"], None, &env),
-            "git push 失败",
-        );
+            "git push failed",
+        )?);
     }
     let remote = default_push_remote(subprocess, root, branch)?;
-    checked(
+    Ok(checked(
         subprocess.run(
             "git",
             &["-C", root, "push", "-u", &remote, branch],
             None,
             &env,
         ),
-        "git push 失败",
-    )
+        "git push failed",
+    )?)
 }
 
 fn has_upstream(subprocess: &dyn Subprocess, root: &str) -> bool {
@@ -377,7 +475,7 @@ fn default_push_remote(
     subprocess: &dyn Subprocess,
     root: &str,
     branch: &str,
-) -> Result<String, String> {
+) -> Result<String, GitError> {
     if let Ok(out) = run_git_with(subprocess, root, &["config", "--get", "remote.pushDefault"]) {
         let name = out.stdout_str().trim().to_string();
         if out.success() && !name.is_empty() {
@@ -386,7 +484,7 @@ fn default_push_remote(
     }
     let out = run_git_with(subprocess, root, &["remote"]).map_err(|error| error.to_string())?;
     if !out.success() {
-        return Err(git_err(&out, "读取远端列表失败"));
+        return Err(git_err(&out, "couldn't read the remotes").into());
     }
     let remotes: Vec<String> = out
         .stdout_str()
@@ -396,17 +494,17 @@ fn default_push_remote(
         .map(str::to_string)
         .collect();
     match remotes.as_slice() {
-        [] => Err("仓库没有配置任何远端，无法推送".to_string()),
+        [] => Err(GitError::because(ControlReason::GitNoRemote)),
         [only] => Ok(only.clone()),
         _ if remotes.iter().any(|name| name == "origin") => Ok("origin".to_string()),
-        _ => Err(format!(
-            "分支「{branch}」还没有上游，且有多个远端（{}），请先执行 git push -u <远端> {branch} 指定推送目标",
-            remotes.join("、")
-        )),
+        _ => Err(GitError::because(ControlReason::GitPushTargetAmbiguous {
+            branch: branch.to_string(),
+            remotes: remotes.join(", "),
+        })),
     }
 }
 
-pub fn push_current(root: &str, branch: &str) -> Result<(), String> {
+pub fn push_current(root: &str, branch: &str) -> Result<(), GitError> {
     push_current_with(&LocalSubprocess, root, branch)
 }
 
@@ -416,7 +514,7 @@ pub fn commit_and_maybe_push_with(
     message: &str,
     push: bool,
     branch: &str,
-) -> Result<(), String> {
+) -> Result<(), GitError> {
     let commit = run_git_with(subprocess, root, &["commit", "-m", message])
         .map_err(|error| error.to_string())?;
     if !commit.success() {
@@ -427,8 +525,9 @@ pub fn commit_and_maybe_push_with(
         } else if !stdout.is_empty() {
             stdout
         } else {
-            "git commit 失败".to_string()
-        });
+            "git commit failed".to_string()
+        }
+        .into());
     }
     if push {
         push_current_with(subprocess, root, branch)
@@ -442,7 +541,7 @@ pub fn commit_and_maybe_push(
     message: &str,
     push: bool,
     branch: &str,
-) -> Result<(), String> {
+) -> Result<(), GitError> {
     commit_and_maybe_push_with(&LocalSubprocess, root, message, push, branch)
 }
 
@@ -465,7 +564,7 @@ pub fn pull_rebase(root: &str) -> Result<(), String> {
 pub fn stash_push_with(subprocess: &dyn Subprocess, root: &str) -> Result<(), String> {
     checked(
         run_git_with(subprocess, root, &["stash", "push", "-u"]),
-        "git stash 失败",
+        "git stash failed",
     )
 }
 
@@ -476,7 +575,7 @@ pub fn stash_push(root: &str) -> Result<(), String> {
 pub fn stash_pop_with(subprocess: &dyn Subprocess, root: &str) -> Result<(), String> {
     checked(
         run_git_with(subprocess, root, &["stash", "pop"]),
-        "git stash pop 失败",
+        "git stash pop failed",
     )
 }
 
@@ -489,17 +588,21 @@ pub fn stash_pop(root: &str) -> Result<(), String> {
 /// `seen` 是用户看到的整份改动列表。先从磁盘重算一遍，多了、少了、状态码或内容变了
 /// 任何一条就整体拒绝：`clean` 会把用户从没见过的新文件连根删掉，不能赌。
 /// 校验和丢弃之间仍有毫秒级窗口，外部写入者不认我们的锁，这里收窄不了。
-pub fn discard_all(root: &str, seen: &[GitSeenChange]) -> Result<(), String> {
-    let mut status = porcelain_status_with(&LocalSubprocess, root).ok_or("读取 git status 失败")?;
+pub fn discard_all(root: &str, seen: &[GitSeenChange]) -> Result<(), GitError> {
+    let mut status =
+        porcelain_status_with(&LocalSubprocess, root).ok_or("couldn't read git status")?;
     fill_worktree_hashes(root, &mut status);
     if let Some(path) = first_seen_mismatch(seen, &status.seen_changes()) {
         return Err(stale_view_error(path));
     }
     checked(
         run_git(root, &["restore", "--staged", "--worktree", "."]),
-        "git restore 失败",
+        "git restore failed",
     )?;
-    checked(run_git(root, &["clean", "-fd"]), "git clean 失败")
+    Ok(checked(
+        run_git(root, &["clean", "-fd"]),
+        "git clean failed",
+    )?)
 }
 
 /// 两份快照第一处不一致的路径（不看顺序）；完全一致返回 `None`。
@@ -521,12 +624,15 @@ fn first_seen_mismatch<'a>(
 }
 
 pub fn checkout_branch(root: &str, branch: &str) -> Result<(), String> {
-    checked(run_git(root, &["checkout", branch]), "git checkout 失败")
+    checked(run_git(root, &["checkout", branch]), "git checkout failed")
 }
 
 pub fn delete_branch(root: &str, branch: &str, remote: bool) -> Result<(), String> {
     if !remote {
-        return checked(run_git(root, &["branch", "-d", branch]), "删除分支失败");
+        return checked(
+            run_git(root, &["branch", "-d", branch]),
+            "couldn't delete the branch",
+        );
     }
     let (remote_name, ref_name) = branch.split_once('/').unwrap_or(("origin", branch));
     checked(
@@ -536,25 +642,23 @@ pub fn delete_branch(root: &str, branch: &str, remote: bool) -> Result<(), Strin
             None,
             &[("GIT_OPTIONAL_LOCKS", "0"), ("GIT_TERMINAL_PROMPT", "0")],
         ),
-        "删除分支失败",
+        "couldn't delete the branch",
     )
 }
 
-pub fn merge_branch(root: &str, branch: &str) -> Result<(), String> {
+pub fn merge_branch(root: &str, branch: &str) -> Result<(), GitError> {
     let out = run_git(root, &["merge", "--no-ff", branch]).map_err(|error| error.to_string())?;
     if out.success() {
         Ok(())
     } else {
-        let raw = git_err(&out, "git merge 失败");
-        Err(format!(
-            "{raw}\n（冲突文件已留在工作区，解决后 git add 再 git commit；\
-             想放弃这次合并用 git merge --abort）"
-        ))
+        Err(GitError::because(ControlReason::GitMergeFailed {
+            detail: git_err(&out, "git merge failed"),
+        }))
     }
 }
 
 pub fn apply_patch(root: &str, args: &[&str], patch: &str) -> Result<(), String> {
-    checked(run_git_stdin(root, args, patch), "git apply 失败")
+    checked(run_git_stdin(root, args, patch), "git apply failed")
 }
 
 /// 未跟踪目录 / 嵌套 git 仓库没法走 `diff --no-index`（对目录会失败），
@@ -571,12 +675,12 @@ pub fn untracked_entry_diff(path: &str) -> String {
 /// 哪个仓库，这里不再按路径反推——反推正是暂存落到子仓、提交却回到父仓的根源。
 /// 批量一条命令：几十个文件逐个跑就是几十个进程。
 pub fn stage_paths(root: &str, paths: &[String]) -> Result<(), String> {
-    index_paths(root, "add", paths, "git add 失败")
+    index_paths(root, "add", paths, "git add failed")
 }
 
 /// `git reset -- <paths>`。
 pub fn unstage_paths(root: &str, paths: &[String]) -> Result<(), String> {
-    index_paths(root, "reset", paths, "git reset 失败")
+    index_paths(root, "reset", paths, "git reset failed")
 }
 
 fn index_paths(root: &str, verb: &str, paths: &[String], fallback: &str) -> Result<(), String> {
@@ -594,9 +698,9 @@ fn index_paths(root: &str, verb: &str, paths: &[String], fallback: &str) -> Resu
 ///
 /// `seen` 是用户看到的那一条改动。磁盘上这条改动的状态码或内容跟它不一致（agent
 /// 接着写了、已经被提交或还原了）就拒绝，不丢用户没见过的内容。
-pub fn discard_file(root: &str, seen: &GitSeenChange) -> Result<(), String> {
+pub fn discard_file(root: &str, seen: &GitSeenChange) -> Result<(), GitError> {
     let path = seen.path.as_str();
-    let status = porcelain_status_with(&LocalSubprocess, root).ok_or("读取 git status 失败")?;
+    let status = porcelain_status_with(&LocalSubprocess, root).ok_or("couldn't read git status")?;
     let current = status
         .files
         .iter()
@@ -613,14 +717,14 @@ pub fn discard_file(root: &str, seen: &GitSeenChange) -> Result<(), String> {
         let full = Path::new(root).join(path);
         return smelt_core::fs::LocalFs
             .remove_file(&full)
-            .map_err(|e| format!("删除 {path} 失败：{e}"));
+            .map_err(|e| format!("couldn't delete {path}: {e}").into());
     }
     // 按字面路径匹配：`[id].tsx` 当 glob 会连带还原 `i.tsx`、`d.tsx`，校验只看了这一个。
     let literal = format!(":(literal){path}");
-    checked(
+    Ok(checked(
         run_git(root, &["restore", "--staged", "--worktree", "--", &literal]),
-        "git restore 失败",
-    )
+        "git restore failed",
+    )?)
 }
 
 pub fn apply_patch_action(root: &str, action: GitPatchAction, patch: &str) -> Result<(), String> {
@@ -636,14 +740,14 @@ pub fn file_diff(root: &str, path: &str, untracked: bool, scope: DiffScope) -> G
     let text = if untracked {
         match run_git(root, &["diff", "--no-index", "--", "/dev/null", path]) {
             Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
-            Err(err) => format!("无法执行 git diff：{err}"),
+            Err(err) => format!("couldn't run git diff: {err}"),
         }
     } else {
         let mut args: Vec<&str> = scope.args().to_vec();
         args.push(path);
         match run_git(root, &args) {
             Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
-            Err(err) => format!("无法执行 git diff：{err}"),
+            Err(err) => format!("couldn't run git diff: {err}"),
         }
     };
     let is_gitlink = text.lines().any(|l| l.starts_with("Submodule "));
@@ -664,7 +768,7 @@ pub fn file_diff(root: &str, path: &str, untracked: bool, scope: DiffScope) -> G
 pub fn all_diff(root: &str, scope: DiffScope, untracked_paths: &[String]) -> String {
     let mut text = run_git(root, scope.args())
         .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
-        .unwrap_or_else(|err| format!("无法执行 git diff：{err}"));
+        .unwrap_or_else(|err| format!("couldn't run git diff: {err}"));
     for path in untracked_paths {
         let chunk = run_git(root, &["diff", "--no-index", "--", "/dev/null", path])
             .ok()
@@ -702,7 +806,7 @@ pub fn log(root: &str, scope: &LogScope, limit: usize) -> Result<Vec<CommitNode>
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = run_git(root, &argv).map_err(|error| error.to_string())?;
     if !out.success() {
-        return Err(git_err(&out, "git log 失败"));
+        return Err(git_err(&out, "git log failed"));
     }
     Ok(parse_log(&String::from_utf8_lossy(&out.stdout)))
 }
@@ -736,13 +840,13 @@ pub fn commit_file_diff(root: &str, hash: &str, path: &str) -> String {
                 if err.is_empty() {
                     stdout
                 } else {
-                    format!("无法执行 git show：{err}")
+                    format!("couldn't run git show: {err}")
                 }
             } else {
                 stdout
             }
         }
-        Err(err) => format!("无法执行 git show：{err}"),
+        Err(err) => format!("couldn't run git show: {err}"),
     }
 }
 
@@ -779,7 +883,10 @@ husky - pre-commit hook exited with code 127 (error)"
         );
         let err = commit_and_maybe_push_with(&sp, "/repo", "msg", false, "main")
             .expect_err("hook 非零退出必须报错");
-        assert!(err.contains("npm: command not found"), "实际错误：{err}");
+        assert!(
+            err.message().contains("npm: command not found"),
+            "实际错误：{err}"
+        );
     }
 
     /// commit 失败就绝不能继续 push：否则用户会收到一条与实际状态无关的推送错误。
@@ -803,7 +910,7 @@ husky - pre-commit hook exited with code 127 (error)"
             },
         );
         let err = commit_and_maybe_push_with(&sp, "/repo", "msg", true, "main").unwrap_err();
-        assert_eq!(err, "hook failed");
+        assert_eq!(err.message(), "hook failed");
     }
 
     #[test]
@@ -911,17 +1018,23 @@ husky - pre-commit hook exited with code 127 (error)"
 
     fn remote_has_branch(tmp: &Path, remote: &str, branch: &str) -> bool {
         let bare = tmp.join(format!("{remote}.git"));
-        run_git(
-            bare.to_str().unwrap(),
+        let output = run_git(
+            tmp.to_str().unwrap(),
             &[
+                "--git-dir",
+                bare.to_str().unwrap(),
                 "rev-parse",
                 "--verify",
                 "-q",
                 &format!("refs/heads/{branch}"),
             ],
         )
-        .unwrap()
-        .success()
+        .unwrap();
+        match output.code {
+            Some(0) => true,
+            Some(1) => false,
+            _ => panic!("checking remote branch failed: {}", output.stderr_str()),
+        }
     }
 
     /// 已有上游时 push 失败，必须原样报出这次失败的原因。
@@ -935,13 +1048,23 @@ husky - pre-commit hook exited with code 127 (error)"
         run_git(&root, &["push", "-q", "-u", "work", "feature"]).unwrap();
         // 让上游远端变得不可达：模拟网络 / 权限一类与「缺上游」无关的失败。
         let gone = tmp.path().join("gone.git");
-        run_git(&root, &["remote", "set-url", "work", gone.to_str().unwrap()]).unwrap();
+        run_git(
+            &root,
+            &["remote", "set-url", "work", gone.to_str().unwrap()],
+        )
+        .unwrap();
         std::fs::write(Path::new(&root).join("a.txt"), "two\n").unwrap();
         run_git(&root, &["commit", "-qam", "next"]).unwrap();
 
         let err = push_current(&root, "feature").expect_err("远端不可达必须报错");
-        assert!(!err.contains("origin"), "不该去推不存在的 origin：{err}");
-        assert!(err.contains("gone.git"), "应报出真实失败的远端：{err}");
+        assert!(
+            !err.message().contains("origin"),
+            "不该去推不存在的 origin：{err}"
+        );
+        assert!(
+            err.message().contains("gone.git"),
+            "应报出真实失败的远端：{err}"
+        );
         assert!(
             !remote_has_branch(tmp.path(), "gh", "feature"),
             "失败后不能擅自改推到别的远端"
@@ -969,8 +1092,12 @@ husky - pre-commit hook exited with code 127 (error)"
         let root = repo_with_remotes(tmp.path(), &["gh", "work"]);
 
         let err = push_current(&root, "feature").expect_err("多远端不能瞎猜");
-        assert!(
-            err.contains("gh") && err.contains("work"),
+        assert_eq!(
+            err.reason(),
+            Some(&ControlReason::GitPushTargetAmbiguous {
+                branch: "feature".into(),
+                remotes: "gh, work".into(),
+            }),
             "应列出可选远端：{err}"
         );
         assert!(!remote_has_branch(tmp.path(), "gh", "feature"));

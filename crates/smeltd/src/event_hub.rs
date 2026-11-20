@@ -3,23 +3,27 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use smelt_event_bus::{
     Delivery, EventBusError, EventHub, Snapshot, SnapshotProvider, StoredEvent, TopicRegistry,
 };
 use smelt_event_protocol::{
-    AggregateRef, CORE_SNAPSHOT_AUTOMATIONS, CORE_SNAPSHOT_SESSIONS, CORE_SNAPSHOT_WORKSPACE,
-    CORE_TOPIC_AUTOMATIONS_CHANGED, CORE_TOPIC_CONVERSATION_WAKE_REQUESTED,
-    CORE_TOPIC_SESSION_REMOVED, CORE_TOPIC_SESSION_STATE_CHANGED, CORE_TOPIC_WORKSPACE_CHANGED,
-    Capability, ConversationWakeRequested, CoreProjectionEvent, CoreSessionPhase, CorrelationId,
-    EventEnvelope, EventId, EventSource, PluginId, PublisherIdentity, SessionStateChanged,
-    SessionStateRemoved, SessionStatesSnapshot, SnapshotKind, SubscriptionId, Topic,
+    AggregateRef, AttentionKind, CORE_SNAPSHOT_AGENT_HOST, CORE_SNAPSHOT_ATTENTION,
+    CORE_SNAPSHOT_AUTOMATIONS, CORE_SNAPSHOT_SESSIONS, CORE_SNAPSHOT_WORKSPACE,
+    CORE_TOPIC_AGENT_HOST_CHANGED, CORE_TOPIC_AUTOMATIONS_CHANGED,
+    CORE_TOPIC_CONVERSATION_WAKE_REQUESTED, CORE_TOPIC_SESSION_REMOVED,
+    CORE_TOPIC_SESSION_STATE_CHANGED, CORE_TOPIC_WORKSPACE_CHANGED, Capability,
+    ConversationWakeRequested, CoreProjectionEvent, CoreSessionPhase, CorrelationId, EventEnvelope,
+    EventId, EventSource, PluginId, PublisherIdentity, SessionStateChanged, SessionStateRemoved,
+    SessionStatesSnapshot, SnapshotKind, SubscriptionId, Topic,
 };
 
 use super::{
     AutomationFile, DaemonProjectionSeed, Phase, SessionState, WorkspaceDirectoryReader,
 };
+use crate::attention::{AttentionLedger, Outcome};
 
 const MAILBOX_CAPACITY: usize = 256;
 
@@ -109,6 +113,43 @@ impl SnapshotProvider for ProjectionSnapshotProvider {
     }
 }
 
+struct AttentionSnapshotProvider {
+    attention: Arc<Mutex<AttentionLedger>>,
+}
+
+impl SnapshotProvider for AttentionSnapshotProvider {
+    fn snapshot(&self, kind: &SnapshotKind, watermark: u64) -> Result<Snapshot, EventBusError> {
+        let snapshot = self
+            .attention
+            .lock()
+            .map_err(|_| EventBusError::new("attention lock poisoned"))?
+            .snapshot();
+        Ok(Snapshot {
+            kind: kind.clone(),
+            watermark,
+            revision: snapshot.revision,
+            payload: serde_json::to_value(snapshot)
+                .map_err(|error| EventBusError::new(error.to_string()))?,
+        })
+    }
+}
+
+/// 智能体配置的快照现读库：配置只在库里，运行时不另留一份。
+struct AgentHostSnapshotProvider;
+
+impl SnapshotProvider for AgentHostSnapshotProvider {
+    fn snapshot(&self, kind: &SnapshotKind, watermark: u64) -> Result<Snapshot, EventBusError> {
+        let settings = smelt_core::agent_host::load().map_err(EventBusError::new)?;
+        Ok(Snapshot {
+            kind: kind.clone(),
+            watermark,
+            revision: 0,
+            payload: serde_json::to_value(settings)
+                .map_err(|error| EventBusError::new(error.to_string()))?,
+        })
+    }
+}
+
 fn projection_value(projection: &Option<CoreProjectionEvent>) -> (u64, serde_json::Value) {
     match projection {
         Some(projection) => (
@@ -127,12 +168,17 @@ fn projection_value(projection: &Option<CoreProjectionEvent>) -> (u64, serde_jso
 }
 
 pub(crate) struct DaemonEventHub {
-    pub(crate) appearance_requests: Arc<crate::appearance_requests::AppearanceRequests>,
+    pub(crate) appearance_requests: Arc<crate::app_requests::AppearanceRequests>,
+    pub(crate) command_requests: Arc<crate::app_requests::CommandRequests>,
     hub: Arc<EventHub>,
     projection: Arc<Mutex<ProjectionState>>,
+    /// 提醒（见 `crate::attention`）。锁序：投影锁在前，总线的锁在后；快照只拿这一把。
+    attention: Arc<Mutex<AttentionLedger>>,
     /// 每个终端正在显示的进度条（会话 id → 实例号、进度）。只为新订阅者补发：
     /// `terminal.progress` 没有快照，后连上的客户端靠它看到已经在跑的进度条。
     terminal_progress: Mutex<BTreeMap<String, (u64, smelt_event_protocol::TerminalProgress)>>,
+    /// 推智能体配置时拿着：读库和发布在同一把锁里，见 [`Self::agent_host_changed`]。
+    agent_host: Mutex<()>,
 }
 
 impl DaemonEventHub {
@@ -148,13 +194,17 @@ impl DaemonEventHub {
         }
         let hub = Arc::new(EventHub::new(registry));
         let projection = Arc::new(Mutex::new(ProjectionState::default()));
-        register_snapshot_providers(&hub, &projection, workspace)
+        let attention = Arc::new(Mutex::new(AttentionLedger::default()));
+        register_snapshot_providers(&hub, &projection, &attention, workspace)
             .map_err(|error| format!("register core snapshot provider: {error}"))?;
         Ok(Arc::new(Self {
             appearance_requests: Arc::default(),
+            command_requests: Arc::default(),
             hub,
             projection,
+            attention,
             terminal_progress: Mutex::new(BTreeMap::new()),
+            agent_host: Mutex::new(()),
         }))
     }
 
@@ -212,6 +262,11 @@ impl DaemonEventHub {
             return Ok(false);
         }
         let changed = match projection.sessions.get(&state.id) {
+            // 实例 0 是没有运行时的留下的会话（崩溃恢复、归档）。活实例一来就顶掉它，不比
+            // 修订：留下的那份也会改展示字段重发（见 `crate::session_names`），修订可能比
+            // 刚起来、还没发出去的活实例新。反过来留下的那份不能盖掉活实例。
+            Some(current) if state.instance != 0 && current.instance == 0 => true,
+            Some(current) if state.instance == 0 && current.instance != 0 => false,
             Some(current)
                 if state.instance != 0
                     && current.instance != 0
@@ -242,7 +297,15 @@ impl DaemonEventHub {
         )?;
         projection.sessions.insert(state.id.clone(), state.clone());
         projection.sessions_revision = projection.sessions_revision.saturating_add(1);
+        // 还在投影锁里：同一段会话先后两次状态按发布的顺序进提醒。
+        self.update_attention(|ledger| ledger.observe(dto.into(), Instant::now()));
         Ok(true)
+    }
+
+    /// 总线上现在发布着的这段会话状态。
+    pub(crate) fn published_session(&self, id: &str) -> Option<SessionState> {
+        let projection = self.projection.lock().ok()?;
+        projection.sessions.get(id).cloned()
     }
 
     pub(crate) fn remove_session(&self, id: &str, instance: u64) -> Result<bool, EventBusError> {
@@ -291,6 +354,7 @@ impl DaemonEventHub {
         )?;
         projection.sessions.remove(id);
         projection.sessions_revision = projection.sessions_revision.saturating_add(1);
+        self.update_attention(|ledger| ledger.remove(id));
         Ok(true)
     }
 
@@ -300,14 +364,18 @@ impl DaemonEventHub {
         &self,
         directory: &smelt_core::workspace_directory::WorkspaceDirectory,
     ) -> Result<bool, EventBusError> {
-        self.publish_projection(
+        let published = self.publish_projection(
             CORE_TOPIC_WORKSPACE_CHANGED,
             directory.revision,
             serde_json::to_value(directory).map_err(|error| {
                 EventBusError::new(format!("serialize workspace directory: {error}"))
             })?,
             ProjectionTarget::Workspace,
-        )
+        )?;
+        if published {
+            crate::session_names::directory(directory);
+        }
+        Ok(published)
     }
 
     pub(crate) fn publish_automations(
@@ -428,6 +496,35 @@ impl DaemonEventHub {
         Ok(())
     }
 
+    /// 智能体配置写过了：谁写的、改成功还是改了一半都调。读出整份推给客户端（没人订阅就不推，
+    /// 后订阅的从快照拿），会话名也跟着重算。
+    ///
+    /// 读库和发布在同一把锁里：两次写挨着发生时，先读到旧配置的那次一定先发出去，客户端最后
+    /// 拿到的总是新的那份。
+    pub(crate) fn agent_host_changed(&self) {
+        crate::session_names::agents_changed();
+        let Ok(_publishing) = self.agent_host.lock() else {
+            eprintln!("[event-hub] agent host lock poisoned");
+            return;
+        };
+        let topic =
+            Topic::new(CORE_TOPIC_AGENT_HOST_CHANGED).expect("registered core topic is valid");
+        if !self.hub.has_subscriber(&topic).unwrap_or(true) {
+            return;
+        }
+        let published = smelt_core::agent_host::load()
+            .map_err(EventBusError::new)
+            .and_then(|settings| {
+                serde_json::to_value(settings).map_err(|error| {
+                    EventBusError::new(format!("serialize agent host settings: {error}"))
+                })
+            })
+            .and_then(|payload| self.publish_core(CORE_TOPIC_AGENT_HOST_CHANGED, payload, None));
+        if let Err(error) = published {
+            eprintln!("[event-hub] agent host publish failed: {error}");
+        }
+    }
+
     /// 经运行时改了历史存档。没人订阅就不发。
     pub(crate) fn publish_history_changed(&self) -> Result<(), EventBusError> {
         let topic = Topic::new(smelt_event_protocol::CORE_TOPIC_HISTORY_CHANGED)
@@ -444,6 +541,57 @@ impl DaemonEventHub {
             None,
         )?;
         Ok(())
+    }
+
+    /// 终端程序的通知、响铃、智能体发来的消息进提醒。`session_id` 为空是命令行发的。
+    pub(crate) fn notify_attention(
+        &self,
+        session_id: &str,
+        kind: AttentionKind,
+        title: &str,
+        message: &str,
+    ) {
+        self.update_attention(|ledger| {
+            ledger.notice(session_id, kind, title, message, Instant::now())
+        });
+    }
+
+    /// 用户看过这段会话了。
+    pub(crate) fn mark_attention_read(&self, session_id: &str) {
+        self.update_attention(|ledger| ledger.mark_read(session_id));
+    }
+
+    /// 改提醒，变化在同一把锁里广播：订阅时取的快照不会和广播交错，把旧的发到新的后面。
+    /// 没人订阅就不广播，后来的订阅者从快照里拿。推送不看有没有人订阅。
+    fn update_attention(&self, change: impl FnOnce(&mut AttentionLedger) -> Outcome) {
+        let Ok(mut ledger) = self.attention.lock() else {
+            eprintln!("[event-hub] attention lock poisoned");
+            return;
+        };
+        let Outcome { changed, push } = change(&mut ledger);
+        if let Some(command) = push {
+            crate::push::apply(command);
+        }
+        let Some(changed) = changed else {
+            return;
+        };
+        let topic = Topic::new(smelt_event_protocol::CORE_TOPIC_ATTENTION_CHANGED)
+            .expect("registered core topic is valid");
+        if !self.hub.has_subscriber(&topic).unwrap_or(true) {
+            return;
+        }
+        let published = serde_json::to_value(changed)
+            .map_err(|error| EventBusError::new(format!("serialize attention: {error}")))
+            .and_then(|payload| {
+                self.publish_core(
+                    smelt_event_protocol::CORE_TOPIC_ATTENTION_CHANGED,
+                    payload,
+                    None,
+                )
+            });
+        if let Err(error) = published {
+            eprintln!("[event-hub] attention publish failed: {error}");
+        }
     }
 
     /// 终端里的程序发了一条 OSC 通知，或智能体主动发了一条（带标题）。没人订阅就不发：
@@ -671,8 +819,19 @@ enum ProjectionTarget {
 fn register_snapshot_providers(
     hub: &EventHub,
     projection: &Arc<Mutex<ProjectionState>>,
+    attention: &Arc<Mutex<AttentionLedger>>,
     workspace: WorkspaceDirectoryReader,
 ) -> Result<(), EventBusError> {
+    hub.register_snapshot_provider(
+        SnapshotKind(CORE_SNAPSHOT_ATTENTION.to_string()),
+        Arc::new(AttentionSnapshotProvider {
+            attention: Arc::clone(attention),
+        }),
+    )?;
+    hub.register_snapshot_provider(
+        SnapshotKind(CORE_SNAPSHOT_AGENT_HOST.to_string()),
+        Arc::new(AgentHostSnapshotProvider),
+    )?;
     let projection_provider: Arc<dyn SnapshotProvider> = Arc::new(ProjectionSnapshotProvider {
         projection: Arc::clone(projection),
         workspace,
@@ -747,6 +906,8 @@ fn session_dto(state: &SessionState) -> SessionStateChanged {
         conversation_id: state.conversation_id.clone(),
         custom_title: state.custom_title.clone(),
         title: state.title.clone(),
+        conversation_name: state.conversation_name.clone(),
+        name: state.name.clone(),
         phase: match state.phase {
             Phase::Connecting => CoreSessionPhase::Connecting,
             Phase::Thinking => CoreSessionPhase::Thinking,
@@ -760,8 +921,17 @@ fn session_dto(state: &SessionState) -> SessionStateChanged {
         },
         phase_since_unix_seconds: state.phase_since,
         turn_started_at_unix_seconds: state.turn_started_at,
-        pending_question: state.pending_question.clone(),
+        pending_question: state
+            .pending
+            .as_ref()
+            .and_then(crate::session_state::PendingLine::question),
         pending_request: state.pending_request.clone(),
+        pending_note: state
+            .pending
+            .as_ref()
+            .and_then(crate::session_state::PendingLine::note)
+            .cloned(),
+        completed_delivery_id: state.completed_delivery_id.clone(),
         tokens_used: state.tokens_used,
         branch: state.branch.clone(),
         dirty_files: state.dirty_files.clone(),
@@ -858,6 +1028,7 @@ mod tests {
             session_id: None,
             provider_session_id: None,
             output: Some("blob".into()),
+            error_code: None,
             error: None,
             runtime_released_at: Some(2),
         });

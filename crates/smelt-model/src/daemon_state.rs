@@ -3,12 +3,13 @@
 //! 解在 [`DaemonStateEventClient`]（不进核心订阅的话题在 [`TopicEventClient`]）；连接
 //! 本身在客户端。
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 pub use smelt_event_protocol::{
-    CORE_TOPIC_HISTORY_CHANGED, CORE_TOPIC_PI_CONFIG_CHANGED, TerminalProgress,
-    TerminalProgressState,
+    AgentMemoryChanged, AttentionChanged, AttentionItem, AttentionKind, AttentionSnapshot,
+    CORE_TOPIC_AGENT_HOST_CHANGED, CORE_TOPIC_AGENT_MEMORY_CHANGED, CORE_TOPIC_ATTENTION_CHANGED,
+    CORE_TOPIC_AUTOMATIONS_CHANGED, CORE_TOPIC_HISTORY_CHANGED, CORE_TOPIC_PI_CONFIG_CHANGED,
+    SessionAttention, TerminalProgress, TerminalProgressState,
 };
 
 use crate::automation::AutomationFile;
@@ -49,7 +50,7 @@ pub enum RuntimePresence {
 
 /// GUI 侧订阅状态通道的镜像（serde 反序列化；多出来的 JSON 字段自动忽略）。
 /// 字段对齐 smeltd `SessionState` 广播——B 路线「语义面板」的数据源。
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DaemonSessionState {
     pub id: String,
     /// daemon runtime generation. A recreated session may restart its revision at a lower value.
@@ -63,11 +64,25 @@ pub struct DaemonSessionState {
     /// hook 上报的问句 / 当前工具名（PreToolUse 时 question 常是 tool_name）。
     #[serde(default)]
     pub pending_question: Option<String>,
+    /// `pending_question` 里运行时自己说的那句的种类，给人看用 [`Self::pending_text`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_note: Option<smelt_event_protocol::SessionNote>,
     /// 对话会话正在等的那个审批或选择题的身份，变了就是换了一个请求。终端会话没有。
     #[serde(default)]
     pub pending_request: Option<String>,
+    /// 最近结束的那轮对应的外部投递（`conversation.prompt` 的 `delivery_id`）；用户自己说的
+    /// 那轮是 None。投递方看到自己的 id 就去 `conversation.turn_result` 取结果。
+    #[serde(default)]
+    pub completed_delivery_id: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// 这段对话的展示名，运行时算好（见 `SessionStateChanged::conversation_name`）。侧栏
+    /// 的对话行、菜单栏、资源页直接显示它，没有就显示通用名。
+    #[serde(default)]
+    pub conversation_name: Option<String>,
+    /// 这一格自己的展示名（分屏的子行、手机上的一格），运行时算好。
+    #[serde(default)]
+    pub name: Option<String>,
     /// 守护下发的启动命令；远程客户端在菜单快照缺少 agent 信息时用它兜底识别 provider。
     #[serde(default)]
     pub launch: Option<String>,
@@ -85,6 +100,9 @@ pub struct DaemonSessionState {
     pub custom_title: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// `cwd` 所在仓库的当前分支，运行时监听 HEAD 维护。不是 git 仓库、旧运行时不报是 None。
+    #[serde(default)]
+    pub branch: Option<String>,
     /// unix 秒，进入当前 phase 的时刻。
     #[serde(default)]
     pub phase_since: u64,
@@ -103,7 +121,7 @@ pub struct DaemonSessionState {
     /// 单独不会置位；旧守护缺字段时为 false，客户端必须对活动状态 fail closed。
     #[serde(default)]
     pub turn_events: bool,
-    /// 会话是否仍有客户端连接（list op 附带）；会话管理器据此展示在线/游离状态。
+    /// 会话是否仍有客户端连接（list op 附带）。
     /// 未连接不等于应删除：GUI 退出后终端与 ACP 会话可以继续由 daemon 托管。旧版
     /// 守护不报该字段，反序列化默认 true，避免把未知状态误判为游离。
     #[serde(default = "default_connected")]
@@ -138,12 +156,17 @@ impl Default for DaemonSessionState {
             phase: DaemonPhase::default(),
             pending_question: None,
             pending_request: None,
+            pending_note: None,
+            completed_delivery_id: None,
             title: None,
+            conversation_name: None,
+            name: None,
             launch: None,
             provider: None,
             conversation_id: None,
             custom_title: None,
             cwd: None,
+            branch: None,
             phase_since: 0,
             turn_started_at: 0,
             updated_at: 0,
@@ -158,21 +181,6 @@ impl Default for DaemonSessionState {
 }
 
 impl DaemonSessionState {
-    /// 结构面板用：phase 中文标签。
-    pub fn phase_label(&self) -> &'static str {
-        match self.effective_phase() {
-            DaemonPhase::Connecting => "启动中",
-            DaemonPhase::Thinking => "思考中",
-            DaemonPhase::ExecutingTool => "执行工具",
-            DaemonPhase::AwaitingApproval => "等你批准",
-            DaemonPhase::WaitingForUser => "等你输入",
-            DaemonPhase::Succeeded => "已完成",
-            DaemonPhase::Failed => "失败",
-            DaemonPhase::Idle => "空闲",
-            DaemonPhase::Dead => "已结束",
-        }
-    }
-
     /// 本进程是否仍持有可 attach 的运行时。幽灵会话为 false。
     pub fn has_runtime(&self) -> bool {
         self.runtime
@@ -222,12 +230,21 @@ impl DaemonSessionState {
         })
     }
 
+    /// 「待处理」那一行给人看的话：运行时自己说的按当前语言说，智能体的原话原样给。
+    pub fn pending_text(&self) -> Option<String> {
+        self.pending_note
+            .as_ref()
+            .and_then(smelt_event_protocol::SessionNote::text)
+            .or_else(|| self.pending_question.clone())
+    }
+
     /// 结构面板副文案：工具名或审批问句。
     pub fn detail_line(&self) -> Option<String> {
         if !self.phase_is_authoritative() {
             return None;
         }
-        let q = self.pending_question.as_deref()?.trim();
+        let q = self.pending_text()?;
+        let q = q.trim();
         if q.is_empty() {
             return None;
         }
@@ -238,20 +255,6 @@ impl DaemonSessionState {
             _ => q.to_string(),
         })
     }
-}
-
-/// 会话管理刚杀掉的 id，在 subscribe 确认消失前从快照里滤掉。
-/// 返回过滤后的列表，并丢掉镜像里已经没有的 tombstone。
-pub fn apply_identity_tombstones(
-    snapshot: Vec<DaemonSessionState>,
-    tombstones: &mut HashSet<String>,
-) -> Vec<DaemonSessionState> {
-    let live: HashSet<&str> = snapshot.iter().map(|state| state.id.as_str()).collect();
-    tombstones.retain(|id| live.contains(id.as_str()));
-    snapshot
-        .into_iter()
-        .filter(|state| !tombstones.contains(&state.id))
-        .collect()
 }
 
 /// 跟 smeltd 的 `Phase`（见 `smeltd::session_state`）对应，同样 `rename_all = "snake_case"`。
@@ -296,8 +299,6 @@ pub enum DaemonStateEvent {
     ConversationWakeRequested { session_id: String },
     /// 关注过的项目目录里有文件变了。
     ProjectChanged { root: String },
-    /// 关注过的智能体的记忆目录里有文件变了（`None` 是用户全局记忆）。
-    AgentMemoryChanged { agent_id: Option<String> },
     /// 会话里的终端程序发了一条 OSC 9/99/777 通知（会话已有结构化 hook 事件时运行时不会
     /// 发），或智能体主动发了一条通知（带 `title`）。一次性事件，不是投影。
     TerminalNotification {
@@ -330,27 +331,6 @@ pub enum DaemonStateEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn identity_tombstones_hide_until_snapshot_drops_them() {
-        let live = |id: &str| DaemonSessionState {
-            id: id.into(),
-            runtime: true,
-            ..Default::default()
-        };
-        let mut tombstones = HashSet::from(["gone".into()]);
-        let filtered = apply_identity_tombstones(vec![live("keep"), live("gone")], &mut tombstones);
-        assert_eq!(
-            filtered.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
-            vec!["keep"]
-        );
-        assert_eq!(tombstones, HashSet::from(["gone".into()]));
-
-        let filtered = apply_identity_tombstones(vec![live("keep")], &mut tombstones);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].id, "keep");
-        assert!(tombstones.is_empty());
-    }
 
     #[test]
     fn runtime_presence_waits_until_mirror_is_primed() {

@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, Weak};
 
+use rust_i18n::t;
 use smelt_model::control_api::{PushRegister, PushUnregister};
 use smelt_runtime_client::protocol::control::{ControlClientError, ControlErrorCode, EmptyParams};
 
@@ -53,8 +54,9 @@ pub(crate) trait Transport: Dialer {
     /// 要让所有节点重新 connect。relay 不合法时报错、形态不变。
     fn configure(&self, relays: &[Option<String>]) -> Result<bool, SmeltError>;
 
-    /// 网络可能变了，让传输层重新探测地址和路径。
-    fn network_change(&self);
+    /// 网络变了：丢掉旧 endpoint，下次拨号按新网络重建。返回是否真丢了：丢了的话调用方要让所有
+    /// 节点重新 connect。
+    fn network_change(&self) -> bool;
 }
 
 /// 各模块的时限。生产值见 [`Timings::PRODUCTION`]，测试用毫秒级。
@@ -329,7 +331,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn not_initialized() -> SmeltError {
     error(
         SmeltErrorKind::Other,
-        "还没有初始化设备身份（先调 init_client）",
+        "the device identity isn't initialized (call init_client first)",
     )
 }
 
@@ -372,14 +374,19 @@ impl Fleet {
             return Err(error(
                 SmeltErrorKind::Other,
                 format!(
-                    "设备身份已从 {} 加载，不能换成 {}",
+                    "the device identity was already loaded from {}; it can't switch to {}",
                     env.data_dir.display(),
                     data_dir.display()
                 ),
             ));
         }
-        let secret = smelt_iroh::load_or_create_secret(&data_dir.join(SECRET_FILE))
-            .map_err(|e| error(SmeltErrorKind::Other, format!("读取设备身份失败：{e:#}")))?;
+        let secret =
+            smelt_iroh::load_or_create_secret(&data_dir.join(SECRET_FILE)).map_err(|e| {
+                error(
+                    SmeltErrorKind::Other,
+                    t!("error.identity_unreadable", error = format!("{e:#}")),
+                )
+            })?;
         let device_id = secret.public().to_string();
         log::info!("设备身份：{device_id}");
         let store = Store::open(&data_dir.join(crate::store::DATABASE_FILE))?;
@@ -593,14 +600,20 @@ impl Fleet {
         }
     }
 
-    /// 网络变了（切 Wi-Fi / 蜂窝、断网又恢复）：先让传输层重新找路径，再确认每台机器的链路。
-    /// 旧链路的路径多半跟着旧网络一起没了，却要等 QUIC 空闲超时才会报断开；确认不了的
-    /// 立刻换新链路重连（见 [`crate::connection`]）。
+    /// 网络变了（切 Wi-Fi / 蜂窝、断网又恢复）：换掉旧 iroh endpoint，所有机器在新 endpoint 上
+    /// 重新 connect。旧 endpoint 跨网络后常常再也连不上 relay，在它上面怎么重拨都没用。
+    /// 还没建过 endpoint 时只确认一遍链路（重连中的立刻重试）。
     pub(crate) fn network_changed(&self) {
-        if let Ok(env) = self.shared.env() {
-            env.transport.network_change();
+        let Ok(env) = self.shared.env() else {
+            return;
+        };
+        if env.transport.network_change() {
+            for node in self.shared.nodes() {
+                self.shared.spawn_connect(&node);
+            }
+        } else {
+            self.verify();
         }
-        self.verify();
     }
 
     pub(crate) fn detach_all_terminals(&self) {
@@ -695,7 +708,10 @@ impl Shared {
         let relays: Vec<Option<String>> = records.iter().map(|r| r.relay_url.clone()).collect();
         env.transport.configure(&relays)?;
         if self.env.set(env).is_err() {
-            return Err(error(SmeltErrorKind::Other, "设备身份已经初始化过"));
+            return Err(error(
+                SmeltErrorKind::Other,
+                "the device identity is already initialized",
+            ));
         }
         let env = self.env()?;
         let nodes: Vec<Arc<Node>> = records

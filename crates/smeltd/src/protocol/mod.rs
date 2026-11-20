@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::devices::Principal;
+use smelt_core::acp_session::ConversationEndReason;
 use smelt_runtime_client::protocol::control::ControlMethod;
 use smelt_runtime_client::protocol::daemon::{DaemonOperation, DaemonRequest};
 
@@ -108,19 +109,20 @@ pub(crate) fn handle_conn<C: ClientSocket + crate::protocol::PeerSource>(
                             .any(|t| t.id.as_deref() == Some(id)))
             })
         });
-        let message = match blocked {
+        let rejection = match blocked {
             Ok(false) => None,
-            Ok(true) => Some("对话已归档，请先恢复".to_string()),
-            Err(error) => Some(error),
+            Ok(true) => Some((ConversationEndReason::Archived, String::new())),
+            Err(error) => Some((ConversationEndReason::OpenFailed, error)),
         };
-        if let Some(message) = message {
+        if let Some((reason, detail)) = rejection {
             if operation == DaemonOperation::AcpOpen {
-                crate::acp_host::write_rejected_acp_snapshot(conn, &message);
+                crate::acp_host::write_rejected_acp_snapshot(conn, &v, reason, &detail);
             } else {
+                // 终端把这句直接写进输出，没有客户端措辞的机会；运行时不设语言，说英文。
                 let mut conn = conn;
                 write_terminal_error(
                     &mut conn,
-                    &message,
+                    &reason.describe(&detail),
                     v["rows"].as_u64().unwrap_or(24) as u16,
                     v["cols"].as_u64().unwrap_or(80) as u16,
                 );
@@ -152,25 +154,26 @@ pub(crate) fn handle_conn<C: ClientSocket + crate::protocol::PeerSource>(
         DaemonOperation::EventSubscribe => {
             handle_event_subscribe_op(conn, &v, &principal, &event_hub)
         }
-        DaemonOperation::AppearanceReceipt => {
-            let mut conn = conn;
-            let result = (|| {
-                if principal.is_remote() {
-                    return Err("外观回执只接受本机桌面".to_string());
-                }
-                let peer = conn.peer_identity()?;
-                authenticate_first_party_desktop(&peer)?;
-                let receipt: smelt_event_protocol::AppearanceApplyReceipt =
-                    serde_json::from_value(v.get("receipt").cloned().ok_or("缺少外观回执")?)
-                        .map_err(|error| error.to_string())?;
-                event_hub.appearance_requests.respond(&peer, &receipt.request_id, receipt.outcome)
-            })();
-            let reply = match result {
-                Ok(()) => serde_json::json!({"ok": true}),
-                Err(error) => serde_json::json!({"ok": false, "error": error}),
-            };
-            let _ = smelt_runtime_client::protocol::write_json_line(&mut conn, &reply);
-        }
+        DaemonOperation::AppearanceReceipt => handle_desktop_receipt(
+            conn,
+            &v,
+            &principal,
+            |peer, receipt: smelt_event_protocol::AppearanceApplyReceipt| {
+                event_hub
+                    .appearance_requests
+                    .respond(peer, &receipt.request_id, receipt.outcome)
+            },
+        ),
+        DaemonOperation::AppCommandReceipt => handle_desktop_receipt(
+            conn,
+            &v,
+            &principal,
+            |peer, receipt: smelt_event_protocol::AppCommandReceipt| {
+                event_hub
+                    .command_requests
+                    .respond(peer, &receipt.request_id, receipt.outcome)
+            },
+        ),
         DaemonOperation::AcpOpen => {
             handle_acp_open(conn, reader, &v, sessions, acp_sessions, event_hub)
         }
@@ -183,6 +186,7 @@ pub(crate) fn handle_conn<C: ClientSocket + crate::protocol::PeerSource>(
             &event_hub,
         ),
         DaemonOperation::AcpSnapshot => handle_acp_snapshot(conn, &v, &acp_sessions, &event_hub),
+        DaemonOperation::AcpDebug => handle_acp_debug(conn, &v, &acp_sessions),
         DaemonOperation::AcpSkills => handle_acp_skills(conn, &v, &acp_sessions),
         DaemonOperation::AcpSubmitInput => {
             handle_acp_submit_input(conn, &v, &acp_sessions, &workspace_directory, &event_hub)
@@ -209,14 +213,43 @@ pub(crate) fn handle_conn<C: ClientSocket + crate::protocol::PeerSource>(
         }
         DaemonOperation::Shutdown => handle_shutdown(conn),
         DaemonOperation::AgentEvent => handle_agent_event_op(conn, &v, &sessions, &event_hub),
-        DaemonOperation::Action => handle_action(conn, &v, &sessions),
-        DaemonOperation::Input => handle_raw_input(conn, &v, &sessions),
+        DaemonOperation::Action => handle_action(conn, &v, &sessions, &event_hub),
+        DaemonOperation::Input => handle_raw_input(conn, &v, &sessions, &event_hub),
         DaemonOperation::Resize => handle_resize(conn, &v, &sessions),
         DaemonOperation::DesktopAttach => {
             crate::desktop::handle_desktop_attach(conn, reader, &crate::desktop::vnc_endpoint())
         }
         DaemonOperation::RuntimeUpgrade => crate::runtime_upgrade::handle_runtime_upgrade(conn, &v),
     }
+}
+
+/// 本机桌面交回的回执（外观修改、App 命令）：只收签过名的本机桌面，`respond` 再核对是
+/// 不是收到请求的那个进程。回 `{"ok": true}` 或带原因的 `{"ok": false}`。
+fn handle_desktop_receipt<C, R>(
+    mut conn: C,
+    payload: &serde_json::Value,
+    principal: &Principal,
+    respond: impl FnOnce(&PeerIdentity, R) -> Result<(), String>,
+) where
+    C: ClientSocket + crate::protocol::PeerSource,
+    R: serde::de::DeserializeOwned,
+{
+    let result = (|| {
+        if principal.is_remote() {
+            return Err("Receipts are only accepted from the local desktop".to_string());
+        }
+        let peer = conn.peer_identity()?;
+        authenticate_first_party_desktop(&peer)?;
+        let receipt: R =
+            serde_json::from_value(payload.get("receipt").cloned().ok_or("missing receipt")?)
+                .map_err(|error| error.to_string())?;
+        respond(&peer, receipt)
+    })();
+    let reply = match result {
+        Ok(()) => serde_json::json!({"ok": true}),
+        Err(error) => serde_json::json!({"ok": false, "error": error}),
+    };
+    let _ = smelt_runtime_client::protocol::write_json_line(&mut conn, &reply);
 }
 
 /// 控制请求回一个带 request_id 的 PermissionDenied，客户端能看懂；其余 op 直接断开。
@@ -241,9 +274,9 @@ fn reject_unpaired<C: ClientSocket>(
         smelt_runtime_client::protocol::control::ControlResponse::<()>::error_with_version(
             version,
             request_id,
-            smelt_runtime_client::protocol::control::ControlError::new(
+            smelt_runtime_client::protocol::control::ControlError::because(
                 smelt_runtime_client::protocol::control::ControlErrorCode::PermissionDenied,
-                "这台设备还没有配对",
+                smelt_runtime_client::protocol::control::ControlReason::DeviceNotPaired,
             ),
         );
     let _ = smelt_runtime_client::protocol::write_json_line(&mut conn, &response);

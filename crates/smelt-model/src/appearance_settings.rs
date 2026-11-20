@@ -4,18 +4,14 @@
 /// 一份完整外观。字段名和桌面的外观结构一致，取值规则见 [`apply_patch`]。
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppearanceSnapshot {
-    pub bg_color: u32,
     pub bg_image: Option<String>,
     pub bg_image_opacity: f32,
-    pub opacity: f32,
-    pub blur: bool,
-    pub glass_style: String,
     pub theme_mode: String,
-    /// 主题注册名，例如 `Default Dark`、`Ayu Light`。
+    /// 主题注册名，例如 `smelt Dark`、`Ayu Light`。
     pub theme_name: String,
     pub ui_font_px: u32,
     pub ui_font_family: String,
-    pub font_px: u32,
+    /// 等宽字体（代码、终端）。终端字号归终端插件，不在外观里。
     pub font_family: String,
 }
 
@@ -33,23 +29,11 @@ pub const UI_FONT_PX: &str = "appearance.ui_font_px";
 
 pub const UI_FONT_FAMILY: &str = "appearance.ui_font_family";
 
-pub const FONT_PX: &str = "appearance.font_px";
-
 pub const FONT_FAMILY: &str = "appearance.font_family";
-
-pub const OPACITY: &str = "appearance.opacity";
 
 pub const MIN_UI_FONT_PX: u32 = 14;
 
 pub const MAX_UI_FONT_PX: u32 = 26;
-
-pub const MIN_FONT_PX: u32 = 9;
-
-pub const MAX_FONT_PX: u32 = 22;
-
-pub const MIN_OPACITY: f32 = 0.3;
-
-pub const MAX_OPACITY: f32 = 1.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettingsError {
@@ -116,20 +100,22 @@ pub fn apply_patch(
     Ok(())
 }
 
+/// 背景图出厂透明度。背景图铺满整扇窗口、压在所有字下面，15% 看得出图，又不和字抢。
+pub const DEFAULT_BG_IMAGE_OPACITY: f32 = 0.15;
+
+/// 背景图不透明度的上限。字色按窗口底配，不按图配；图压到三成以内，再亮再暗的图也压不坏
+/// 字的对比。存着更高值的旧设置读出来按它截。
+pub const MAX_BG_IMAGE_OPACITY: f32 = 0.30;
+
 /// 库里还没有外观记录时的默认值，GUI 与 CLI / Control API 共用这一份。
 pub fn default_snapshot() -> AppearanceSnapshot {
     AppearanceSnapshot {
-        bg_color: 0x1a1b26,
         bg_image: None,
-        bg_image_opacity: 0.25,
-        opacity: 0.95,
-        blur: true,
-        glass_style: "regular".into(),
+        bg_image_opacity: DEFAULT_BG_IMAGE_OPACITY,
         theme_mode: "dark".into(),
         theme_name: crate::theme_index::DEFAULT_DARK.into(),
         ui_font_px: 16,
         ui_font_family: String::new(),
-        font_px: 13,
         font_family: String::new(),
     }
 }
@@ -140,9 +126,7 @@ enum Change {
     ThemeName(String),
     UiFontPx(u32),
     UiFontFamily(String),
-    FontPx(u32),
     FontFamily(String),
-    Opacity(f32),
 }
 
 fn parse_change(key: &str, value: &Value) -> Result<Change, SettingsError> {
@@ -152,7 +136,7 @@ fn parse_change(key: &str, value: &Value) -> Result<Change, SettingsError> {
             Some("light") => Change::ThemeMode("light"),
             _ => {
                 return Err(SettingsError::Invalid(
-                    "appearance.theme_mode 只能是 dark 或 light".into(),
+                    rust_i18n::t!("settings.theme_mode_invalid", key = THEME_MODE).into_owned(),
                 ));
             }
         },
@@ -161,27 +145,20 @@ fn parse_change(key: &str, value: &Value) -> Result<Change, SettingsError> {
                 .as_str()
                 .map(str::trim)
                 .filter(|name| !name.is_empty() && name.len() <= 80)
-                .ok_or_else(|| SettingsError::Invalid("appearance.theme 必须是主题名".into()))?;
+                .ok_or_else(|| {
+                    SettingsError::Invalid(
+                        rust_i18n::t!("settings.theme_name_invalid", key = THEME_NAME).into_owned(),
+                    )
+                })?;
             Change::ThemeName(name.to_string())
         }
         UI_FONT_PX => Change::UiFontPx(u32_in(value, UI_FONT_PX, MIN_UI_FONT_PX, MAX_UI_FONT_PX)?),
         UI_FONT_FAMILY => Change::UiFontFamily(string_value(value, UI_FONT_FAMILY)?),
-        FONT_PX => Change::FontPx(u32_in(value, FONT_PX, MIN_FONT_PX, MAX_FONT_PX)?),
         FONT_FAMILY => Change::FontFamily(string_value(value, FONT_FAMILY)?),
-        OPACITY => {
-            let opacity = value
-                .as_f64()
-                .ok_or_else(|| SettingsError::Invalid("appearance.opacity 必须是数字".into()))?
-                as f32;
-            if !opacity.is_finite() || !(MIN_OPACITY..=MAX_OPACITY).contains(&opacity) {
-                return Err(SettingsError::Invalid(format!(
-                    "appearance.opacity 必须在 {MIN_OPACITY} 和 {MAX_OPACITY} 之间"
-                )));
-            }
-            Change::Opacity(opacity)
-        }
         other => {
-            return Err(SettingsError::Invalid(format!("未知设置: {other}")));
+            return Err(SettingsError::Invalid(
+                rust_i18n::t!("settings.unknown_key", key = other).into_owned(),
+            ));
         }
     })
 }
@@ -198,22 +175,27 @@ fn apply_change(
                 crate::theme_index::sibling_in(catalog, &snapshot.theme_name, mode);
         }
         Change::ThemeName(name) => {
-            let entry = crate::theme_index::find_in(catalog, &name)
-                .ok_or_else(|| SettingsError::Invalid(format!("未知主题: {name}")))?;
+            let entry = crate::theme_index::find_in(catalog, &name).ok_or_else(|| {
+                SettingsError::Invalid(
+                    rust_i18n::t!("settings.unknown_theme", name = name).into_owned(),
+                )
+            })?;
             if entry.mode != "dark" && entry.mode != "light" {
-                return Err(SettingsError::Invalid(format!(
-                    "主题 {name} 的明暗不是 dark 或 light: {}",
-                    entry.mode
-                )));
+                return Err(SettingsError::Invalid(
+                    rust_i18n::t!(
+                        "settings.theme_mode_unknown",
+                        name = name,
+                        mode = entry.mode
+                    )
+                    .into_owned(),
+                ));
             }
             snapshot.theme_name = entry.name.clone();
             snapshot.theme_mode = entry.mode.clone();
         }
         Change::UiFontPx(px) => snapshot.ui_font_px = px,
         Change::UiFontFamily(family) => snapshot.ui_font_family = family,
-        Change::FontPx(px) => snapshot.font_px = px,
         Change::FontFamily(family) => snapshot.font_family = family,
-        Change::Opacity(opacity) => snapshot.opacity = opacity,
     }
     Ok(())
 }
@@ -222,22 +204,25 @@ fn u32_in(value: &Value, key: &str, min: u32, max: u32) -> Result<u32, SettingsE
     let number = value
         .as_u64()
         .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
-        .ok_or_else(|| SettingsError::Invalid(format!("{key} 必须是整数")))?;
-    let number =
-        u32::try_from(number).map_err(|_| SettingsError::Invalid(format!("{key} 超出范围")))?;
+        .ok_or_else(|| {
+            SettingsError::Invalid(rust_i18n::t!("settings.not_integer", key = key).into_owned())
+        })?;
+    let out_of_range = || {
+        SettingsError::Invalid(
+            rust_i18n::t!("settings.out_of_range", key = key, min = min, max = max).into_owned(),
+        )
+    };
+    let number = u32::try_from(number).map_err(|_| out_of_range())?;
     if number < min || number > max {
-        return Err(SettingsError::Invalid(format!(
-            "{key} 必须在 {min} 和 {max} 之间"
-        )));
+        return Err(out_of_range());
     }
     Ok(number)
 }
 
 fn string_value(value: &Value, key: &str) -> Result<String, SettingsError> {
-    value
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| SettingsError::Invalid(format!("{key} 必须是字符串")))
+    value.as_str().map(str::to_string).ok_or_else(|| {
+        SettingsError::Invalid(rust_i18n::t!("settings.not_string", key = key).into_owned())
+    })
 }
 
 #[cfg(test)]
@@ -247,8 +232,8 @@ mod tests {
 
     fn catalog() -> Vec<ThemeEntry> {
         vec![
-            ThemeEntry::new("Default Dark", "dark", "Default"),
-            ThemeEntry::new("Default Light", "light", "Default"),
+            ThemeEntry::new(crate::theme_index::DEFAULT_DARK, "dark", "smelt"),
+            ThemeEntry::new(crate::theme_index::DEFAULT_LIGHT, "light", "smelt"),
             ThemeEntry::new("Plug Night", "dark", "Plug"),
             ThemeEntry::new("Plug Day", "light", "Plug"),
             ThemeEntry::new("Weird", "sepia", "Weird"),
@@ -271,8 +256,8 @@ mod tests {
             patch(&[(THEME_NAME, json!("x".repeat(81)))]),
             patch(&[(THEME_MODE, json!("sepia"))]),
             patch(&[(UI_FONT_PX, json!(MAX_UI_FONT_PX + 1))]),
-            patch(&[(FONT_PX, json!(-1))]),
-            patch(&[(OPACITY, json!(0.1))]),
+            // 终端字号归了终端插件，外观不再认这个键。
+            patch(&[("appearance.font_px", json!(13))]),
             patch(&[(FONT_FAMILY, json!(1))]),
             patch(&[("appearance.nope", json!(1))]),
         ] {

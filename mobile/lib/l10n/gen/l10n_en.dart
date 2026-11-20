@@ -38,7 +38,7 @@ class L10nEn extends L10n {
   }
 
   @override
-  String get agentEditPluginsNone => 'No plugins on this machine.';
+  String get agentEditPluginsNone => 'No skills or extensions on this machine.';
 
   @override
   String get agentEditMissing => 'No longer on this machine';
@@ -54,7 +54,7 @@ class L10nEn extends L10n {
 
   @override
   String agentEditChoicesFailed(String message) {
-    return 'Couldn\'t read this machine\'s capability library, so models, plugins and MCP may be incomplete: $message';
+    return 'Couldn\'t read this machine\'s capability library, so models, skills, extensions and MCP may be incomplete: $message';
   }
 
   @override
@@ -240,7 +240,7 @@ class L10nEn extends L10n {
   String get agentsNoPrompt => 'No standing instructions.';
 
   @override
-  String get agentsPlugins => 'Plugins';
+  String get agentsPlugins => 'Skills & Extensions';
 
   @override
   String get agentsContext => 'Context';
@@ -1127,7 +1127,7 @@ class L10nEn extends L10n {
   }
 
   @override
-  String get conversationStatusEnded => 'Session ended';
+  String get conversationStatusEnded => 'Stopped';
 
   @override
   String get conversationStatusCompacting => 'Compacting context…';
@@ -1146,9 +1146,6 @@ class L10nEn extends L10n {
 
   @override
   String get conversationHintTicket => 'Handle the ticket above first';
-
-  @override
-  String get conversationHintEnded => 'This session has ended';
 
   @override
   String get conversationHintSending => 'Waiting for the machine to confirm…';
@@ -1310,6 +1307,12 @@ class L10nEn extends L10n {
 
   @override
   String get conversationMemoryEmptyBody => '(empty)';
+
+  @override
+  String get conversationAskSkipped => 'Skipped';
+
+  @override
+  String get conversationAskUnanswered => 'Not answered';
 
   @override
   String get filesTitle => 'Files';
@@ -1931,7 +1934,7 @@ class L10nEn extends L10n {
   String get elicitationDismiss => 'Skip';
 
   @override
-  String get elicitationRequired => 'Required';
+  String get elicitationOtherAnswer => 'Other answer…';
 
   @override
   String get elicitationOpenLink => 'Open link';

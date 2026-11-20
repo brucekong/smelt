@@ -158,6 +158,16 @@ class RecordingBackend extends DemoBackend {
   }
 
   @override
+  Future<void> chooseElicitation(
+    String runtimeId,
+    String sessionId, {
+    required int fieldIndex,
+    required int optionIndex,
+  }) async {
+    calls.add('choose $fieldIndex:$optionIndex');
+  }
+
+  @override
   Future<void> submitElicitation(
     String runtimeId,
     String sessionId,
@@ -221,6 +231,7 @@ ConversationEntry entry(
   String text = '',
   bool thought = false,
   ToolCallView? tool,
+  AskView? ask,
 }) => ConversationEntry(
   index: index,
   kind: kind,
@@ -228,6 +239,7 @@ ConversationEntry entry(
   thought: thought,
   images: const [],
   toolCall: tool,
+  ask: ask,
 );
 
 ToolCallView tool(

@@ -16,12 +16,12 @@
       }
     }
   },
-  "agentEditPluginsNone": "No plugins on this machine.",
+  "agentEditPluginsNone": "No skills or extensions on this machine.",
   "agentEditMissing": "No longer on this machine",
   "agentEditMcp": "MCP",
   "agentEditMcpNone": "No MCP servers on this machine.",
   "agentEditMcpDisabled": "Turned off in the capability library",
-  "agentEditChoicesFailed": "Couldn't read this machine's capability library, so models, plugins and MCP may be incomplete: {message}",
+  "agentEditChoicesFailed": "Couldn't read this machine's capability library, so models, skills, extensions and MCP may be incomplete: {message}",
   "@agentEditChoicesFailed": {
     "placeholders": {
       "message": {
@@ -183,7 +183,7 @@
   },
   "agentsPrompt": "Standing instructions",
   "agentsNoPrompt": "No standing instructions.",
-  "agentsPlugins": "Plugins",
+  "agentsPlugins": "Skills & Extensions",
   "agentsContext": "Context",
   "agentsEdit": "Edit",
   "agentsMemories": "Memories",
@@ -767,7 +767,7 @@
       }
     }
   },
-  "conversationStatusEnded": "Session ended",
+  "conversationStatusEnded": "Stopped",
   "conversationStatusCompacting": "Compacting context…",
   "conversationNoticeDismiss": "Dismiss notice",
   "conversationHint": "Message {agent}",
@@ -780,7 +780,6 @@
   },
   "conversationHintOffline": "Machine is offline. Your draft is kept.",
   "conversationHintTicket": "Handle the ticket above first",
-  "conversationHintEnded": "This session has ended",
   "conversationHintSending": "Waiting for the machine to confirm…",
   "conversationSend": "Send",
   "conversationStop": "Stop this turn",
@@ -910,6 +909,8 @@
     }
   },
   "conversationMemoryEmptyBody": "(empty)",
+  "conversationAskSkipped": "Skipped",
+  "conversationAskUnanswered": "Not answered",
   "filesTitle": "Files",
   "filesOpen": "Project files",
   "filesSearchHint": "Search file names and contents",
@@ -1393,7 +1394,7 @@
   "approvalRejectAlways": "Always deny",
   "elicitationSubmit": "Send answer",
   "elicitationDismiss": "Skip",
-  "elicitationRequired": "Required",
+  "elicitationOtherAnswer": "Other answer…",
   "elicitationOpenLink": "Open link",
   "elicitationTextHint": "Type your answer",
   "pushSection": "Notifications",

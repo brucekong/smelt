@@ -28,6 +28,12 @@ use serde::{Deserialize, Serialize};
 
 use std::{fmt, str::FromStr};
 
+// 运行时自己说的话的文案（note.rs，见 docs/i18n.md）。
+rust_i18n::i18n!("locales", fallback = "en");
+
+mod note;
+pub use note::{ConversationEndReason, SessionNote, SignInAgent, TurnFailure};
+
 /// v2：跨 Agent 消息下线，持久投递随之删掉（它是唯一的使用者）：订阅不再声明 `delivery`、
 /// 不带 `cursor`，没有 ack / nack 和 `cursor` 消息，`SessionStateChanged` 去掉 `agent_mcp`。
 /// 载荷都是 `deny_unknown_fields`，新旧两边谁也解不了谁，所以整条事件协议升版，在订阅
@@ -74,8 +80,7 @@ pub const CORE_TOPIC_AUTOMATIONS_CHANGED: &str = "automations.changed";
 /// 对话的启动规格归桌面端所有，daemon 只能把请求转给它。
 pub const CORE_TOPIC_CONVERSATION_WAKE_REQUESTED: &str = "conversation.wake_requested";
 /// 项目目录里的文件变了（已滤掉构建产物、依赖目录）。只在客户端用 `project.watch`
-/// 关注过的项目上发；客户端据此重取 git 状态、文件树。用 `git.watch_head` 关注过的
-/// 目录，所在仓库切了分支时也发，`root` 是当初登记的那个目录。
+/// 关注过的项目上发；客户端据此重取 git 状态、文件树。
 pub const CORE_TOPIC_PROJECT_CHANGED: &str = "project.changed";
 /// 智能体的记忆目录里有文件变了。只在客户端用 `agent.memory.watch` 关注过的智能体上发；
 /// 客户端据此重取记忆列表。
@@ -93,9 +98,24 @@ pub const CORE_TOPIC_APPEARANCE_CHANGE_REQUESTED: &str = "appearance.change_requ
 /// 回执。加在 v7 之后、没有升版本，所以不进核心订阅，只放在单独的一条订阅里（同
 /// [`PiConfigChanged`]），不认识该话题的旧运行时只会拒掉那一条。
 pub const CORE_TOPIC_APPEARANCE_APPLY_REQUESTED: &str = "appearance.apply_requested";
+/// 命令行要列出或执行本机 App 登记的命令，载荷 [`AppCommandRequested`]，桌面用
+/// [`AppCommandReceipt`] 回执。和带回执的外观修改一样单独订阅、不进核心订阅，不升版本。
+pub const CORE_TOPIC_APP_COMMAND_REQUESTED: &str = "app.command_requested";
 /// 终端里的程序用 OSC 9 / 99 / 777 发了一条通知。运行时在 PTY 字节流上扫一次，
 /// 会话已有结构化 hook 事件时不发；没人连着时发生的就丢了，不补。
 pub const CORE_TOPIC_TERMINAL_NOTIFICATION: &str = "terminal.notification";
+/// 一段会话的提醒变了（[`AttentionChanged`]），带快照 [`CORE_SNAPSHOT_ATTENTION`]。
+///
+/// 加在事件协议 v7 之后、没有升版本，所以只放在单独的一条订阅里，v7 的运行时会拒掉那一条，
+/// 那台机器上就没有提醒。
+pub const CORE_TOPIC_ATTENTION_CHANGED: &str = "attention.changed";
+/// 那台机器的智能体配置（自定义 Agent、智能体定义、环境变量、hook 开关）变了，载荷是改完的
+/// 整份 `smelt_model::agent_host::AgentHostSettings`（同 `agent.host.get` 的结果），带快照
+/// [`CORE_SNAPSHOT_AGENT_HOST`]。配置只有运行时写，谁改的都发；客户端只留这一份，不另读。
+///
+/// 加在事件协议 v7 之后、没有升版本，同 [`CORE_TOPIC_ATTENTION_CHANGED`] 只放在单独的一条
+/// 订阅里；v7 的运行时会拒掉那一条，那台机器的智能体配置要等它升级后才可用。
+pub const CORE_TOPIC_AGENT_HOST_CHANGED: &str = "agent_host.changed";
 /// 终端里的程序用 OSC 9;4（ConEmu 进度）报的进度变了。运行时变了就发，进度条还在时
 /// 每 5 秒重发一次（后连上的客户端据此补齐），15 秒没新报告就清掉。不进会话投影。
 pub const CORE_TOPIC_TERMINAL_PROGRESS: &str = "terminal.progress";
@@ -108,10 +128,14 @@ pub const CORE_CAPABILITY_AUTOMATION_READ: &str = "automation.read";
 pub const CORE_CAPABILITY_CONVERSATION_WAKE: &str = "conversation.wake";
 /// 接收外观修改请求。只有自己持有外观的桌面端该拿：运行时据此判断有没有人能接。
 pub const CORE_CAPABILITY_APPEARANCE_CONTROL: &str = "appearance.control";
+/// 接收命令行转来的 App 命令（列出、执行）。只有登记着命令的本机桌面该拿。
+pub const CORE_CAPABILITY_APP_COMMAND: &str = "app.command";
 
 pub const CORE_SNAPSHOT_SESSIONS: &str = "core.sessions.v1";
 pub const CORE_SNAPSHOT_WORKSPACE: &str = "core.workspace.v1";
 pub const CORE_SNAPSHOT_AUTOMATIONS: &str = "core.automations.v1";
+pub const CORE_SNAPSHOT_ATTENTION: &str = "core.attention.v1";
+pub const CORE_SNAPSHOT_AGENT_HOST: &str = "core.agent_host.v1";
 
 pub const FIRST_PARTY_DESKTOP_PLUGIN_ID: &str = "core.desktop";
 
@@ -443,6 +467,14 @@ pub struct SessionStateChanged {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_title: Option<String>,
     pub title: Option<String>,
+    /// 各端显示的这段对话的名字（侧栏的对话行、菜单栏）：运行时按工作区目录、用户改的名、
+    /// 会话名、智能体定义现算好，同一段对话里每一格都是同一个值。客户端直接显示，不再自己
+    /// 拼。不在工作区目录里的会话、旧运行时没有，客户端显示通用名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_name: Option<String>,
+    /// 这一格自己的名字（分屏的子行、手机上的一格）。只有一格时和 `conversation_name` 相同。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub phase: CoreSessionPhase,
     #[serde(rename = "phase_since")]
     pub phase_since_unix_seconds: u64,
@@ -451,11 +483,22 @@ pub struct SessionStateChanged {
     #[serde(rename = "turn_started_at", default)]
     pub turn_started_at_unix_seconds: u64,
     pub pending_question: Option<String>,
+    /// `pending_question` 是运行时自己说的话时，它的种类和参数，客户端按自己的语言说
+    /// （[`SessionNote::text`]）；此时 `pending_question` 是运行时按英文说的同一句，给旧客户端
+    /// 兜底。智能体的原话没有。旧运行时不报。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_note: Option<SessionNote>,
     /// 对话会话正在等的那个请求的身份：`permission:<请求 id>` 或
     /// `elicitation:<卡片 id>`。变了就是换了一个请求；终端会话没有。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_request: Option<String>,
+    /// 最近结束的那轮对应的外部投递（`conversation.prompt` 的 `delivery_id`）；用户自己说的
+    /// 那轮是 None。投递方看到自己的 id 就去 `conversation.turn_result` 取结果。旧运行时不报。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_delivery_id: Option<String>,
     pub tokens_used: Option<u64>,
+    /// 会话目录所在仓库的当前分支，运行时监听 HEAD 维护，切了分支会再推一次。不是 git
+    /// 仓库、仓库还没有提交是 None，分离头指针是 `HEAD`。旧运行时不报。
     pub branch: Option<String>,
     pub dirty_files: Vec<String>,
     #[serde(rename = "updated_at")]
@@ -532,6 +575,123 @@ pub struct TerminalNotification {
     pub message: String,
 }
 
+/// 要告诉用户的一件事是什么。会增长：认不出的值读成 [`Self::Unknown`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    /// 等你批准。
+    Approval,
+    /// 等你回答或继续。
+    Input,
+    /// 这一轮做完了。
+    Success,
+    /// 这一轮失败了。
+    Failure,
+    /// 终端响铃。
+    Bell,
+    /// 终端程序的 OSC 通知，或智能体主动发的消息。
+    Notice,
+    /// 比这个客户端新的运行时报的类型。按 [`Self::Notice`] 对待。
+    #[serde(other)]
+    Unknown,
+}
+
+impl AttentionKind {
+    /// 按当前语言说的种类名；终端通知、响铃这些用来源给的标题，没有自己的名字。
+    pub fn label(&self) -> Option<String> {
+        let label = match self {
+            Self::Approval => rust_i18n::t!("attention.approval"),
+            Self::Input => rust_i18n::t!("attention.input"),
+            Self::Success => rust_i18n::t!("attention.success"),
+            Self::Failure => rust_i18n::t!("attention.failure"),
+            Self::Bell | Self::Notice | Self::Unknown => return None,
+        };
+        Some(label.into_owned())
+    }
+}
+
+/// 没有名字的会话在提醒里怎么称呼：按当前语言说「会话」加 id 的开头。
+pub fn unnamed_session(id: &str) -> String {
+    let short = id.get(..8).unwrap_or(id);
+    rust_i18n::t!("attention.unnamed_session", id = short).into_owned()
+}
+
+impl AttentionKind {
+    /// 等用户处理的事：等批准、等输入、失败。看过也不算完，会话往下走了才算。
+    pub fn requires_action(self) -> bool {
+        matches!(self, Self::Approval | Self::Input | Self::Failure)
+    }
+}
+
+/// 一条提醒。给人看用 [`AttentionItem::title_text`]、[`AttentionItem::message_text`]。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionItem {
+    pub kind: AttentionKind,
+    /// 短标题：等批准、等输入、完成、失败这几种是运行时按英文说的种类名（客户端按种类自己说），
+    /// 其余是来源给的标题（终端通知的标题、智能体的名字）。
+    pub title: String,
+    /// 一行内容：等批准的命令、等回答的问题、失败原因、通知正文。有 `note` 时是它按英文说的
+    /// 同一句，给旧客户端兜底。
+    pub message: String,
+    /// `message` 是运行时自己说的话时，它的种类和参数。旧运行时不报。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<SessionNote>,
+}
+
+impl AttentionItem {
+    /// 按当前语言说的标题：种类有自己的名字就用它，否则是来源给的标题。
+    pub fn title_text(&self) -> String {
+        self.kind.label().unwrap_or_else(|| self.title.clone())
+    }
+
+    /// 按当前语言说的内容：运行时自己说的话按种类说，其余原样。
+    pub fn message_text(&self) -> String {
+        self.note
+            .as_ref()
+            .and_then(SessionNote::text)
+            .unwrap_or_else(|| self.message.clone())
+    }
+}
+
+/// 一段会话此刻的提醒。两样都没有的会话不在快照里。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttention {
+    pub session_id: String,
+    /// 等你处理的事（等批准、等输入、失败）。看过也留着，会话往下走了才清掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<AttentionItem>,
+    /// 最近一条还没看过的提醒，可能就是上面那件事。哪台设备上看过、在终端里打字、在对话里
+    /// 回复，都算看过。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<AttentionItem>,
+}
+
+impl SessionAttention {
+    pub fn is_empty(&self) -> bool {
+        self.action.is_none() && self.unread.is_none()
+    }
+}
+
+/// [`CORE_SNAPSHOT_ATTENTION`] 的载荷：所有有提醒的会话。只在内存里：运行时重启后从空开始，
+/// 重启前的提醒不补。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionSnapshot {
+    pub revision: u64,
+    pub sessions: Vec<SessionAttention>,
+}
+
+/// [`CORE_TOPIC_ATTENTION_CHANGED`] 的载荷。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionChanged {
+    pub revision: u64,
+    /// 这段会话现在的提醒，整份替换。空的就是没有了（看过、处理掉、会话删了）。
+    pub session: SessionAttention,
+    /// 刚来、该响一下的那条（系统通知、推送）。快照里没有：后连上的客户端不补响。同一段会话
+    /// 同样的提醒 60 秒内只响一次。自动化运行的会话、命令行发的消息不进会话提醒，只有这一项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert: Option<AttentionItem>,
+}
+
 /// 会增长：认不出的值读成 [`Self::Unknown`]。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -585,6 +745,41 @@ pub enum AppearanceApplyOutcome {
 pub struct AppearanceApplyReceipt {
     pub request_id: String,
     pub outcome: AppearanceApplyOutcome,
+}
+
+/// 单播给本机桌面的 App 命令请求（独立订阅）；请求 id 用来关联回执。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppCommandRequested {
+    pub request_id: String,
+    pub request: AppCommandRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AppCommandRequest {
+    /// 列出开给命令行的命令。
+    List,
+    /// 执行一条开给命令行的命令。
+    Run {
+        command: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AppCommandOutcome {
+    /// 做完了。列出时是命令表，执行时是命令交回的值（没有就是 `null`）。
+    Done { value: serde_json::Value },
+    /// 没做成，`message` 是给人看的原因（桌面按自己的语言说）。
+    Failed { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppCommandReceipt {
+    pub request_id: String,
+    pub outcome: AppCommandOutcome,
 }
 
 pub fn core_topic_descriptors() -> Result<Vec<TopicDescriptor>, ValidationError> {
@@ -649,6 +844,12 @@ pub fn core_topic_descriptors() -> Result<Vec<TopicDescriptor>, ValidationError>
             4 * 1024,
         )?,
         descriptor(
+            CORE_TOPIC_APP_COMMAND_REQUESTED,
+            CORE_CAPABILITY_APP_COMMAND,
+            None,
+            64 * 1024,
+        )?,
+        descriptor(
             CORE_TOPIC_PROJECT_CHANGED,
             CORE_CAPABILITY_WORKSPACE_READ,
             None,
@@ -684,6 +885,20 @@ pub fn core_topic_descriptors() -> Result<Vec<TopicDescriptor>, ValidationError>
             CORE_CAPABILITY_SESSION_READ,
             None,
             4 * 1024,
+        )?,
+        // 两条提醒，各自的正文最多 4096 字节（扫描器上限），JSON 转义后可能翻倍。
+        descriptor(
+            CORE_TOPIC_ATTENTION_CHANGED,
+            CORE_CAPABILITY_SESSION_READ,
+            Some(CORE_SNAPSHOT_ATTENTION),
+            48 * 1024,
+        )?,
+        // 智能体定义带着系统提示词、技能和环境变量，和自动化定义同一个量级。
+        descriptor(
+            CORE_TOPIC_AGENT_HOST_CHANGED,
+            CORE_CAPABILITY_WORKSPACE_READ,
+            Some(CORE_SNAPSHOT_AGENT_HOST),
+            1024 * 1024,
         )?,
     ])
 }
@@ -921,6 +1136,7 @@ mod tests {
         assert_eq!(state.conversation_id, None);
         assert_eq!(state.custom_title, None);
         assert_eq!(state.pending_request, None);
+        assert_eq!(state.completed_delivery_id, None);
     }
 
     #[test]
@@ -974,12 +1190,23 @@ mod tests {
             (CORE_TOPIC_CONVERSATION_WAKE_REQUESTED, None, 1),
             (CORE_TOPIC_APPEARANCE_CHANGE_REQUESTED, None, 1),
             (CORE_TOPIC_APPEARANCE_APPLY_REQUESTED, None, 1),
+            (CORE_TOPIC_APP_COMMAND_REQUESTED, None, 1),
             (CORE_TOPIC_PROJECT_CHANGED, None, 1),
             (CORE_TOPIC_AGENT_MEMORY_CHANGED, None, 1),
             (CORE_TOPIC_PI_CONFIG_CHANGED, None, 1),
             (CORE_TOPIC_HISTORY_CHANGED, None, 1),
             (CORE_TOPIC_TERMINAL_NOTIFICATION, None, 1),
             (CORE_TOPIC_TERMINAL_PROGRESS, None, 1),
+            (
+                CORE_TOPIC_ATTENTION_CHANGED,
+                Some(CORE_SNAPSHOT_ATTENTION),
+                1,
+            ),
+            (
+                CORE_TOPIC_AGENT_HOST_CHANGED,
+                Some(CORE_SNAPSHOT_AGENT_HOST),
+                1,
+            ),
         ];
         assert_eq!(descriptors.len(), expected.len());
         for (topic, snapshot, schema_version) in expected {
@@ -1030,6 +1257,58 @@ mod tests {
             let encoded = serde_json::to_value(&receipt).unwrap();
             assert_eq!(
                 serde_json::from_value::<AppearanceApplyReceipt>(encoded).unwrap(),
+                receipt
+            );
+        }
+    }
+
+    #[test]
+    fn app_command_requests_and_receipts_round_trip() {
+        let request = AppCommandRequested {
+            request_id: "request-1".into(),
+            request: AppCommandRequest::Run {
+                command: "smelt.app/open-view".into(),
+                args: json!({ "view": "hello/main" }),
+            },
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "request_id": "request-1",
+                "request": {
+                    "kind": "run",
+                    "command": "smelt.app/open-view",
+                    "args": { "view": "hello/main" },
+                },
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<AppCommandRequested>(encoded).unwrap(),
+            request
+        );
+        // 不带参数的执行读成 `null`。
+        assert_eq!(
+            serde_json::from_value::<AppCommandRequest>(json!({ "kind": "run", "command": "a/b" }))
+                .unwrap(),
+            AppCommandRequest::Run {
+                command: "a/b".into(),
+                args: serde_json::Value::Null,
+            }
+        );
+        for outcome in [
+            AppCommandOutcome::Done { value: json!(true) },
+            AppCommandOutcome::Failed {
+                message: "没有这条命令".into(),
+            },
+        ] {
+            let receipt = AppCommandReceipt {
+                request_id: "request-1".into(),
+                outcome,
+            };
+            let encoded = serde_json::to_value(&receipt).unwrap();
+            assert_eq!(
+                serde_json::from_value::<AppCommandReceipt>(encoded).unwrap(),
                 receipt
             );
         }

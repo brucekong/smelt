@@ -11,13 +11,12 @@ use crate::agent_definition_store::{
 use crate::automation::{
     AUTOMATION_FILE_SCHEMA_VERSION, Automation, AutomationAction, AutomationCommand,
     AutomationCommandResult, AutomationEventPublished, AutomationFile, AutomationInboundEvent,
-    AutomationRun, AutomationRunSource, AutomationRunStatus, AutomationState, MAX_RUN_ERROR_BYTES,
-    MAX_RUN_OUTPUT_BYTES, apply_automation_command, claim_due_automations, prune_runs,
-    publish_automation_event,
+    AutomationProblem, AutomationRun, AutomationRunFailure, AutomationRunSource,
+    AutomationRunStatus, AutomationState, MAX_RUN_ERROR_BYTES, MAX_RUN_OUTPUT_BYTES,
+    apply_automation_command, claim_due_automations, prune_runs, publish_automation_event,
 };
 use crate::automation_transcript::save_run_transcript_on;
 use chrono::{DateTime, Duration, Local, Offset, TimeZone};
-use sha2::{Digest, Sha256};
 
 const AUTOMATION_DOCUMENT: &str = "automations.json";
 
@@ -43,6 +42,44 @@ pub struct AutomationEventApplied {
     pub snapshot: AutomationFile,
     pub changed: bool,
 }
+
+/// 改自动化、触发一次没成。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutomationError {
+    /// 自动化本身哪里不对，用户改了就能过；客户端按种类说。
+    Problem(AutomationProblem),
+    /// 外部触发的令牌对不上任何自动化。
+    UnknownWebhook,
+    /// 自动化暂停着，外部触发不跑。
+    Paused,
+    /// 存储、智能体执行上下文出错，说明原样给。
+    Failed(String),
+}
+
+impl From<AutomationProblem> for AutomationError {
+    fn from(problem: AutomationProblem) -> Self {
+        Self::Problem(problem)
+    }
+}
+
+impl From<String> for AutomationError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl std::fmt::Display for AutomationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Problem(problem) => write!(f, "{problem}"),
+            Self::UnknownWebhook => f.write_str("unknown webhook"),
+            Self::Paused => f.write_str("automation is paused"),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for AutomationError {}
 
 pub struct AutomationOwner {
     file: AutomationFile,
@@ -90,7 +127,7 @@ impl AutomationOwner {
         let Some(storage_path) = path.clone() else {
             return Self {
                 file: AutomationFile {
-                    store_error: Some("无法确定自动化存储路径".to_string()),
+                    store_error: Some("can't determine the automation store path".to_string()),
                     ..Default::default()
                 },
                 path,
@@ -107,7 +144,9 @@ impl AutomationOwner {
                 Err(error) => {
                     return Self {
                         file: AutomationFile {
-                            store_error: Some(format!("打开自动化 SQLite 失败: {error}")),
+                            store_error: Some(format!(
+                                "couldn't open the automation SQLite store: {error}"
+                            )),
                             ..Default::default()
                         },
                         path,
@@ -149,6 +188,7 @@ impl AutomationOwner {
                     .collect::<Vec<_>>();
                 let normalized =
                     assign_managed_workspaces(&mut file, workspaces.as_ref(), automation_ids)
+                        .map_err(|error| error.to_string())
                         .and_then(|()| {
                             normalize_loaded_file(&mut file, now, &timezone_fingerprint)
                         });
@@ -158,7 +198,7 @@ impl AutomationOwner {
                         if should_persist {
                             let Some(next_revision) = file.revision.checked_add(1) else {
                                 file.store_error = Some(
-                                    "自动化存储 revision 已达上限，无法完成启动迁移".to_string(),
+                                    "the automation store revision hit its limit; the startup migration can't finish".to_string(),
                                 );
                                 return Self {
                                     file,
@@ -173,7 +213,9 @@ impl AutomationOwner {
                             if let Some(opened) = &store
                                 && let Err(error) = save_automation_document(opened, &file)
                             {
-                                file.store_error = Some(format!("更新自动化启动状态失败: {error}"));
+                                file.store_error = Some(format!(
+                                    "couldn't update the automation startup state: {error}"
+                                ));
                                 return Self {
                                     file,
                                     path,
@@ -252,12 +294,15 @@ impl AutomationOwner {
         &mut self,
         mut command: AutomationCommand,
         now: DateTime<Tz>,
-    ) -> Result<AutomationCommandApplied, String>
+    ) -> Result<AutomationCommandApplied, AutomationError>
     where
         Tz: TimeZone,
     {
         if matches!(&command, AutomationCommand::RunOnce { .. }) {
-            return Err("RunOnce 必须通过带智能体快照的提交入口".to_string());
+            return Err(AutomationError::Failed(
+                "RunOnce must go through the entry point that carries an agent snapshot"
+                    .to_string(),
+            ));
         }
         let mut candidate = self.file.clone();
         candidate.store_error = None;
@@ -294,7 +339,7 @@ impl AutomationOwner {
         &mut self,
         automation_id: String,
         now: DateTime<Tz>,
-    ) -> Result<AutomationCommandApplied, String>
+    ) -> Result<AutomationCommandApplied, AutomationError>
     where
         Tz: TimeZone,
     {
@@ -304,9 +349,12 @@ impl AutomationOwner {
             .iter()
             .find(|automation| automation.id == automation_id)
             .cloned()
-            .ok_or_else(|| "自动化不存在".to_string())?;
+            .ok_or(AutomationProblem::NotFound)?;
         if let Some(run) = self.file.active_run_for(&automation_id) {
-            return Err(format!("自动化已有运行中的 Run: {}", run.id));
+            return Err(AutomationProblem::AlreadyRunning {
+                run: run.id.clone(),
+            }
+            .into());
         }
         let execution = if let Some(agent_definition_id) = automation.agent_definition_id() {
             Some(load_agent_execution_definition(agent_definition_id)?)
@@ -321,7 +369,7 @@ impl AutomationOwner {
         automation_id: String,
         now: DateTime<Tz>,
         execution: &AgentExecutionDefinition,
-    ) -> Result<AutomationCommandApplied, String>
+    ) -> Result<AutomationCommandApplied, AutomationError>
     where
         Tz: TimeZone,
     {
@@ -333,7 +381,7 @@ impl AutomationOwner {
         automation_id: String,
         now: DateTime<Tz>,
         execution: Option<&AgentExecutionDefinition>,
-    ) -> Result<AutomationCommandApplied, String>
+    ) -> Result<AutomationCommandApplied, AutomationError>
     where
         Tz: TimeZone,
     {
@@ -385,7 +433,8 @@ impl AutomationOwner {
             .filter(|automation| automation.enabled)
             .map(|automation| automation.id.clone())
             .collect::<Vec<_>>();
-        assign_managed_workspaces(&mut candidate, self.workspaces.as_ref(), enabled_ids)?;
+        assign_managed_workspaces(&mut candidate, self.workspaces.as_ref(), enabled_ids)
+            .map_err(|error| error.to_string())?;
         let claimed = claim_due_automations(&mut candidate, now.clone());
         let mut runs = Vec::new();
         for claimed_run in claimed {
@@ -415,6 +464,7 @@ impl AutomationOwner {
                             .expect("claimed Run remains in candidate");
                         run.status = AutomationRunStatus::Failed;
                         run.finished_at = Some(now.timestamp());
+                        run.error_code = Some(AutomationRunFailure::AgentUnavailable);
                         run.error = bounded_text(error, MAX_RUN_ERROR_BYTES);
                         run.runtime_released_at = Some(now.timestamp());
                     }
@@ -445,7 +495,7 @@ impl AutomationOwner {
         &mut self,
         event: AutomationInboundEvent,
         now: DateTime<Tz>,
-    ) -> Result<AutomationEventApplied, String>
+    ) -> Result<AutomationEventApplied, AutomationError>
     where
         Tz: TimeZone,
     {
@@ -490,6 +540,7 @@ impl AutomationOwner {
                         .expect("published Run remains in candidate");
                     stored.status = AutomationRunStatus::Failed;
                     stored.finished_at = Some(now.timestamp());
+                    stored.error_code = Some(AutomationRunFailure::AgentUnavailable);
                     stored.error = bounded_text(error, MAX_RUN_ERROR_BYTES);
                     stored.runtime_released_at = Some(now.timestamp());
                 }
@@ -528,7 +579,7 @@ impl AutomationOwner {
         token: &str,
         payload: Option<serde_json::Value>,
         now: DateTime<Tz>,
-    ) -> Result<AutomationCommandApplied, String>
+    ) -> Result<AutomationCommandApplied, AutomationError>
     where
         Tz: TimeZone,
     {
@@ -536,9 +587,9 @@ impl AutomationOwner {
             .file
             .webhook_automation_for(token)
             .cloned()
-            .ok_or_else(|| "外部触发不存在".to_string())?;
+            .ok_or(AutomationError::UnknownWebhook)?;
         if !automation.enabled {
-            return Err("自动化已暂停".to_string());
+            return Err(AutomationError::Paused);
         }
         let automation_id = automation.id;
         let mut candidate = self.file.clone();
@@ -580,6 +631,7 @@ impl AutomationOwner {
                             .expect("webhook Run remains in candidate");
                         stored.status = AutomationRunStatus::Failed;
                         stored.finished_at = Some(now.timestamp());
+                        stored.error_code = Some(AutomationRunFailure::AgentUnavailable);
                         stored.error = bounded_text(error, MAX_RUN_ERROR_BYTES);
                         stored.runtime_released_at = Some(now.timestamp());
                     }
@@ -613,12 +665,12 @@ impl AutomationOwner {
         let workspaces = self.workspaces.clone();
         self.mutate_run(run_id, |run| {
             if run.status.is_terminal() {
-                return Err(format!("Run {} 已结束", run.id));
+                return Err(format!("Run {} has ended", run.id));
             }
             if let Some(existing) = run.context.engine_kind_id.as_deref()
                 && existing != execution.kind.id()
             {
-                return Err("Run 已绑定到不同的智能体执行引擎".to_string());
+                return Err("the run is bound to a different agent engine".to_string());
             }
             bind_run_context(run, execution, workspaces.as_ref());
             Ok(())
@@ -633,7 +685,7 @@ impl AutomationOwner {
     ) -> Result<AutomationFile, String> {
         self.mutate_run(run_id, |run| {
             if run.status != AutomationRunStatus::Starting {
-                return Err(format!("Run {} 已经进入 {:?}", run.id, run.status));
+                return Err(format!("Run {} is already {:?}", run.id, run.status));
             }
             run.status = AutomationRunStatus::Queued;
             run.session_id = Some(session_id);
@@ -649,7 +701,7 @@ impl AutomationOwner {
         now: i64,
     ) -> Result<AutomationFile, String> {
         if !status.is_active() || status == AutomationRunStatus::Starting {
-            return Err(format!("不能把活跃 Run 归约为 {status:?}"));
+            return Err(format!("can't reduce an active run to {status:?}"));
         }
         self.mutate_run(run_id, |run| {
             if run.status.is_terminal() {
@@ -680,7 +732,7 @@ impl AutomationOwner {
                 return Ok(());
             }
             if run.status != AutomationRunStatus::Dispatching {
-                return Err(format!("Run {} 当前不在投递边界", run.id));
+                return Err(format!("Run {} isn't at a delivery boundary", run.id));
             }
             run.status = AutomationRunStatus::Queued;
             run.delivery_attempt_at = Some(now);
@@ -693,12 +745,13 @@ impl AutomationOwner {
         run_id: &str,
         status: AutomationRunStatus,
         output: Option<String>,
+        error_code: Option<AutomationRunFailure>,
         error: Option<String>,
         provider_session_id: Option<String>,
         now: i64,
     ) -> Result<AutomationFile, String> {
         if !status.is_terminal() || status == AutomationRunStatus::Skipped {
-            return Err(format!("不能用 {status:?} 结束 Run"));
+            return Err(format!("can't end a run as {status:?}"));
         }
         self.mutate_run(run_id, |run| {
             if run.status.is_terminal() {
@@ -707,6 +760,7 @@ impl AutomationOwner {
             run.status = status;
             run.finished_at = Some(now);
             run.output = output.and_then(|value| bounded_text(value, MAX_RUN_OUTPUT_BYTES));
+            run.error_code = error_code;
             run.error = error.and_then(|value| bounded_text(value, MAX_RUN_ERROR_BYTES));
             if run.session_id.is_none() {
                 run.runtime_released_at = Some(now);
@@ -725,7 +779,7 @@ impl AutomationOwner {
     ) -> Result<AutomationFile, String> {
         self.mutate_run(run_id, |run| {
             if !run.status.is_terminal() {
-                return Err("仍在运行的 Run 不能释放 runtime".to_string());
+                return Err("a running run can't release its runtime".to_string());
             }
             run.runtime_released_at = Some(now);
             Ok(())
@@ -758,7 +812,7 @@ impl AutomationOwner {
             .runs
             .iter_mut()
             .find(|run| run.id == run_id)
-            .ok_or_else(|| format!("Run 不存在: {run_id}"))?;
+            .ok_or_else(|| format!("the run doesn't exist: {run_id}"))?;
         let before = run.clone();
         mutate(run)?;
         if *run == before {
@@ -771,18 +825,14 @@ impl AutomationOwner {
 
     fn commit(&mut self, mut candidate: AutomationFile) -> Result<(), String> {
         if !self.writable {
-            return Err(self
-                .file
-                .store_error
-                .clone()
-                .unwrap_or_else(|| "自动化存储当前不可安全写入".to_string()));
+            return Err(self.file.store_error.clone().unwrap_or_else(|| {
+                "the automation store can't be written safely right now".to_string()
+            }));
         }
         candidate.schema_version = AUTOMATION_FILE_SCHEMA_VERSION;
-        candidate.revision = self
-            .file
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| "自动化存储 revision 已达上限，拒绝覆盖状态".to_string())?;
+        candidate.revision = self.file.revision.checked_add(1).ok_or_else(|| {
+            "the automation store revision hit its limit; refusing to overwrite state".to_string()
+        })?;
         candidate.store_error = None;
         candidate.validate()?;
         candidate.webhook_base_url = None;
@@ -790,7 +840,7 @@ impl AutomationOwner {
             let store = self
                 .store
                 .as_ref()
-                .ok_or_else(|| "自动化 SQLite 未打开".to_string())?;
+                .ok_or_else(|| "the automation SQLite store isn't open".to_string())?;
             save_automation_document(store, &candidate)?;
         }
         self.file = candidate;
@@ -812,18 +862,12 @@ impl AutomationOwner {
     }
 }
 
-const AUTOMATION_WORKSPACE_HASH_DOMAIN: &[u8] = b"smelt.automation-workspace.v1\0";
-
 fn automation_workspace_path(root: &Path, automation_id: &str) -> PathBuf {
-    let mut digest = Sha256::new();
-    digest.update(AUTOMATION_WORKSPACE_HASH_DOMAIN);
-    digest.update((automation_id.len() as u64).to_be_bytes());
-    digest.update(automation_id.as_bytes());
-    let encoded = hex::encode(digest.finalize());
-    root.join(encoded)
+    root.join(crate::automation::managed_workspace_name(automation_id))
 }
 
-/// 自动化工作目录的两个根，都从存储所在的 smelt home 推出来。
+/// 自动化托管工作目录的两个根，都从存储所在的 smelt home 推出来。用户自己选了目录的
+/// 不归这里管（[`Automation::custom_workspace`]），原样用，不建也不改权限。
 ///
 /// 智能体自动化跑在它的 space 下的 `automations/` 里，每条一个子目录：能读到它在
 /// 对话里攒下的东西，又不会和别的自动化互相覆盖。Shell 没有智能体，留在托管目录；
@@ -853,9 +897,9 @@ impl WorkspaceRoots {
                 agent_definition_id,
                 ..
             } => {
-                let space = self
-                    .agent_space(agent_definition_id)
-                    .ok_or_else(|| format!("智能体 id 不能用作目录名: {agent_definition_id}"))?;
+                let space = self.agent_space(agent_definition_id).ok_or_else(|| {
+                    format!("the agent id can't be a directory name: {agent_definition_id}")
+                })?;
                 Ok(automation_workspace_path(
                     &space.join("automations"),
                     &automation.id,
@@ -895,19 +939,19 @@ fn ensure_automation_workspace(
     );
     fs::create_dir_all(&workspace).map_err(|error| {
         format!(
-            "创建自动化 Smelt 工作区失败（{}）: {error}",
+            "couldn't create the automation's Smelt workspace ({}): {error}",
             workspace.display()
         )
     })?;
     let metadata = fs::symlink_metadata(&workspace).map_err(|error| {
         format!(
-            "读取自动化 Smelt 工作区失败（{}）: {error}",
+            "couldn't read the automation's Smelt workspace ({}): {error}",
             workspace.display()
         )
     })?;
     if !metadata.is_dir() {
         return Err(format!(
-            "自动化 Smelt 工作区不是目录: {}",
+            "the automation's Smelt workspace isn't a directory: {}",
             workspace.display()
         ));
     }
@@ -916,14 +960,14 @@ fn ensure_automation_workspace(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).map_err(|error| {
             format!(
-                "设置自动化 Smelt 工作区权限失败（{}）: {error}",
+                "couldn't set permissions on the automation's Smelt workspace ({}): {error}",
                 workspace.display()
             )
         })?;
     }
     workspace.to_str().map(str::to_owned).ok_or_else(|| {
         format!(
-            "自动化 Smelt 工作区路径不是有效 UTF-8: {}",
+            "the automation's Smelt workspace path isn't valid UTF-8: {}",
             workspace.display()
         )
     })
@@ -933,7 +977,7 @@ fn assign_managed_workspaces(
     file: &mut AutomationFile,
     roots: Option<&WorkspaceRoots>,
     automation_ids: impl IntoIterator<Item = String>,
-) -> Result<(), String> {
+) -> Result<(), AutomationError> {
     let Some(roots) = roots else {
         return Ok(());
     };
@@ -954,14 +998,16 @@ fn assign_managed_workspaces(
     }
     let workspaces = automation_ids
         .iter()
-        .map(|automation_id| {
+        .filter_map(|automation_id| {
             let automation = file
                 .automations
                 .iter()
                 .find(|automation| automation.id == automation_id.as_str())
                 .expect("managed workspace ids were filtered against this file");
-            ensure_automation_workspace(roots, automation)
-                .map(|workspace| (automation_id, workspace))
+            (automation.custom_workspace().is_none()).then(|| {
+                ensure_automation_workspace(roots, automation)
+                    .map(|workspace| (automation_id, workspace))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     for (automation_id, workspace) in workspaces {
@@ -979,12 +1025,14 @@ fn assign_managed_workspaces(
 fn assign_upsert_workspace(
     automation: &mut Automation,
     roots: Option<&WorkspaceRoots>,
-) -> Result<(), String> {
+) -> Result<(), AutomationError> {
     let Some(roots) = roots else {
         return Ok(());
     };
     automation.validate()?;
-    automation.workspace_dir = Some(ensure_automation_workspace(roots, automation)?);
+    if automation.custom_workspace().is_none() {
+        automation.workspace_dir = Some(ensure_automation_workspace(roots, automation)?);
+    }
     Ok(())
 }
 
@@ -999,7 +1047,7 @@ pub fn automation_file_path() -> Option<PathBuf> {
 fn open_automation_store(legacy_path: &Path) -> Result<smelt_store::Store, String> {
     let database = legacy_path
         .parent()
-        .ok_or_else(|| format!("{} 没有父目录", legacy_path.display()))?
+        .ok_or_else(|| format!("{} has no parent directory", legacy_path.display()))?
         .join(smelt_store::DATABASE_FILE_NAME);
     crate::sqlite_state::open_sqlite_store(&database)
 }
@@ -1157,6 +1205,7 @@ fn run_record(run: &AutomationRun) -> Result<smelt_store::AutomationRunRecord, S
         error: run.error.clone(),
         runtime_released_at: run.runtime_released_at,
         context_json: encode_json(&run.context)?,
+        error_code: run.error_code.map(run_failure_name),
     })
 }
 
@@ -1176,9 +1225,23 @@ fn run_from_record(record: smelt_store::AutomationRunRecord) -> Result<Automatio
         session_id: record.session_id,
         provider_session_id: record.provider_session_id,
         output: record.output,
+        error_code: record.error_code.as_deref().map(run_failure_from_name),
         error: record.error,
         runtime_released_at: record.runtime_released_at,
     })
+}
+
+/// 原因种类按线上的代码存；不认识的（比这个运行时新的库）读成 `Other`，界面只说细节。
+fn run_failure_name(failure: AutomationRunFailure) -> String {
+    match serde_json::to_value(failure) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => unreachable!("AutomationRunFailure 序列化成字符串"),
+    }
+}
+
+fn run_failure_from_name(name: &str) -> AutomationRunFailure {
+    serde_json::from_value(serde_json::Value::String(name.to_string()))
+        .unwrap_or(AutomationRunFailure::Other)
 }
 
 /// 点开 Run 详情时读 SQLite 里的正文；直播投影不带这些字段。
@@ -1211,7 +1274,7 @@ fn run_source_from_name(name: &str) -> Result<AutomationRunSource, String> {
         "scheduled" => Ok(AutomationRunSource::Scheduled),
         "webhook" => Ok(AutomationRunSource::Webhook),
         "event" => Ok(AutomationRunSource::Event),
-        other => Err(format!("未知 Run source: {other}")),
+        other => Err(format!("unknown run source: {other}")),
     }
 }
 
@@ -1242,7 +1305,7 @@ fn run_status_from_name(name: &str) -> Result<AutomationRunStatus, String> {
         "failed" => Ok(AutomationRunStatus::Failed),
         "cancelled" => Ok(AutomationRunStatus::Cancelled),
         "skipped" => Ok(AutomationRunStatus::Skipped),
-        other => Err(format!("未知 Run status: {other}")),
+        other => Err(format!("unknown run status: {other}")),
     }
 }
 
@@ -1251,7 +1314,8 @@ fn encode_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
 }
 
 fn decode_json<T: serde::de::DeserializeOwned>(raw: &[u8], field: &str) -> Result<T, String> {
-    serde_json::from_slice(raw).map_err(|error| format!("解析自动化 {field} 失败: {error}"))
+    serde_json::from_slice(raw)
+        .map_err(|error| format!("couldn't parse the automation {field}: {error}"))
 }
 
 fn bind_agent_execution(
@@ -1264,7 +1328,7 @@ fn bind_agent_execution(
         .runs
         .iter_mut()
         .find(|run| run.id == run_id)
-        .ok_or_else(|| format!("Run 不存在: {run_id}"))?;
+        .ok_or_else(|| format!("the run doesn't exist: {run_id}"))?;
     bind_run_context(run, execution, workspaces);
     Ok(())
 }
@@ -1570,8 +1634,17 @@ mod tests {
         );
         assert!(!missing_workspace.exists());
 
+        // 换智能体前的托管目录（客户端原样带回来的）认得出是托管的，换成现在这位的。
+        let stale = automation_workspace_path(
+            &temp
+                .path()
+                .join("agents")
+                .join("old-agent")
+                .join("automations"),
+            "automation-1",
+        );
         let mut definition = automation();
-        definition.workspace_dir = Some("/outside/client-controlled".to_string());
+        definition.workspace_dir = stale.to_str().map(str::to_owned);
 
         owner
             .apply(
@@ -1593,7 +1666,7 @@ mod tests {
             workspace,
             automation_workspace_path(&workspace_root, "automation-1")
         );
-        assert!(!workspace.to_string_lossy().contains("client-controlled"));
+        assert!(!stale.exists());
 
         std::fs::remove_dir_all(&workspace).unwrap();
         let applied = owner
@@ -1653,6 +1726,7 @@ mod tests {
             true,
         );
         let mut definition = automation();
+        definition.workspace_dir = None;
         definition.action = crate::automation::AutomationAction::shell("true", Vec::new());
 
         owner
@@ -1720,42 +1794,80 @@ mod tests {
     }
 
     #[test]
-    fn startup_replaces_a_legacy_workspace_with_the_managed_path() {
+    fn a_chosen_workspace_is_kept_as_is() {
         let temp = tempfile::tempdir().unwrap();
         let store_path = temp.path().join("automations.json");
-        let workspace_root = temp
-            .path()
-            .join("agents")
-            .join("agent-1")
-            .join("automations");
-        let mut file = AutomationFile {
-            timezone_fingerprint: "UTC".to_string(),
-            ..Default::default()
-        };
-        let mut definition = automation();
-        definition.workspace_dir = Some("/legacy/project".to_string());
-        file.automations.push(definition);
-        seed_snapshot(temp.path(), &file);
-
-        let owner = AutomationOwner::load_from_paths(
+        let chosen = temp.path().join("repo");
+        std::fs::create_dir_all(&chosen).unwrap();
+        let chosen = chosen.to_str().unwrap().to_string();
+        let mut owner = AutomationOwner::load_from_paths(
             Some(store_path.clone()),
             Utc::now(),
             "UTC".to_string(),
             true,
         );
-
-        let expected = automation_workspace_path(&workspace_root, "automation-1");
+        let mut definition = automation();
+        definition.workspace_dir = Some(chosen.clone());
+        owner
+            .apply(
+                AutomationCommand::Upsert {
+                    automation: Box::new(definition.clone()),
+                },
+                Utc::now(),
+            )
+            .unwrap();
         assert_eq!(
             owner.snapshot().automations[0].workspace_dir.as_deref(),
-            expected.to_str()
+            Some(chosen.as_str())
         );
-        assert!(expected.is_dir());
-        assert!(!store_path.exists());
-        let persisted = persisted_file(temp.path());
+        // 托管目录没建出来。
+        assert!(!temp.path().join("agents").exists());
+
+        // 重启照样用它。
+        let owner =
+            AutomationOwner::load_from_paths(Some(store_path), Utc::now(), "UTC".to_string(), true);
         assert_eq!(
-            persisted.automations[0].workspace_dir.as_deref(),
-            expected.to_str()
+            owner.snapshot().automations[0].workspace_dir.as_deref(),
+            Some(chosen.as_str())
         );
+
+        // 选的目录不在了：保存时就报出来。
+        let mut owner = owner;
+        definition.workspace_dir = Some(temp.path().join("gone").to_string_lossy().into_owned());
+        assert!(
+            owner
+                .apply(
+                    AutomationCommand::Upsert {
+                        automation: Box::new(definition.clone()),
+                    },
+                    Utc::now(),
+                )
+                .is_err()
+        );
+
+        // 改回默认就用托管目录。
+        definition.workspace_dir = None;
+        owner
+            .apply(
+                AutomationCommand::Upsert {
+                    automation: Box::new(definition),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        let managed = automation_workspace_path(
+            &temp
+                .path()
+                .join("agents")
+                .join("agent-1")
+                .join("automations"),
+            "automation-1",
+        );
+        assert_eq!(
+            owner.snapshot().automations[0].workspace_dir.as_deref(),
+            managed.to_str()
+        );
+        assert!(managed.is_dir());
     }
 
     #[test]
@@ -1800,21 +1912,18 @@ mod tests {
         };
         assert_eq!(
             sinks(&loaded, "app-and-feishu"),
-            vec![AutomationSink::Local]
+            vec![AutomationSink::local()]
         );
         assert!(sinks(&loaded, "feishu-only").is_empty());
         let persisted = persisted_file(temp.path());
         assert_eq!(persisted.schema_version, AUTOMATION_FILE_SCHEMA_VERSION);
         assert_eq!(
             sinks(&persisted, "app-and-feishu"),
-            vec![AutomationSink::Local]
+            vec![AutomationSink::local()]
         );
-        assert!(
-            persisted
-                .automations
-                .iter()
-                .all(crate::automation::Automation::notifies_app)
-        );
+        assert!(persisted.automations.iter().all(|automation| {
+            automation.notify() == crate::automation::AutomationNotify::Always
+        }));
     }
 
     #[cfg(unix)]
@@ -1843,13 +1952,16 @@ mod tests {
         let error = owner
             .apply(
                 AutomationCommand::Upsert {
-                    automation: Box::new(automation()),
+                    automation: Box::new(Automation {
+                        workspace_dir: None,
+                        ..automation()
+                    }),
                 },
                 Utc::now(),
             )
             .unwrap_err();
 
-        assert!(error.contains("不是目录"));
+        assert!(error.to_string().contains("isn't a directory"), "{error}");
         assert!(owner.snapshot().automations.is_empty());
     }
 
@@ -2039,6 +2151,7 @@ mod tests {
                 session_id: None,
                 provider_session_id: None,
                 output: None,
+                error_code: None,
                 error: None,
                 runtime_released_at: Some(index as i64),
             });
@@ -2212,6 +2325,7 @@ mod tests {
                 &run.id,
                 AutomationRunStatus::Completed,
                 Some("ok".into()),
+                None,
                 None,
                 None,
                 Utc::now().timestamp(),

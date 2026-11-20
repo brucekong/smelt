@@ -2,7 +2,8 @@
 //!
 //! 会话状态产生的提醒（等批准、完成……）由运行时判定；这里是智能体自己判断「这件事值得打扰
 //! 用户」时发的一条消息，内容由它写。两头都发：
-//! - 桌面：经 `terminal.notification` 带标题发给连着的客户端，和终端 OSC 通知进同一个关注队列；
+//! - 提醒（`crate::attention`）：记成这段会话的未读、响一下；命令行发的只响。旧桌面还读
+//!   `terminal.notification`，也照发一份；
 //! - 手机：交给 [`crate::push::send_message`]，推给登记了「智能体消息」的手机，人在不在 Mac 前
 //!   都推。
 //!
@@ -15,7 +16,7 @@ use super::*;
 const MESSAGE_LIMIT_CHARS: usize = 2_000;
 const TITLE_LIMIT_CHARS: usize = 80;
 /// 智能体没给标题、也不是自动化运行时，桌面通知的标题。
-const DEFAULT_TITLE: &str = "智能体消息";
+const DEFAULT_TITLE: &str = "Agent message";
 
 /// 发出去的情况，回给调用方。
 #[derive(Debug, PartialEq, Eq)]
@@ -30,14 +31,18 @@ pub(crate) struct Sent {
 fn parse(title: Option<&str>, message: Option<&str>) -> Result<(Option<String>, String), String> {
     let message = message.map(str::trim).unwrap_or_default();
     if message.is_empty() {
-        return Err("通知内容是空的".to_string());
+        return Err("The notification is empty".to_string());
     }
     if message.chars().count() > MESSAGE_LIMIT_CHARS {
-        return Err(format!("通知内容太长，最多 {MESSAGE_LIMIT_CHARS} 个字符"));
+        return Err(format!(
+            "The notification is too long (max {MESSAGE_LIMIT_CHARS} characters)"
+        ));
     }
     let title = title.map(str::trim).filter(|title| !title.is_empty());
     if title.is_some_and(|title| title.chars().count() > TITLE_LIMIT_CHARS) {
-        return Err(format!("标题太长，最多 {TITLE_LIMIT_CHARS} 个字符"));
+        return Err(format!(
+            "The title is too long (max {TITLE_LIMIT_CHARS} characters)"
+        ));
     }
     Ok((title.map(str::to_string), message.to_string()))
 }
@@ -86,6 +91,12 @@ fn deliver(
             false
         }
     };
+    event_hub.notify_attention(
+        session_id,
+        smelt_event_protocol::AttentionKind::Notice,
+        &display.desktop_title,
+        message,
+    );
     let phones = crate::push::send_message(
         push_session,
         display.push_title.as_deref(),

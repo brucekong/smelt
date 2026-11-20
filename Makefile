@@ -22,7 +22,7 @@ fmt-check: ## 检查代码格式
 	cargo fmt --check
 
 lint: ## 运行 Clippy 静态检查（正确性 lint 由 workspace.lints deny）
-	./scripts/lint-pointer.sh
+	./scripts/lint-crate-deps.sh
 	cargo clippy --workspace --all-targets
 
 lint-sh: ## 检查 shell 脚本里 $$var 紧跟非 ASCII 的写法
@@ -89,22 +89,15 @@ dist: ## 用已有 release 产物打包 app + dmg
 dist-build: ## 先编 release 再打包（一步到位）
 	./scripts/package-mac.sh --build
 
-install: $(SMELT_AGENT) ## 原子安装到 /Applications（不打 dmg）；活跃 ACP 不阻塞，旧 runtime 首次迁移在后台完成
+install: $(SMELT_AGENT) ## 原子安装到 /Applications（不打 dmg）：退出 Smelt、停守护、换 App、重新打开
 	@# make build && make install 必须装刚编的二进制；只检查 dist 是否存在会把
-	@# 旧包再装一遍，守护永远跑不到新代码。插件脚本没有 cargo binary，因此同时
-	@# 检查 plugins 的源内容（按 .gitignore 排除编辑器生成文件和本地 clone 的外部仓库）。
+	@# 旧包再装一遍，守护永远跑不到新代码。
 	@# codesign -dv 不打印证书名，Authority= 从 -dvv 才出现。少这一级时已签好的包也会被当成签名不对。
 	@[ -f target/release/$(BIN) ] && [ -f target/release/$(DAEMON) ] \
 		&& [ -f target/release/smelt-notify ] \
 		&& [ -f target/release/smelt-installer ] || { \
 		echo "✗ 缺少 release 产物，先 make build"; exit 1; }
-	@if [ -d dist/Smelt.app/Contents/Resources/plugins ]; then \
-		plugin_sources_changed="$$(git ls-files -co --exclude-standard -- plugins | while read -r f; do \
-			[ "$$f" -nt dist/Smelt.app/Contents/Resources/plugins ] && { echo "$$f"; break; }; done)"; \
-	else \
-		plugin_sources_changed=missing; \
-	fi; \
-	sig_ok=0; \
+	@sig_ok=0; \
 	identity="$${SMELT_CODESIGN_IDENTITY:-Smelt Local Signing}"; \
 	if [ -d dist/Smelt.app ]; then \
 		sig="$$(codesign -dvv dist/Smelt.app 2>&1 || true)"; \
@@ -126,15 +119,12 @@ install: $(SMELT_AGENT) ## 原子安装到 /Applications（不打 dmg）；活�
 		|| [ target/smelt-agent/smelt-agent -nt dist/Smelt.app/Contents/Resources/smelt-agent/smelt-agent ] \
 		|| [ target/smelt-agent/photon_rs_bg.wasm -nt dist/Smelt.app/Contents/Resources/smelt-agent/photon_rs_bg.wasm ] \
 		|| ! diff -rq target/smelt-agent/skills dist/Smelt.app/Contents/Resources/smelt-agent/skills >/dev/null 2>&1 \
-		|| [ -n "$$plugin_sources_changed" ] \
 		|| [ "$$sig_ok" -ne 1 ]; then \
-		echo "· dist 落后于 release、签名不对，或插件脚本有改动，重新打包"; \
+		echo "· dist 落后于 release 或签名不对，重新打包"; \
 		./scripts/package-mac.sh --no-dmg; \
 	fi
-	@# 存量 make install 仍走旧的显式安装入口；在线更新已改由进程外 installer
-	@# 在 GUI 完全退出后提交。这里保留 daemon handoff 语义，后续再收敛到同一 core。
-	@./target/release/$(BIN) --install-app dist/Smelt.app /Applications/Smelt.app
-	@echo "✅ 安装完成"
+	@# 和在线更新同一条提交：让 Smelt 退出 → 停守护 → 原子交换 App → 打开新版。
+	@./target/release/smelt-installer --local-app dist/Smelt.app
 
 dev: ## 编译 release 并原子安装到 /Applications（= make build 后 make install）
 	@# 不写成 `dev: build install` 依赖：make -j 会把两者并行，install 可能装上旧产物。

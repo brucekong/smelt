@@ -12,13 +12,12 @@ mod action_tests;
 mod automation_command_tests;
 mod autostart_remote_tests;
 #[cfg(unix)]
-mod daemon_executable_tests;
-#[cfg(unix)]
 mod flow_control_tests;
 mod history_rename_tests;
 #[cfg(unix)]
 mod input_integration_tests;
 mod input_payload_tests;
+mod prompt_index_tests;
 #[cfg(unix)]
 mod remote_reattach_tests;
 #[cfg(unix)]
@@ -84,6 +83,12 @@ fn make_acp_session_value(
         pending_agent_preset: SessionLock::new(None),
         durable_history_session_id: SessionLock::new(None),
         idle: Default::default(),
+        after_ready: SessionLock::new(Default::default()),
+        after_ready_gate: SessionLock::new(()),
+        startup_hold: AtomicBool::new(false),
+        reconnect: SessionLock::new(Default::default()),
+        disallowed_tools: SessionLock::new(Vec::new()),
+        delivery_results: SessionLock::new(VecDeque::new()),
     }
 }
 
@@ -104,13 +109,9 @@ fn make_pipe_session(rows: u16, cols: u16, phase: Phase) -> (Arc<Session>, std::
         phase,
         ..Default::default()
     }));
-    let subscribers = new_event_hub();
     let replies = Arc::new(Mutex::new(VecDeque::new()));
-    let listener = StateListener::with_replies(
-        Arc::clone(&state),
-        subscribers,
-        Arc::clone(&replies),
-    );
+    let bell = Arc::new(AtomicBool::new(false));
+    let listener = StateListener::new(Arc::clone(&replies), Arc::clone(&bell));
     let sess = Arc::new(Session {
         instance: next_session_instance(),
         geometry_token: uuid::Uuid::new_v4().simple().to_string(),
@@ -133,6 +134,7 @@ fn make_pipe_session(rows: u16, cols: u16, phase: Phase) -> (Arc<Session>, std::
         }),
         output_gate: Mutex::new(()),
         replies,
+        bell,
         term: Mutex::new(new_daemon_term(rows, cols, listener)),
         graphics: Mutex::default(),
         state,

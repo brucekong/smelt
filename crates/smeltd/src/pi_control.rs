@@ -25,6 +25,13 @@ pub(crate) fn dispatch(
     if changes_config(method) {
         notify_changed(event_hub);
     }
+    // 删 MCP 服务器、删插件时运行时顺带清掉各智能体对它的勾选，那是智能体配置的一部分。
+    if matches!(
+        method,
+        ControlMethod::PiMcpRemove | ControlMethod::PiPluginsRemove
+    ) {
+        event_hub.agent_host_changed();
+    }
     result
 }
 
@@ -41,9 +48,9 @@ fn changes_config(method: ControlMethod) -> bool {
             | ControlMethod::PiMcpAddPreset
             | ControlMethod::PiMcpSetEnabled
             | ControlMethod::PiMcpRemove
-            | ControlMethod::PiMcpLogin
             | ControlMethod::PiPluginsRemove
             | ControlMethod::PiPluginsImport
+            | ControlMethod::PiPluginsAdopt
             | ControlMethod::PiAuthLogout
     )
 }
@@ -60,7 +67,10 @@ fn run(
     event_hub: &EventHubHandle,
 ) -> Result<serde_json::Value, ControlError> {
     match method {
-        ControlMethod::PiConfigGet => call::<PiConfigGet>(params, |_| Ok(pi_service::config())),
+        ControlMethod::PiConfigGet => call::<PiConfigGet>(params, |_| {
+            pi_service::sync_skill_bridges();
+            Ok(pi_service::config())
+        }),
         ControlMethod::PiConfigEnsureFile => {
             call::<PiConfigEnsureFile>(params, pi_service::ensure_config_file)
         }
@@ -97,13 +107,18 @@ fn run(
             mutate::<PiMcpSetEnabled>(params, pi_service::set_mcp_enabled)
         }
         ControlMethod::PiMcpRemove => mutate::<PiMcpRemove>(params, pi_service::remove_mcp_server),
-        ControlMethod::PiMcpLogin => mutate::<PiMcpLogin>(params, pi_service::login_mcp_server),
+        ControlMethod::PiMcpLoginStart => call::<PiMcpLoginStart>(params, |p| {
+            Ok(pi_auth_service::LoginIdParams {
+                login_id: pi_auth_service::start_mcp(&p.name)?,
+            })
+        }),
         ControlMethod::PiPluginsRemove => {
             mutate::<PiPluginsRemove>(params, pi_service::remove_plugin)
         }
         ControlMethod::PiPluginsImport => {
             mutate::<PiPluginsImport>(params, pi_service::import_plugin)
         }
+        ControlMethod::PiPluginsAdopt => mutate::<PiPluginsAdopt>(params, pi_service::adopt_plugin),
         ControlMethod::PiAuthProviders => {
             call::<PiAuthProviders>(params, |_| pi_auth_service::providers())
         }
@@ -178,6 +193,7 @@ mod tests {
             ControlMethod::PiAuthProviders,
             ControlMethod::PiAuthModels,
             ControlMethod::PiAuthLoginStart,
+            ControlMethod::PiMcpLoginStart,
             ControlMethod::PiAuthLoginEvents,
             ControlMethod::PiAuthLoginAnswer,
             ControlMethod::PiAuthLoginCancel,

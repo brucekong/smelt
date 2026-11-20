@@ -4,13 +4,16 @@
 name = "smelt-layouts"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
 smelt-plugin-api = { path = "../../smelt-plugin-api" }
-gpui = { package = "gpui-pre", version = "=0.3.11" }
+rust-i18n.workspace = true
+gpui = { package = "gpui-pre", version = "=0.3.12" }
 
 [dev-dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }

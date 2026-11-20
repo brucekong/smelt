@@ -207,11 +207,11 @@ fn csops_string(
 #[cfg(target_os = "macos")]
 fn parse_csops_blob(buf: &[u8]) -> Result<Option<String>, String> {
     if buf.len() < 8 {
-        return Err("csops 返回不足 8 字节".to_string());
+        return Err("csops returned fewer than 8 bytes".to_string());
     }
     let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
     if len > buf.len() {
-        return Err(format!("csops 返回长度 {len} 越过缓冲区"));
+        return Err(format!("csops returned length {len}, past the buffer"));
     }
     if len <= 9 {
         return Ok(None);
@@ -221,7 +221,8 @@ fn parse_csops_blob(buf: &[u8]) -> Result<Option<String>, String> {
         .iter()
         .position(|&byte| byte == 0)
         .unwrap_or(data.len());
-    let text = std::str::from_utf8(&data[..end]).map_err(|_| "csops 返回非 UTF-8".to_string())?;
+    let text =
+        std::str::from_utf8(&data[..end]).map_err(|_| "csops returned non-UTF-8".to_string())?;
     if text.is_empty() {
         Ok(None)
     } else {
@@ -625,37 +626,6 @@ pub(crate) fn authenticate_first_party_desktop(
     Ok(FirstPartyClientKind::Desktop)
 }
 
-/// 正在看画面的活连接数。headless 自升级只在这是 0 时才动手——GUI 自己有空闲
-/// 门控（agent 忙不闪终端），有人连着就把升级时机让出去。
-///
-/// 必须是租约而不是「最近 N 分钟活跃过」：desktop 鉴权 / 终端 open 都是稀疏事件，
-/// ACP 对话可以连着看很久却不再触发它们。用过期时间当「GUI 不在」，会把正在跑的
-/// 回合当成没人看，自升级把 host 换掉，toolUse 就停在半截。
-static LIVE_VIEWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// 一条会挡住 headless 自升级的观看连接。Drop 时归还。
-pub(crate) struct ViewerLease;
-
-impl ViewerLease {
-    pub(crate) fn acquire() -> Self {
-        LIVE_VIEWERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for ViewerLease {
-    fn drop(&mut self) {
-        // 最后一个观看连接走了：headless 自升级可能正等着这一刻。
-        if LIVE_VIEWERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-            crate::nudge_headless_self_upgrade();
-        }
-    }
-}
-
-pub(crate) fn viewer_is_present() -> bool {
-    LIVE_VIEWERS.load(std::sync::atomic::Ordering::SeqCst) > 0
-}
-
 #[cfg(target_os = "macos")]
 pub(super) fn authenticate_first_party_macos(
     requested: FirstPartyClientKind,
@@ -837,7 +807,7 @@ pub(super) fn trusted_sibling(
     if canonical_eq(&parent.join(expected_basename), peer_executable) {
         return true;
     }
-    // 托管守护是 `~/.smelt/bin/smeltd-<hash>.exe`，桌面是安装目录里的 `smelt.exe`。
+    // 托管守护是 `~/.smelt/bin/smeltd.exe`，桌面是安装目录里的 `smelt.exe`。
     // 只认守护目录的兄弟会把 GUI 拒掉。桌面拉起守护时写入 `SMELT_BUNDLE_DIR`。
     #[cfg(windows)]
     {
@@ -936,6 +906,8 @@ pub(super) fn first_party_event_client(kind: FirstPartyClientKind) -> Authentica
                 CORE_CAPABILITY_CONVERSATION_WAKE,
                 // 外观归桌面端，CLI 发来的外观改动只能交给它。
                 CORE_CAPABILITY_APPEARANCE_CONTROL,
+                // 命令登记在桌面端，`smelt app` 转来的命令只能交给它。
+                smelt_event_protocol::CORE_CAPABILITY_APP_COMMAND,
             ],
         ),
     };

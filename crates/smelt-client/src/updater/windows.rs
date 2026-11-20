@@ -2,9 +2,6 @@
 //! 应用时拉起它静默覆盖安装，桌面随即退出。安装程序先等桌面进程退出再换文件，装完（或
 //! 没装成）重新打开 Smelt（`scripts/windows-installer.iss` 的 `/WAITPID`、`/RELAUNCH`）。
 //!
-//! 本机守护不用停：smeltd、smelt-agent、smelt-notify 跑的都是 `~/.smelt/bin` 里的副本，
-//! 不占安装目录。新版桌面起来后照「守护落后就在空闲时重启」的老规矩换守护，会话不断。
-//!
 //! 换文件、出错回滚是安装程序的事，这里不记持久化事务：下好的安装程序只在这次运行里
 //! 等着装，重启后重新检查；同一个版本已经下好、校验过就不再下一遍。
 
@@ -14,9 +11,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
-
-/// 应用更新要不要先停掉本机守护。见模块说明。
-pub const INSTALL_STOPS_LOCAL_DAEMON: bool = false;
 
 /// Inno Setup 放在安装目录里的卸载程序。有它才说明这个 exe 是安装程序装的。
 const UNINSTALLER: &str = "unins000.exe";
@@ -53,7 +47,7 @@ pub async fn fetch_latest(channel: UpdateChannel) -> anyhow::Result<UpdateCandid
         // 接着看上一个。
         if let Err(error) = semver::Version::parse(&candidate.version) {
             last_error = Some(anyhow::anyhow!(
-                "更新包的版本号不是发版号：{}（{error}）",
+                "the package version isn't a release number: {} ({error})",
                 candidate.version
             ));
             continue;
@@ -66,7 +60,9 @@ pub async fn fetch_latest(channel: UpdateChannel) -> anyhow::Result<UpdateCandid
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有已传好安装程序的{}", channel.label())))
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!("the {channel:?} channel has no release with an uploaded installer")
+    }))
 }
 
 /// 这个 exe 是不是安装程序装的：发版构建，而且旁边有卸载程序。开发构建、拷出来的 exe
@@ -78,10 +74,11 @@ pub fn installed_by_setup() -> bool {
 
 /// 装着的就是编进程序的那次发版。
 pub fn installed_release() -> anyhow::Result<InstalledRelease> {
-    let release = smelt_version::RELEASE
-        .ok_or_else(|| anyhow::anyhow!("开发构建没有发版号，不自动更新"))?;
+    let release = smelt_version::RELEASE.ok_or_else(|| {
+        anyhow::anyhow!("development builds have no release number and don't auto-update")
+    })?;
     let version = semver::Version::parse(release)
-        .with_context(|| format!("编进程序的发版号不是 semver：{release}"))?;
+        .with_context(|| format!("the built-in release number isn't semver: {release}"))?;
     Ok(InstalledRelease::Version(version))
 }
 
@@ -117,7 +114,7 @@ impl std::fmt::Display for InstallerTicket {
 /// 下载的安装程序放在 `%LOCALAPPDATA%\Smelt\update`，不进数据目录 `~\.smelt`。
 fn download_dir() -> anyhow::Result<PathBuf> {
     Ok(dirs::cache_dir()
-        .ok_or_else(|| anyhow::anyhow!("找不到系统缓存目录"))?
+        .ok_or_else(|| anyhow::anyhow!("couldn't find the system cache directory"))?
         .join("Smelt")
         .join("update"))
 }
@@ -135,21 +132,18 @@ async fn expected_sha256(installer_url: &str) -> anyhow::Result<String> {
         .path_segments()
         .and_then(|segments| segments.last())
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("安装程序地址里没有文件名：{installer_url}"))?
+        .ok_or_else(|| anyhow::anyhow!("the installer URL has no file name: {installer_url}"))?
         .to_string();
     let sums_url = url.join(CHECKSUMS_ASSET)?;
-    validate_download_url(sums_url.as_str())?;
-    let resp = reqwest::Client::new()
-        .get(sums_url.clone())
-        .header("User-Agent", "smelt-updater")
-        .send()
-        .await?
-        .error_for_status()?;
-    validate_download_url(resp.url().as_str())?;
-    let sums = resp.text().await?;
+    let sums = fetch_metadata(sums_url.as_str(), "*/*").await?;
+    let sums = String::from_utf8(sums).with_context(|| format!("{sums_url} isn't text"))?;
     smelt_version::checksum_for(&sums, &file)
         .map(str::to_ascii_lowercase)
-        .ok_or_else(|| anyhow::anyhow!("{sums_url} 里还没有 {file}，发布可能还没传完"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{sums_url} doesn't list {file} yet; the release may still be uploading"
+            )
+        })
 }
 
 fn file_sha256(path: &Path) -> std::io::Result<String> {
@@ -177,12 +171,12 @@ pub async fn download_and_stage(
 ) -> anyhow::Result<StagedUpdate> {
     validate_download_url(url)?;
     if version.trim().is_empty() {
-        anyhow::bail!("更新包缺少版本标识");
+        anyhow::bail!("the update package has no version");
     }
     let sha256 = expected_sha256(url).await?;
     let dir = download_dir()?;
     std::fs::create_dir_all(&dir)
-        .with_context(|| format!("创建下载目录失败：{}", dir.display()))?;
+        .with_context(|| format!("couldn't create the download directory: {}", dir.display()))?;
     let update = StagedUpdate {
         version: version.to_string(),
         url: url.trim().to_string(),
@@ -200,7 +194,7 @@ pub async fn download_and_stage(
         .and_then(|()| {
             std::fs::rename(&partial, &update.installer).with_context(|| {
                 format!(
-                    "移动安装程序失败：{} → {}",
+                    "couldn't move the installer: {} → {}",
                     partial.display(),
                     update.installer.display()
                 )
@@ -231,21 +225,7 @@ async fn download_verified(
     expected: &str,
     on_progress: &dyn Fn(DownloadProgress),
 ) -> anyhow::Result<()> {
-    let mut resp = reqwest::Client::new()
-        .get(url)
-        .header("User-Agent", "smelt-updater")
-        .send()
-        .await?
-        .error_for_status()?;
-    validate_download_url(resp.url().as_str())?;
-    if resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
-    {
-        anyhow::bail!("更新地址返回了 HTML，不是安装程序：{url}");
-    }
+    let mut resp = open_package_download(url, "installer").await?;
     let total = resp.content_length();
     on_progress(DownloadProgress::Bytes { received: 0, total });
 
@@ -254,9 +234,10 @@ async fn download_verified(
     let mut received = 0u64;
     let mut reported = 0u64;
     while let Some(chunk) = resp.chunk().await? {
+        received += chunk.len() as u64;
+        ensure_package_size(received)?;
         file.write_all(&chunk)?;
         hasher.update(&chunk);
-        received += chunk.len() as u64;
         if received - reported >= PROGRESS_REPORT_STEP || Some(received) == total {
             reported = received;
             on_progress(DownloadProgress::Bytes { received, total });
@@ -267,7 +248,7 @@ async fn download_verified(
 
     let actual = hex::encode(hasher.finalize());
     if actual != expected {
-        anyhow::bail!("安装程序校验失败（期望 {expected}，实际 {actual}）");
+        anyhow::bail!("installer checksum mismatch (expected {expected}, got {actual})");
     }
     Ok(())
 }
@@ -279,11 +260,15 @@ async fn download_verified(
 /// 拉起前再校验一遍：下载之后文件被换过就不装。安装程序要脱离桌面的 Job，不然桌面
 /// 一退出它就跟着没了。
 pub fn launch_installer(update: &StagedUpdate, relaunch: bool) -> anyhow::Result<InstallerTicket> {
-    let actual = file_sha256(&update.installer)
-        .with_context(|| format!("读取安装程序失败：{}", update.installer.display()))?;
+    let actual = file_sha256(&update.installer).with_context(|| {
+        format!(
+            "couldn't read the installer: {}",
+            update.installer.display()
+        )
+    })?;
     if actual != update.sha256 {
         anyhow::bail!(
-            "安装程序和下载时校验的不一致：{}",
+            "the installer no longer matches what was verified at download: {}",
             update.installer.display()
         );
     }
@@ -297,10 +282,11 @@ pub fn launch_installer(update: &StagedUpdate, relaunch: bool) -> anyhow::Result
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     if relaunch {
-        let exe = std::env::current_exe().context("找不到当前 exe")?;
+        let exe = std::env::current_exe().context("couldn't find the current exe")?;
         command.arg(format!("/RELAUNCH={}", exe.display()));
     }
-    let child = smelt_sys::process::spawn_detached(&mut command).context("拉起安装程序失败")?;
+    let child = smelt_sys::process::spawn_detached(&mut command)
+        .context("couldn't launch the installer")?;
     Ok(InstallerTicket {
         pid: child.id(),
         log,
@@ -347,8 +333,12 @@ pub fn discard_staged_update(expected: &StagedUpdate) -> anyhow::Result<()> {
     match std::fs::remove_file(&expected.installer) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("删除安装程序失败：{}", expected.installer.display())),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "couldn't delete the installer: {}",
+                expected.installer.display()
+            )
+        }),
     }
 }
 

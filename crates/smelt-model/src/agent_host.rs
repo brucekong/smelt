@@ -23,6 +23,10 @@ pub struct AgentHostSettings {
     pub agents: Vec<AgentDefinition>,
     /// 侧栏「新对话」默认用哪个智能体。指向这台运行时上的定义，所以跟着运行时走。
     pub default_conversation_agent: Option<String>,
+    /// 这台运行时上智能体 space 的根（`~/.smelt/agents`，按那台机器的路径写）。运行时读出
+    /// 配置时填上，不存库、不经编辑合并；旧运行时不报，那时认不出哪个目录是智能体的 space。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_spaces_root: Option<String>,
 }
 
 impl AgentHostSettings {
@@ -36,6 +40,7 @@ impl AgentHostSettings {
             profiles: Vec::new(),
             agents: Vec::new(),
             default_conversation_agent: None,
+            agent_spaces_root: None,
         }
     }
 }
@@ -57,6 +62,14 @@ impl AgentHostSettings {
 
     pub fn find_agent(&self, id: &str) -> Option<&AgentDefinition> {
         self.agents.iter().find(|agent| agent.id == id)
+    }
+
+    /// 这条路径（这台运行时上的）是哪个智能体的 space：只认 space 根本身，子目录不算；定义
+    /// 已经删了、运行时没报 space 在哪时是 `None`。
+    pub fn agent_for_space(&self, path: &str) -> Option<&AgentDefinition> {
+        let root = self.agent_spaces_root.as_deref()?;
+        let id = crate::agent_paths::agent_definition_id_in_spaces(root, path)?;
+        self.find_agent(&id)
     }
 
     /// 某个 agent 当前生效的额外环境变量。
@@ -131,6 +144,27 @@ impl AgentHostSettings {
         values
     }
 
+    /// 运行时自己开的一段新对话（`session.create`、手机、Pi 派生）拉起后、第一轮之前要设好的
+    /// 选项，结果跟桌面开对话、对话插件接上后的一样：智能体的对话放开权限、定成它选的模型，
+    /// 别的按这个 agent 记住的选择；裸引擎（含自定义 Agent）只按记住的选择。
+    pub fn new_conversation_config(
+        &self,
+        agent: ConversationAgentKind,
+        agent_definition_id: Option<&str>,
+    ) -> Vec<(String, String)> {
+        let Some(definition_id) = agent_definition_id else {
+            return self.initial_acp_config(agent, &[]);
+        };
+        let mut values = self.initial_agent_conversation_config(agent);
+        if let Some(model) = self
+            .find_agent(definition_id)
+            .and_then(AgentDefinition::model_config_value)
+        {
+            upsert_config_value(&mut values, "model".to_string(), model);
+        }
+        values
+    }
+
     /// 某个 agent 当前生效的完整启动规格：出厂命令 + 用户配的环境变量。要换命令、
     /// 加参数用自定义 Agent（[`AcpProfile`]）。
     ///
@@ -161,10 +195,12 @@ impl AgentHostSettings {
         definition: &AgentDefinition,
     ) -> Result<(ConversationAgentKind, ConversationLaunchSpec), String> {
         let agent = definition.engine_kind().ok_or_else(|| {
-            format!(
-                "智能体 `{}` 使用了未知执行引擎 `{}`",
-                definition.name, definition.engine_kind_id
+            rust_i18n::t!(
+                "agent.unknown_engine",
+                name = definition.name,
+                engine = definition.engine_kind_id
             )
+            .into_owned()
         })?;
         Ok((agent, self.acp_launch_for(agent)))
     }
@@ -203,6 +239,75 @@ mod tests {
 
     fn settings() -> AgentHostSettings {
         AgentHostSettings::fresh()
+    }
+
+    #[test]
+    fn a_space_belongs_to_a_known_agent_under_the_reported_root() {
+        let mut config = settings();
+        config.agents.push(AgentDefinition {
+            id: "writer".into(),
+            ..Default::default()
+        });
+        let space = "/home/u/.smelt/agents/writer";
+        assert!(
+            config.agent_for_space(space).is_none(),
+            "运行时没报根，认不出"
+        );
+        config.agent_spaces_root = Some("/home/u/.smelt/agents".into());
+        assert_eq!(
+            config.agent_for_space(space).map(|a| a.id.as_str()),
+            Some("writer")
+        );
+        assert!(
+            config
+                .agent_for_space("/home/u/.smelt/agents/gone")
+                .is_none()
+        );
+        assert!(config.agent_for_space("/home/u/code/app").is_none());
+
+        // 根只在线上传给客户端；旧运行时不带这个字段照样解得开。
+        let mut wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(wire["agent_spaces_root"], "/home/u/.smelt/agents");
+        wire.as_object_mut().unwrap().remove("agent_spaces_root");
+        let old: AgentHostSettings = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.agent_spaces_root, None);
+    }
+
+    /// 运行时自己开的对话一拉起就按这份设好：智能体的对话不管记住过什么都放开权限、定成它的
+    /// 模型；裸引擎照记住的选择，没记过就不设，用 agent 自己的默认。
+    #[test]
+    fn a_new_conversation_starts_with_what_the_desktop_would_set() {
+        let mut config = settings();
+        config.remember_acp_config_value(ConversationAgentKind::Pi, "mode".into(), "ask".into());
+        config.remember_acp_config_value(ConversationAgentKind::Pi, "codemode".into(), "on".into());
+        config.agents.push(AgentDefinition {
+            id: "dev".into(),
+            engine_kind_id: ConversationAgentKind::Pi.id().into(),
+            model_provider: "Token-X".into(),
+            model_id: "Claude-Opus-5".into(),
+            ..Default::default()
+        });
+        let pair = |id: &str, value: &str| (id.to_string(), value.to_string());
+
+        let agent = config.new_conversation_config(ConversationAgentKind::Pi, Some("dev"));
+        assert!(
+            agent.contains(&pair("mode", "bypassPermissions")),
+            "{agent:?}"
+        );
+        assert!(agent.contains(&pair("codemode", "on")), "{agent:?}");
+        assert!(
+            agent.contains(&pair("model", "Token-X/Claude-Opus-5")),
+            "{agent:?}"
+        );
+        assert!(!agent.contains(&pair("mode", "ask")), "{agent:?}");
+
+        let engine = config.new_conversation_config(ConversationAgentKind::Pi, None);
+        assert!(engine.contains(&pair("mode", "ask")), "{engine:?}");
+        assert!(
+            config
+                .new_conversation_config(ConversationAgentKind::Claude, None)
+                .is_empty()
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! 工作区组合键绑在 `Workspace` 或更具体、但仍浅于 Terminal / Input 的 context 上。
 //! `None` 与最内层同深度，后注册会抢走输入框的键，不用。
 
+use rust_i18n::t;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -20,9 +21,7 @@ use gpui::{
     App, Global, KeyBinding, KeyBindingContextPredicate, KeyBindingMetaIndex, Keystroke, Menu,
     MenuItem, NoAction, OperatingSystem, SharedString, Subscription, Window,
 };
-use gpui_component::input::{
-    DeleteToBeginningOfLine, DeleteToEndOfLine, DeleteToPreviousWordStart,
-};
+use gpui_base::input::{DeleteToBeginningOfLine, DeleteToEndOfLine, DeleteToPreviousWordStart};
 use smelt_client_store::KeyBindingRecord;
 use smelt_plugin_api::{self as api, CommandInfo, HostEvent, RunCommand};
 
@@ -48,17 +47,19 @@ pub(crate) struct Bound {
 /// 不让绑的键：终端在自己的按键监听里处理、不在键表里的（应用键先于终端派发，绑上去终端
 /// 就收不到了），通用的编辑键，以及 macOS 自己用的。⌘Space、⌘Tab 这类系统直接截走的键
 /// 根本到不了应用，录不到，不用列。
-const RESERVED_KEYS: &[(&str, &str)] = &[
-    ("cmd-c", "复制"),
-    ("cmd-v", "粘贴"),
-    ("cmd-x", "剪切"),
-    ("cmd-a", "全选"),
-    ("cmd-z", "撤销"),
-    ("cmd-shift-z", "重做"),
-    ("cmd-f", "终端内搜索"),
-    ("cmd-h", "系统的「隐藏应用」"),
-    ("cmd-alt-h", "系统的「隐藏其他应用」"),
-    ("cmd-m", "系统的「最小化」"),
+/// 每条带一个取「留给谁」的函数：录键被拒时说给人听，跟着界面语言。
+type ReservedFor = fn() -> std::borrow::Cow<'static, str>;
+const RESERVED_KEYS: &[(&str, ReservedFor)] = &[
+    ("cmd-c", || t!("reserved.copy")),
+    ("cmd-v", || t!("reserved.paste")),
+    ("cmd-x", || t!("reserved.cut")),
+    ("cmd-a", || t!("reserved.select_all")),
+    ("cmd-z", || t!("reserved.undo")),
+    ("cmd-shift-z", || t!("reserved.redo")),
+    ("cmd-f", || t!("reserved.terminal_search")),
+    ("cmd-h", || t!("reserved.hide")),
+    ("cmd-alt-h", || t!("reserved.hide_others")),
+    ("cmd-m", || t!("reserved.minimize")),
 ];
 
 /// 出厂键要带 ⌘（或者是 F 键），不能是保留键：应用键先于终端和输入框派发。
@@ -133,39 +134,11 @@ pub(crate) fn bind_commands(
 pub(crate) fn app_key_bindings(bound: &[Bound], cx: &App) -> Vec<KeyBinding> {
     let mut bindings = vec![
         KeyBinding::new("escape", DismissWorkspace, Some("Workspace")),
-        // 设置窗口：Cmd+W（Windows / Linux 是 Ctrl+W）关窗。它是普通窗口，不是模态层，
-        // Esc 不关它，留给下拉框、弹出层和输入框。`KeyBinding::new` 不解析 `secondary-`，
-        // 按目标平台写成显式修饰键。
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-w", CloseSettingsWindow, Some("SettingsWindow")),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-w", CloseSettingsWindow, Some("SettingsWindow")),
-        // 文件树只在自己的宿主上挂 FileTree。树没挂载（文件页不可见、树收起、
-        // 搜索框有内容）时这条 context 不在焦点路径上。
-        KeyBinding::new("up", FileTreeMoveUp, Some("FileTree")),
-        KeyBinding::new("down", FileTreeMoveDown, Some("FileTree")),
-        KeyBinding::new("left", FileTreeMoveLeft, Some("FileTree")),
-        KeyBinding::new("right", FileTreeMoveRight, Some("FileTree")),
-        KeyBinding::new("enter", FileTreeActivate, Some("FileTree")),
-        KeyBinding::new("up", SidebarUp, Some("Sidebar")),
-        KeyBinding::new("down", SidebarDown, Some("Sidebar")),
-        KeyBinding::new("left", SidebarCollapse, Some("Sidebar")),
-        KeyBinding::new("right", SidebarExpand, Some("Sidebar")),
-        KeyBinding::new("enter", SidebarOpen, Some("Sidebar")),
-        KeyBinding::new("escape", SidebarExit, Some("Sidebar")),
         // readline / Grok TUI 行编辑：Ctrl+U 删到行首、Ctrl+K 删到行尾、
-        // Ctrl+W 删词。绑在 Input context，所有输入框（ACP composer 等）生效。
+        // Ctrl+W 删词。绑在 Input context，所有输入框（对话输入框等）生效。
         KeyBinding::new("ctrl-u", DeleteToBeginningOfLine, Some("Input")),
         KeyBinding::new("ctrl-k", DeleteToEndOfLine, Some("Input")),
         KeyBinding::new("ctrl-w", DeleteToPreviousWordStart, Some("Input")),
-        // 把 Tab/Shift-Tab 从 gpui-component Root 的全局焦点跳转手里要回来，
-        // 终端聚焦时改发给 shell（见 terminal_view.rs 里 TerminalTab 的注释）。
-        KeyBinding::new("tab", terminal_view::TerminalTab, Some("Terminal")),
-        KeyBinding::new(
-            "shift-tab",
-            terminal_view::TerminalBackTab,
-            Some("Terminal"),
-        ),
     ];
     // cmux：Ctrl+Backspace / Ctrl+Delete 也是删行（^U / ^K），不是删词。
     #[cfg(target_os = "macos")]
@@ -212,31 +185,45 @@ pub(crate) fn app_key_bindings(bound: &[Bound], cx: &App) -> Vec<KeyBinding> {
         .collect()
 }
 
-/// 应用菜单栏：macOS 顶部「Smelt」菜单，含当前版本、「设置… ⌘,」+「退出 Smelt ⌘Q」
-/// （跟侧栏「设置」一样开独立设置窗口，符合 mac 惯例）；帮助文档和反馈问题按 mac 惯例
-/// 放「帮助」菜单。设置「关于」页也有这两项，没有菜单栏的平台从那里进。
+/// 应用菜单栏：macOS 顶部「Smelt」菜单，含当前版本、插件放进来的项（见
+/// [`api::menu_items`]）、「设置… ⌘,」+「退出 Smelt ⌘Q」（符合 mac 惯例）；「帮助」菜单
+/// 全是插件放的，没人放就没有。
 ///
-/// 菜单项上的快捷键是设菜单那一刻从键表里取的，改键后要重设一次。
-fn app_menus() -> Vec<Menu> {
-    let command =
-        |title: &'static str, id: &'static str| MenuItem::action(title, RunCommand::new(id));
-    vec![
-        Menu::new("Smelt").items([
-            MenuItem::action(format!("v{}", smelt_version::VERSION), NoAction).disabled(true),
-            #[cfg(target_os = "macos")]
-            MenuItem::Separator,
-            #[cfg(target_os = "macos")]
-            command("检查更新…", "smelt.app/check-update"),
-            MenuItem::Separator,
-            command("设置…", "smelt.app/settings"),
-            MenuItem::Separator,
-            command("退出 Smelt", "smelt.app/quit"),
-        ]),
-        Menu::new("帮助").items([
-            command("帮助文档", "smelt.app/docs"),
-            command("反馈问题", "smelt.app/report-issue"),
-        ]),
-    ]
+/// 菜单项上的快捷键是设菜单那一刻从键表里取的，改键后要重设一次；插件的菜单项变了也发
+/// `CommandsChanged`，跟着重设。
+fn app_menus(cx: &App) -> Vec<Menu> {
+    let entries = api::menu_items(cx);
+    let plugin_items = |slot: api::MenuSlot| -> Vec<MenuItem> {
+        entries
+            .iter()
+            .filter(|entry| entry.slot == slot)
+            .map(|entry| {
+                MenuItem::action(entry.title.get(), RunCommand::new(entry.command.clone()))
+            })
+            .collect()
+    };
+    let command = |title: std::borrow::Cow<'static, str>, id: &'static str| {
+        MenuItem::action(SharedString::from(title), RunCommand::new(id))
+    };
+    let app_items = plugin_items(api::MenuSlot::App);
+    let mut app_menu =
+        vec![MenuItem::action(format!("v{}", smelt_version::VERSION), NoAction).disabled(true)];
+    if !app_items.is_empty() {
+        app_menu.push(MenuItem::Separator);
+        app_menu.extend(app_items);
+    }
+    app_menu.extend([
+        MenuItem::Separator,
+        command(t!("menu.settings"), "smelt.app/settings"),
+        MenuItem::Separator,
+        command(t!("menu.quit"), "smelt.app/quit"),
+    ]);
+    let mut menus = vec![Menu::new("Smelt").items(app_menu)];
+    let help_items = plugin_items(api::MenuSlot::Help);
+    if !help_items.is_empty() {
+        menus.push(Menu::new(SharedString::from(t!("menu.help"))).items(help_items));
+    }
+    menus
 }
 
 /// 快捷键的全局状态：用户的覆盖、每条命令现在的键，以及设置页正在录哪一条。
@@ -285,7 +272,8 @@ pub(crate) fn init(cx: &mut App) {
     install(cx);
     let events = api::events(cx);
     cx.subscribe(&events, |_, event, cx| {
-        if matches!(event, HostEvent::CommandsChanged) {
+        // 菜单栏上的字（命令、插件菜单项的标题）跟着界面语言变，换了语言重设一次。
+        if matches!(event, HostEvent::CommandsChanged | HostEvent::LocaleChanged) {
             install(cx);
         }
     })
@@ -338,7 +326,7 @@ fn install(cx: &mut App) {
     };
     cx.clear_key_bindings();
     cx.bind_keys(rebuilt);
-    cx.set_menus(app_menus());
+    cx.set_menus(app_menus(cx));
 }
 
 /// smelt 那一段换成 `app`，放在原来第一条 smelt 键的位置；原来没有就接在最后。
@@ -410,7 +398,7 @@ fn apply_saved(
         Err(error) => {
             eprintln!("[keymap] 保存快捷键 {failed} 失败：{error}");
             cx.update_global::<KeymapState, _>(|state, _| {
-                state.error = Some((failed, format!("保存失败：{error}")));
+                state.error = Some((failed, t!("error.save_failed", error = error).into_owned()));
             });
         }
     }
@@ -433,8 +421,8 @@ pub(crate) fn cancel_reassign(cx: &mut App) {
     cx.update_global::<KeymapState, _>(|state, _| state.reassign = None);
 }
 
-/// 设置页点了某条的键帽：开始录。设置窗口里的下一次按键先到这里，不派发成动作，所以
-/// ⌘W、⌘Q 这种已经有用处的键也录得到。按键落在别的窗口（设置窗口关了、切走了）就不录了，
+/// 设置页点了某条的键帽：开始录。这扇窗口里的下一次按键先到这里，不派发成动作，所以
+/// ⌘W、⌘Q 这种已经有用处的键也录得到。按键落在别的窗口（这扇关了、切走了）就不录了，
 /// 那个键照常交给那个窗口。
 pub(crate) fn start_recording(id: SharedString, window: &Window, cx: &mut App) {
     let recording_window = window.window_handle().window_id();
@@ -536,7 +524,7 @@ fn recorded<'a>(
     }
     // 应用键先于终端和输入框派发：⌃ / ⌥ 组合会抢走 shell 和 readline 的键。
     if !modifiers.platform && !is_function_key(&keystroke.key) {
-        return Recorded::Rejected("要带 ⌘：⌃ 和 ⌥ 组合留给终端和输入框".to_string());
+        return Recorded::Rejected(t!("record.needs_cmd").into_owned());
     }
     let keystroke = Keystroke {
         modifiers: *modifiers,
@@ -547,7 +535,14 @@ fn recorded<'a>(
         .iter()
         .find(|(reserved, _)| same_key(reserved, &keystroke, os))
     {
-        return Recorded::Rejected(format!("{} 留给{what}", display(&keystroke)));
+        return Recorded::Rejected(
+            t!(
+                "record.reserved",
+                key = smelt_ui::keybind::label(&keystroke, os),
+                what = what()
+            )
+            .into_owned(),
+        );
     }
     if let Some(other) = bound.iter().find(|other| {
         other.info.id.as_ref() != id
@@ -575,20 +570,22 @@ fn recorded<'a>(
                 && only.inner().key == keystroke.key)
     });
     if let Some(binding) = taken {
-        return Recorded::Rejected(format!(
-            "{} 已被别的功能占用（{}）",
-            display(&keystroke),
-            binding.action().name()
-        ));
+        return Recorded::Rejected(
+            t!(
+                "record.taken",
+                key = smelt_ui::keybind::label(&keystroke, os),
+                action = binding.action().name()
+            )
+            .into_owned(),
+        );
     }
     Recorded::Set(Some(keystroke.unparse(os)))
 }
 
-/// 键表里改不了、录键时要让开的键。命令的键按 [`Bound`] 算冲突，不看键表里的旧键；设置
-/// 窗口自己的关窗键只在设置窗口里生效，不和工作台的键冲突。
+/// 键表里改不了、录键时要让开的键。命令的键按 [`Bound`] 算冲突，不看键表里的旧键。
 fn is_fixed(binding: &KeyBinding) -> bool {
     let action = binding.action().as_any();
-    !action.is::<RunCommand>() && !action.is::<NoAction>() && !action.is::<CloseSettingsWindow>()
+    !action.is::<RunCommand>() && !action.is::<NoAction>()
 }
 
 fn same_key(spec: &str, keystroke: &Keystroke, os: OperatingSystem) -> bool {
@@ -604,10 +601,6 @@ fn is_function_key(key: &str) -> bool {
 
 fn is_modifier_key(key: &str) -> bool {
     matches!(key, "shift" | "control" | "alt" | "platform" | "function")
-}
-
-pub(crate) fn display(keystroke: &Keystroke) -> String {
-    gpui_component::kbd::Kbd::format(keystroke)
 }
 
 #[cfg(test)]

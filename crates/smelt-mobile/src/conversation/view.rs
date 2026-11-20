@@ -7,18 +7,19 @@ use smelt_model::acp_chat::{
 };
 use smelt_model::acp_conn::{ModelProviderGroup, ModelState, SessionConfigState};
 use smelt_model::acp_session::{
-    ApprovalDetailsView, ConversationSnapshot, ElicitFieldKindView, PendingElicitation,
-    PendingPermission, PermissionOptionKindView, PlanEntryStatusView,
+    ApprovalDetailsView, ConversationSnapshot, ElicitFieldKindView, ElicitOptionView,
+    PendingElicitation, PendingPermission, PermissionOptionKindView, PlanEntryStatusView,
 };
 use smelt_model::daemon_state::DaemonPhase;
 
 use crate::api::conversation::{
-    ApprovalDetails, ApprovalKind, ChoiceOption, ConfigOption, ContextUsage, ConversationEntry,
-    ConversationImage, ConversationMemoryChange, ConversationMemoryChanges, ConversationNotice, ConversationPhase, ConversationView, DiffLine, DiffOp,
-    DiffView, Elicitation, ElicitationField, ElicitationFieldKind, EntryKind, ImageRef,
-    ModelProvider, ModelSelector, PermissionOption, PermissionOptionKind, PermissionRequest,
-    PlanStep, PlanStepStatus, SlashCommand, TaskNoteKind, TaskNoteView, ToolCallView, ToolKind,
-    ToolOutput, ToolOutputKind, ToolStatus,
+    ApprovalDetails, ApprovalKind, AskAnswerView, AskOutcome, AskView, ChoiceOption, ConfigOption,
+    ContextUsage, ConversationEntry, ConversationImage, ConversationMemoryChange,
+    ConversationMemoryChanges, ConversationNotice, ConversationPhase, ConversationView, DiffLine,
+    DiffOp, DiffView, Elicitation, ElicitationField, ElicitationFieldKind, ElicitationOption,
+    EntryKind, ImageRef, ModelProvider, ModelSelector, PermissionOption, PermissionOptionKind,
+    PermissionRequest, PlanStep, PlanStepStatus, SlashCommand, TaskNoteKind, TaskNoteView,
+    ToolCallView, ToolKind, ToolOutput, ToolOutputKind, ToolStatus,
 };
 
 /// 投影出视图，条目只投影从绝对下标 `from` 起的那段（落在窗口外就夹回窗口里）：前面的
@@ -43,7 +44,7 @@ pub(crate) fn conversation_view(
         compacting: snapshot.compacting,
         notice: snapshot.notice.as_ref().map(|notice| ConversationNotice {
             id: to_i64_u64(notice.id),
-            text: notice.text.clone(),
+            text: notice.display_text(),
         }),
         memory_changes: snapshot
             .memory_changes
@@ -67,12 +68,12 @@ pub(crate) fn conversation_view(
                         name: entry.name.clone(),
                         description: entry.description.clone(),
                         created: entry.created,
-                        pending_reason: entry.pending_reason.clone(),
+                        pending_reason: entry.pending_reason_text(),
                         body: entry.body.clone(),
                     })
                     .collect(),
             }),
-        end_reason: snapshot.end_reason.clone(),
+        end_reason: snapshot.end_text(),
         session_title: snapshot.session_title.clone(),
         turn_started_at_ms: snapshot.turn_started_at_ms.map(to_i64_u64),
         last_turn_duration_ms: snapshot
@@ -177,6 +178,7 @@ fn blank_entry(index: i64, kind: EntryKind) -> ConversationEntry {
         images: Vec::new(),
         tool_call: None,
         task_note: None,
+        ask: None,
     }
 }
 
@@ -199,6 +201,14 @@ pub(crate) fn conversation_entry(index: i64, entry: &AcpEntry) -> ConversationEn
             text: text.clone(),
             thought: *thought,
             ..blank_entry(index, EntryKind::Assistant)
+        },
+        AcpEntry::ToolCall {
+            status,
+            asked: Some(record),
+            ..
+        } => ConversationEntry {
+            ask: ask_view(*status, record),
+            ..blank_entry(index, EntryKind::Ask)
         },
         AcpEntry::ToolCall {
             id,
@@ -232,9 +242,14 @@ pub(crate) fn conversation_entry(index: i64, entry: &AcpEntry) -> ConversationEn
                 )
             }
         }
-        AcpEntry::Divider(label) => ConversationEntry {
-            text: label.clone(),
+        AcpEntry::Divider(_) | AcpEntry::NewSession { .. } => ConversationEntry {
+            text: entry.divider_label().unwrap_or_default(),
             ..blank_entry(index, EntryKind::Divider)
+        },
+        // 回合失败按助手正文画：原话加下一步，按手机的语言说。
+        AcpEntry::TurnFailed { detail, hint } => ConversationEntry {
+            text: acp_chat::turn_failed_text(detail, *hint),
+            ..blank_entry(index, EntryKind::Assistant)
         },
         AcpEntry::TaskNote(note) => ConversationEntry {
             text: note.summary(),
@@ -242,6 +257,27 @@ pub(crate) fn conversation_entry(index: i64, entry: &AcpEntry) -> ConversationEn
             ..blank_entry(index, EntryKind::TaskNote)
         },
     }
+}
+
+/// 和桌面同一规则：没答完不出；结束了却一题没答是「没有回答」。
+fn ask_view(status: ToolCallStatus, record: &acp_chat::AskRecord) -> Option<AskView> {
+    let outcome = match status {
+        ToolCallStatus::Pending | ToolCallStatus::InProgress => return None,
+        ToolCallStatus::Failed if record.answers.is_empty() => AskOutcome::Unanswered,
+        _ if record.skipped => AskOutcome::Skipped,
+        _ => AskOutcome::Answered,
+    };
+    Some(AskView {
+        outcome,
+        answers: record
+            .answers
+            .iter()
+            .map(|item| AskAnswerView {
+                question: item.question.clone(),
+                answer: item.answer.clone(),
+            })
+            .collect(),
+    })
 }
 
 /// 大图（`original` 有值）不内联；内联的 base64 解不开就当没有字节，界面画占位。
@@ -431,13 +467,13 @@ pub(crate) fn elicitation(pending: &PendingElicitation) -> Elicitation {
             let (kind, options, secret, url) = match &field.kind {
                 ElicitFieldKindView::Select(options) => (
                     ElicitationFieldKind::Select,
-                    options.iter().map(|option| option.label.clone()).collect(),
+                    options.iter().map(elicitation_option).collect(),
                     false,
                     None,
                 ),
                 ElicitFieldKindView::MultiSelect(options) => (
                     ElicitationFieldKind::MultiSelect,
-                    options.iter().map(|option| option.label.clone()).collect(),
+                    options.iter().map(elicitation_option).collect(),
                     false,
                     None,
                 ),
@@ -474,6 +510,13 @@ pub(crate) fn elicitation(pending: &PendingElicitation) -> Elicitation {
         message: pending.message.clone(),
         fields,
         is_ready,
+    }
+}
+
+fn elicitation_option(option: &ElicitOptionView) -> ElicitationOption {
+    ElicitationOption {
+        label: option.display_label(),
+        description: option.description.clone(),
     }
 }
 
@@ -581,15 +624,15 @@ fn model_selector(model: &ModelState) -> ModelSelector {
 fn config_option(config: &SessionConfigState) -> ConfigOption {
     ConfigOption {
         config_id: config.config_id.clone(),
-        name: config.name.clone(),
-        description: config.description.clone(),
-        current_name: config.current_name.clone(),
+        name: config.display_name(),
+        description: config.display_description(),
+        current_name: config.current_label(),
         options: config
             .options
             .iter()
             .map(|(value, name)| ChoiceOption {
                 value: value.clone(),
-                name: name.clone(),
+                name: config.option_label(value, name),
                 selected: name == &config.current_name,
             })
             .collect(),
@@ -711,12 +754,49 @@ mod tests {
         let note = view.entries[6].task_note.as_ref().unwrap();
         assert_eq!(note.kind, TaskNoteKind::Subagent);
         assert_eq!(note.exit_code, Some(1));
-        assert!(view.entries[6].text.contains("子智能体"));
+        assert!(view.entries[6].text.contains("Subagent"));
         assert_eq!(view.entries[7].text, "全部完成");
 
         // 空白正文不算最终回答，往前找到完成信号。
         assert_eq!(view.final_answer_index, Some(7));
         assert_eq!(view.last_turn_duration_ms, Some(3500));
+    }
+
+    #[test]
+    fn an_ask_shows_its_answers_once_it_is_settled() {
+        let ask = |status: &str, answers: serde_json::Value, skipped: bool| {
+            json!({"ToolCall": {
+                "id": "ask-1", "title": "smelt_ask_user", "kind": "other", "status": status,
+                "output": [], "asked": {"answers": answers, "skipped": skipped},
+            }})
+        };
+        let answered = json!([{"question": "按哪个方案做？", "answer": ["按推荐方案"]}]);
+        let snapshot = snapshot_from(json!({
+            "entries": [
+                ask("in_progress", json!([]), false),
+                ask("completed", answered.clone(), false),
+                ask("completed", json!([{"question": "清缓存吗？", "answer": []}]), true),
+                ask("failed", json!([]), false),
+            ],
+        }));
+        let entries = conversation_view("acp-1", &snapshot, 0).entries;
+        assert!(entries.iter().all(|entry| entry.kind == EntryKind::Ask));
+        assert!(
+            entries.iter().all(|entry| entry.tool_call.is_none()),
+            "不当工具画"
+        );
+        assert_eq!(entries[0].ask, None, "还在等时不出，题在单据上");
+        let outcome = |ix: usize| entries[ix].ask.as_ref().unwrap().outcome;
+        assert_eq!(outcome(1), AskOutcome::Answered);
+        assert_eq!(
+            entries[1].ask.as_ref().unwrap().answers,
+            vec![AskAnswerView {
+                question: "按哪个方案做？".into(),
+                answer: vec!["按推荐方案".into()],
+            }]
+        );
+        assert_eq!(outcome(2), AskOutcome::Skipped);
+        assert_eq!(outcome(3), AskOutcome::Unanswered);
     }
 
     #[test]
@@ -781,7 +861,7 @@ mod tests {
         let pending = json!({
             "message": "选一下",
             "fields": [
-                {"key": "color", "title": "颜色", "required": true, "kind": {"Select": [{"label": "红"}, {"label": "绿"}]}},
+                {"key": "color", "title": "颜色", "required": true, "kind": {"Select": [{"label": "红", "description": "暖色"}, {"label": "绿"}]}},
                 {"key": "tags", "title": "标签", "required": false, "kind": {"MultiSelect": [{"label": "a"}, {"label": "b"}]}},
                 {"key": "name", "title": "名字", "kind": {"Text": {"secret": true}}},
                 {"key": "login", "title": "登录", "required": true, "kind": {"ExternalUrl": "https://example.com"}},
@@ -794,7 +874,19 @@ mod tests {
         let elicitation = view.pending_elicitation.unwrap();
         let fields = &elicitation.fields;
         assert_eq!(fields[0].kind, ElicitationFieldKind::Select);
-        assert_eq!(fields[0].options, ["红", "绿"]);
+        assert_eq!(
+            fields[0].options,
+            [
+                ElicitationOption {
+                    label: "红".into(),
+                    description: Some("暖色".into()),
+                },
+                ElicitationOption {
+                    label: "绿".into(),
+                    description: None,
+                },
+            ]
+        );
         assert_eq!(fields[0].chosen, [1]);
         assert_eq!(fields[1].kind, ElicitationFieldKind::MultiSelect);
         assert!(!fields[1].required);

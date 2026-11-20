@@ -25,6 +25,7 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
+use rust_i18n::t;
 use smelt_model::control_api::DevicePair;
 use smelt_model::remote_config::PairParams;
 use smelt_runtime_client::RuntimeClient;
@@ -107,6 +108,10 @@ pub(crate) struct Link {
     /// 盯着这条链路当前的连接，返回的守卫丢掉就不再盯。还没连上或已经断了时立刻报
     /// [`LinkChange::Closed`]。阻塞（`block_on`），只在普通线程上调。
     pub watch: Arc<dyn Fn(OnLinkChange) -> Box<dyn Send> + Send + Sync>,
+    /// 关掉这条链路：上面的长连接立刻读到 EOF，之后再开流直接失败、不重拨。链路被弃用（确认失败、
+    /// 换了新链路）时调，免得还拿着旧客户端的订阅挂在僵死的连接上等 QUIC 空闲超时。阻塞
+    /// （`block_on`），只在普通线程上调。
+    pub close: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// 到某个运行时的路由，能反复建新链路。
@@ -534,7 +539,7 @@ impl ConnectionHub {
             inner.retire();
             let error = error(
                 SmeltErrorKind::Other,
-                format!("起不了连接线程：{spawn_error}"),
+                t!("error.thread_failed", error = spawn_error),
             );
             inner.publish(event(
                 ConnectionState::Disconnected,
@@ -586,7 +591,10 @@ fn supervise(shared: Arc<Shared>, session: Arc<Session>, timing: Timing, mut fai
                         ConnectionState::Reconnecting,
                         Some(&session.target),
                         None,
-                        Some(error(SmeltErrorKind::Offline, "到运行时的连接断了")),
+                        Some(error(
+                            SmeltErrorKind::Offline,
+                            t!("error.connection_dropped"),
+                        )),
                     ));
                     true
                 }
@@ -624,13 +632,23 @@ fn supervise(shared: Arc<Shared>, session: Arc<Session>, timing: Timing, mut fai
         let target = Some(&session.target);
         match outcome {
             Ok(metrics) => {
-                if fresh {
-                    *session.link.lock().unwrap_or_else(|e| e.into_inner()) = link;
+                let replaced = fresh.then(|| {
+                    std::mem::replace(
+                        &mut *session.link.lock().unwrap_or_else(|e| e.into_inner()),
+                        link,
+                    )
+                });
+                if replaced.is_some() {
                     log::info!("运行时已重新连上：{}", session.target.endpoint_id);
                 }
                 failures = 0;
                 inner.publish(session.connected(Some(metrics)));
                 drop(inner);
+                // 旧链路在锁外关（会 block_on）。先推了 Connected 再关也不要紧：订阅在离开
+                // Connected 时就放掉了旧链路上的流。
+                if let Some(old) = replaced {
+                    (old.close)();
+                }
                 if watch.is_none() {
                     watch = Some(session.watch());
                 }
@@ -658,6 +676,9 @@ fn supervise(shared: Arc<Shared>, session: Arc<Session>, timing: Timing, mut fai
                 ));
                 drop(inner);
                 watch = None;
+                // 当它断了就真的关掉：还拿着旧客户端的开流、读写立刻失败，不在僵死的连接上
+                // 等到空闲超时，旧连接器也不会自己去重拨。
+                (session.link().close)();
                 redial = true;
             }
             Err(error) => {
@@ -685,7 +706,7 @@ fn is_terminal(kind: SmeltErrorKind) -> bool {
 }
 
 fn superseded() -> SmeltError {
-    error(SmeltErrorKind::Cancelled, "已切换到别的连接请求")
+    error(SmeltErrorKind::Cancelled, t!("error.superseded"))
 }
 
 fn describe(link: &Link, target: &Target, timeout: Duration) -> Result<RuntimeInfo, SmeltError> {
@@ -709,12 +730,9 @@ fn runtime_info(
         )
     })?;
     let daemon = described.daemon;
-    let runtime_id = daemon.runtime_id.ok_or_else(|| {
-        error(
-            SmeltErrorKind::RuntimeOutdated,
-            "这个运行时太旧，没有 runtime_id，先升级它",
-        )
-    })?;
+    let runtime_id = daemon
+        .runtime_id
+        .ok_or_else(|| error(SmeltErrorKind::RuntimeOutdated, t!("error.runtime_too_old")))?;
     Ok(RuntimeInfo {
         runtime_id,
         hostname: daemon.hostname,
@@ -729,15 +747,16 @@ fn runtime_info(
 /// `device.pair` 是配对码无效或过期。
 fn control_error(error: ControlClientError, denied: SmeltErrorKind) -> SmeltError {
     match error {
-        ControlClientError::Transport(message) => {
-            crate::api::error::error(SmeltErrorKind::Offline, format!("连不上运行时：{message}"))
-        }
+        ControlClientError::Transport(message) => crate::api::error::error(
+            SmeltErrorKind::Offline,
+            t!("error.unreachable", error = message),
+        ),
         ControlClientError::Protocol(error) => {
             let kind = match error.code {
                 ControlErrorCode::PermissionDenied => denied,
                 _ => crate::api::error::outdated_kind(&error).unwrap_or(SmeltErrorKind::Other),
             };
-            crate::api::error::error(kind, error.message)
+            crate::api::error::error(kind, error.text())
         }
         ControlClientError::InvalidRequest(message)
         | ControlClientError::InvalidResponse(message) => {

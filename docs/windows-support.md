@@ -13,11 +13,12 @@
 
 - `smelt` 桌面端在 Windows 10 1803 及以上（x86_64）编过、跑起来，通过 iroh 连已配对的 Linux / macOS 运行时，对话、终端、文件树、Git 面板、远程桌面照常用。
 - Windows 原生 CI 检查，发版产出 zip 便携包。
+- 窗口材质（`window_backdrop.rs`）：Windows 11 22H2（build 22621）起用 GPUI 的 `MicaBackdrop`，整窗拿 Mica 做底，布局声明了材质的地方透出它、别处铺实色（系统背景材质只能整窗一种，侧栏、窗口底两种用途在 Windows 上分不出来），窗口的深色标记跟 smelt 的主题；更早的版本主窗口不透明、铺主题底色，不退到 Acrylic（`Blurred`），拖窗口会卡。
 
 不做：
 
 - 自动更新、代码签名、安装包。
-- 系统通知、状态栏图标、Dock 角标、液态玻璃。这些模块的非 macOS 实现保持为空（`status_item.rs`、`dock.rs`、`liquid_glass.rs`）。
+- 系统通知、状态栏图标、Dock 角标。这些模块的非 macOS 实现保持为空（`status_item.rs`、`dock.rs`）。
 
 ## 前提
 
@@ -93,7 +94,7 @@
 1. **本机运行时在所有桌面平台上都有**：Windows 也跑 smeltd 之后，`local_runtime_supported()` 恒为真，已删除。
 2. **`Runtime::local()` 直接返回 `Runtime`**。过渡期它返回过 `Option<Runtime>`，用来逼出每个调用点的处理；三个桌面平台都有本机之后，`None` 分支全部是死代码，一并删掉。
 3. **空间合一**：`local` 和 `remote_spaces` 合成 `spaces: Vec<RuntimeSpace>`，有本机时本机在前，`space()` 等去掉本机特判。那 14 处 `self.local` 原本为本机冷启动恢复而设，逐个确认原意后改成读会话所属运行时的空间，改之前要确认远程空间的恢复语义一致。
-4. **smeltd 生命周期独立成模块**：`terminal.rs` 里上面那段挪到 `local_daemon.rs`。现在是 `cfg(any(unix, windows))`，`runtimes::connect_terminal` 在本机分支调它。Windows 用 `spawn_detached`、`ExclusiveFile`、`pid_is_alive`，升级不交接。
+4. **smeltd 生命周期独立成模块**：`terminal.rs` 里上面那段挪到 `local_daemon.rs`。现在是 `cfg(any(unix, windows))`，`runtimes::connector` 在本机分支调它。Windows 用 `spawn_detached`、`ExclusiveFile`、`pid_is_alive`，升级不交接。
 5. **只认本机的功能**按下表处理：
 
 | 功能 | 位置 | 没有本机运行时时 |
@@ -151,10 +152,10 @@
 - **IPC**。守护只有一条监听：`smeltd.sock` 这个路径对应的命名管道 `\\.\pipe\smelt-<sid>-daemon-<路径哈希>`（`daemon_pipe_path`），DACL 只给当前用户、拒绝远程客户端。Rust 客户端（桌面、`smelt-notify`、runtime client）照旧拿 sock 路径调 `RuntimeStream::connect`，Windows 上换成管道名去连，不建这个文件；交给 Bun / Pi / shell 的 `SMELT_SOCK` 直接是管道名，Node 的 `net.connect(path)` 只认它。守护的 accept 循环是同步线程，不把监听塞进 tokio。
 - **单实例**。不能像 Unix 那样「连得上就是有守护」：前任退出后，它的客户端还没关的那几端让管道名继续存在、实例都在忙。所以守护活着就一直握着 `smeltd.instance.lock`（进程没了系统替它放掉），拿到锁才接手管道名（`bind_taking_over`）。停机在回执前叫停监听、放掉这把锁，接班的守护才拿得到。
 - **排队**。管道没有套接字那样的 backlog，只有正在等客户端的那一个实例能连。`PipeListener` 在 `bind` 时起一条接受线程，不停地建实例、等客户端，连上的放进有界队列（64 条），`accept` 从队列里取。守护绑好管道就报就绪，接受循环等初始化做完才起来，中间连上来的客户端照样排上队。叫停时队列里还没取走的连接一起关掉，客户端去重连接班的守护。
-- **鉴权**。macOS 的 codesign 路径不动。Windows 走同一用户 SID：pid 来自管道的 `GetNamedPipeClientProcessId`，exe 来自 `process_executable`，必须 `same_user_as_current`，并且不能是守护自己的 pid。basename 和 `"smelt"` 比的时候去掉一个结尾的 `.exe`、大小写不敏感，不另加一行表，免得 macOS 的 signing-id 列分叉。路径要和守护目录旁边的 `smelt.exe` 相同，或者和 `SMELT_BUNDLE_DIR`（桌面拉起守护时写成 GUI exe 所在目录）旁边的 `smelt.exe` 相同。托管映像是 `~/.smelt/bin/smeltd-<指纹>.exe`，GUI 在安装目录，只认守护目录的兄弟会把桌面拒掉。不做 Authenticode。
-- **升级**。不交接 fd（`handoff_v2` 已删）。升级先拨启动名，再优雅停机：收割子进程、回写未完成回合、WAL checkpoint，最后回执。Unix 回执后在本进程里 `exec` 新映像；Windows 不能 `exec`，拉起目标映像当接班进程（`SMELTD_PREDECESSOR_PID` 告诉它前任是谁），接班进程等前任退出、放掉监听再绑定；30 秒还没退就是卡在退出路上，结束它再绑（只认创建时间早于自己的那个 pid，不会误杀复用了 pid 的进程）。不结束的话，旧版本的前任停机时不关 Bun 那条管道的监听，会和接班进程挂在同一个管道名下。没有桌面的运行时（推送升级、空闲自升级）也能换上新版。终端会话和进行中的回合会中断，历史还在。
-- **守护映像**。不建符号链接（那要额外权限）。发布是复制或硬链接到 `smeltd-<指纹>.exe`，启动名是旁边的 `smelt-image-v1` 指针文件。`launch_executable` 读出真正要执行的那份。
-- **Bun**。`scripts/fetch-bun.sh` 在 Windows 上取 `bun-windows-x64.zip`（Bun 1.4.4），装成 `bin/bun.exe`（硬链接或复制）。`agent/scripts/build-smelt-agent.sh` 编出 `smelt-agent.exe`。
+- **鉴权**。macOS 的 codesign 路径不动。Windows 走同一用户 SID：pid 来自管道的 `GetNamedPipeClientProcessId`，exe 来自 `process_executable`，必须 `same_user_as_current`，并且不能是守护自己的 pid。basename 和 `"smelt"` 比的时候去掉一个结尾的 `.exe`、大小写不敏感，不另加一行表，免得 macOS 的 signing-id 列分叉。路径要和守护目录旁边的 `smelt.exe` 相同，或者和 `SMELT_BUNDLE_DIR`（桌面拉起守护时写成 GUI exe 所在目录）旁边的 `smelt.exe` 相同。托管的守护是 `~/.smelt/bin/smeltd.exe`，GUI 在安装目录，只认守护目录的兄弟会把桌面拒掉。不做 Authenticode。
+- **升级**。不交接 fd（`handoff_v2` 已删）。升级先优雅停机：收割子进程、回写未完成回合、WAL checkpoint，最后回执。Unix 回执后在本进程里 `exec` 新版本；Windows 不能 `exec`，拉起新版本当接班进程（`SMELTD_PREDECESSOR_PID` 告诉它前任是谁），接班进程等前任退出、放掉监听再绑定；30 秒还没退就是卡在退出路上，结束它再绑（只认创建时间早于自己的那个 pid，不会误杀复用了 pid 的进程）。不结束的话，旧版本的前任停机时不关 Bun 那条管道的监听，会和接班进程挂在同一个管道名下。终端会话和进行中的回合会中断，历史还在。
+- **守护和 smelt-agent 的位置**。不建符号链接（那要额外权限）。守护复制成 `~/.smelt/bin/smeltd.exe`，smelt-agent 一整套复制进 `~/.smelt/bin/agent\`。正在执行的 exe 换不掉，所以桌面一律先停守护再装（新版桌面起来后等没有进行中的会话再重启守护）。
+- **Bun**。`scripts/fetch-bun.sh` 在 Windows 上从 npm 取 `@oven/bun-windows-x64`（版本见脚本），装成 `bin/bun.exe`（硬链接或复制）。`agent/scripts/build-smelt-agent.sh` 编出 `smelt-agent.exe`。
 - **Shell 和进程**。交互终端是 `COMSPEC` 或 `cmd.exe`，参数 `/d /k`。没有参数的自动化 Shell 脚本同样走 `cmd.exe /d /c`，不调用 bash。子进程放进 Job Object，`KILL_ON_JOB_CLOSE`。ConPTY 不能 `CREATE_SUSPENDED`，shell 起来之后立刻 `attach_running`。PTY 尺寸走 master 的 `resize`，不用 `as_raw_fd`。
 - **发版**。安装程序 `smelt-<版本>-windows-x86_64-setup.exe` 装进安装目录的是 `smelt.exe`、`smelt.com`、`smeltd.exe`、`smelt-notify.exe`、`smelt-agent.exe`，外加 Pi 要的 wasm。桌面在自己旁边找这几个 exe。`smelt.com` 是控制台子系统的命令行入口（`smelt-cli.exe` 改名），cmd / PowerShell 敲 `smelt` 先找到它。
 
@@ -166,8 +167,8 @@
 - **查**。认 Release 里的 `smelt-<版本>-windows-x86_64-setup.exe`，同一个 Release 还要有 `SHA256SUMS`，而且清单里已经有它（发版流水线等所有产物到齐才重写清单）；最新的还没齐就退到上一个，最多看三个。是不是新版比的是发版号：只有比装着的新才装，切回生产通道或退到比装着的旧时都不装回去（旧版读不了新版升级过的客户端库）。版本号认不出的候选跳过，所以更新清单要给出能解析的版本号。
 - **下**。下到 `%LOCALAPPDATA%\Smelt\update`，边下边算 SHA-256，对上清单才算下好；同一版本下过就不再下。不记持久化事务：下好的安装程序只在这次运行里等着装，重启后重新检查。启动时删掉已经装上的那个版本的安装程序和日志。
 - **装**。拉起前再校验一遍，再用 `spawn_detached` 拉起 `setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /WAITPID=<桌面 pid> /LOG=<日志> [/RELAUNCH=<桌面 exe>]`，脱离桌面的 Job，桌面随即退出。安装程序在 `InitializeSetup` 里等桌面进程退出（上限 2 分钟，超时这次不装），之后才查 `AppMutex`、换文件（Inno 源码里这两步就是这个顺序）。给了 `/RELAUNCH` 时，装好由 `[Run]` 打开新版；没装成（超时、文件被占用、又有 Smelt 开着）由 `DeinitializeSetup` 把原来那个打开。下次启动在 app.log 里记一笔，指向留下的安装日志。
-- **退出时装**。Quit 动作和关掉主窗口（Windows 上关主窗口就是退出，不走 Quit）都会装待装的更新，不重新打开。
-- **守护不停**。smeltd、smelt-agent、smelt-notify 跑的都是 `~/.smelt/bin` 里的副本，不占安装目录，换文件不用停守护，会话不断，也就不用像 macOS 那样先确认。新版桌面起来后照「守护落后就在空闲时重启」换守护。安装目录里还可能被占着的是 `smelt.com`（终端里开着的命令行），交给 Inno 的 Restart Manager 关。
+- **停守护**。和 macOS 一样：装更新时停掉本机守护，有会话在跑先确认，新版桌面起来时拉起新版守护。
+- **退出时装**。Quit 动作和关掉主窗口（Windows 上关主窗口就是退出，不走 Quit）都会装待装的更新，不重新打开。Quit 有会话在跑时先确认；关主窗口没处确认，有会话在跑就这次不装。安装目录里还可能被占着的是 `smelt.com`（终端里开着的命令行），交给 Inno 的 Restart Manager 关。
 
 ## 已定
 

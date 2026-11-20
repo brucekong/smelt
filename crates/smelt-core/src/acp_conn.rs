@@ -51,6 +51,8 @@ use agent_client_protocol::v1::{
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, Lines};
 
 pub use crate::acp_chat::AcpImage as PromptImage;
+use crate::acp_chat::TurnHint;
+use crate::acp_session::{RuntimeNote, SignInAgent};
 use crate::agent_kind::{
     BUILTIN_ADAPTER_COMMANDS, ConversationAgentKind, ConversationLaunchSpec, SMELT_AGENT_COMMAND,
     SMELT_PI_AGENT_COMMAND, TerminalAgentKind,
@@ -86,6 +88,10 @@ pub struct ConversationLaunch {
     pub fork_cut: Option<AcpForkCut>,
     /// 这个 Pi 会话的跨对话请求。来源会话绑在闭包里。非 Pi 会话是 `None`。
     pub peer_handler: Option<crate::background_tasks::PeerRequestHandler>,
+    /// 这次拉起的 agent 不许用的工具，Claude 权限规则的写法（`Edit`、`Bash(git push:*)`）。
+    /// 由 agent 自己的权限引擎执行，任何权限模式下都生效。只有 Claude 适配器认；非空时
+    /// 别的 agent 起不来，不悄悄放开跑（见 [`supports_disallowed_tools`]）。
+    pub disallowed_tools: Vec<String>,
 }
 
 /// 回退到一条用户消息之前以后，这条消息怎么办。
@@ -149,7 +155,7 @@ pub enum ConversationCommand {
     /// 走 cmd 通道而不是在回调里直接发事件，是为了让收尾发生在连接循环里：
     /// 循环拿到它时会先把 update 队列里已到的流式更新排空，保证「正文先到、
     /// 回合结束后到」的顺序。
-    PromptSettled(Result<StopReason, String>),
+    PromptSettled(Result<StopReason, FailedTurn>),
     /// 取消当前 turn（session/cancel 通知）。支持原生队列的驱动会先 `clear_queue`
     /// 再 abort，避免队列在 abort 之后继续跑。
     Cancel,
@@ -186,7 +192,9 @@ pub enum ConversationRestoreFailure {
     HistoryMissing,
     /// agent 没有声明或实现 `session/load`。
     UnsupportedLoad,
-    /// 其他恢复失败，通常可以重试。
+    /// agent 要求先登录（`auth_required`）。`detail` 是它的原话。
+    SignInRequired { agent: SignInAgent, detail: String },
+    /// 其他恢复失败，通常可以重试。带底层原话。
     Failed(String),
 }
 
@@ -202,8 +210,9 @@ impl ConversationRestoreFailure {
 impl std::fmt::Display for ConversationRestoreFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HistoryMissing => write!(f, "旧会话记录不存在，无法恢复"),
-            Self::UnsupportedLoad => write!(f, "agent 不支持 session/load，无法恢复历史对话"),
+            Self::HistoryMissing => write!(f, "the earlier session no longer exists"),
+            Self::UnsupportedLoad => write!(f, "the agent doesn't support session/load"),
+            Self::SignInRequired { detail, .. } => write!(f, "the agent needs sign-in: {detail}"),
             Self::Failed(message) => f.write_str(message),
         }
     }
@@ -221,7 +230,7 @@ where
     smol::future::race(request, async move {
         smol::Timer::after(ACP_HANDSHAKE_TIMEOUT).await;
         Err(agent_client_protocol::Error::internal_error().data(format!(
-            "ACP {method} 超时（{} 秒）",
+            "ACP {method} timed out ({}s)",
             ACP_HANDSHAKE_TIMEOUT.as_secs()
         )))
     })
@@ -233,12 +242,14 @@ pub enum ConversationEvent {
     /// 启动阶段的进度文案（下载运行时 / 拉取适配器等），Starting 横幅显示，
     /// Ready 清掉。只有建连阶段能发：别的时候发出去没人清，会一直挂着。
     StartupProgress(String),
-    /// 用户该看到的一次性提示（插话、压缩、停后台任务失败等）。显示在输入框上方，
+    /// 智能体（或它的扩展）发给用户看的一次性提示，原话。显示在输入框上方，
     /// 下一回合开始时清掉；不能走 `StartupProgress`，那条只在启动横幅里显示。
     Notice(String),
-    /// agent 没接受会话配置修改。和 `Notice` 一样给用户看，另带类别，
+    /// 运行时自己要说的一次性提示（插话、压缩、停后台任务失败等），发种类，各端按语言说。
+    RuntimeNotice(RuntimeNote),
+    /// agent 没接受会话配置修改。和 `RuntimeNotice` 一样给用户看，另带类别，
     /// 好让客户端撤掉没生效的勾选、守护停止等待配置确认。
-    ConfigRejected(String),
+    ConfigRejected(RuntimeNote),
     /// 冷恢复即将由 agent 重放完整历史。必须先清空 daemon 中的旧投影；Ready
     /// 到达时历史可能已经同步回放完，不能再在那里清空。
     HistoryReplayStarted,
@@ -309,6 +320,11 @@ pub enum ConversationEvent {
     PeerSend {
         id: String,
         send: crate::acp_chat::PeerSend,
+    },
+    /// 这次 Pi `smelt_ask_user` 问了什么、怎么答的。工具开始时是空记录，结束后补上答案。
+    AskRecord {
+        id: String,
+        record: crate::acp_chat::AskRecord,
     },
     /// 这次 Pi `subagent` 调用派出的子智能体（工具结果里的 `runs`），全量替换。
     SubagentRuns {
@@ -429,7 +445,7 @@ pub enum ConversationEvent {
     /// SDK 回调一路冒泡，把整条连接 return 掉，于是「没配 API key」这种一句话
     /// 就能改好的问题表现为整个会话猝死、输入框消失。agent 进程当时还活得好
     /// 好的。这里让回合失败、连接继续，用户改完配置直接重发即可。
-    TurnFailed(String),
+    TurnFailed(FailedTurn),
     /// 回退成功：agent 已切到目标消息之前的新分叉。`truncate_from` 和 `then` 是
     /// 发起 `Rewind` 命令时带上的，这里原样奉还；投影据 `truncate_from` 丢弃该消息
     /// 及其之后的所有条目。`then` 是 [`AfterRewind::RestoreComposer`] 时原文由紧随
@@ -444,6 +460,33 @@ pub enum ConversationEvent {
     ProviderSessionIdChanged(SessionId),
     /// 连接不可恢复地结束：启动失败 / 协议错误 / 子进程退出。带 stderr 尾巴。
     Fatal(String),
+    /// 连接时 agent 要求先登录（ACP 的 `auth_required`）。和 `Fatal` 一样结束会话，
+    /// 但结束原因带种类，各端按语言教人怎么登录。`detail` 是原话和 stderr 尾巴。
+    SignInRequired {
+        agent: SignInAgent,
+        detail: String,
+    },
+    /// 驱动这条会话的线程 panic 了。带 panic 的原话，人看到的原因由各端按语言说。
+    DriverCrashed(String),
+}
+
+/// 失败的一轮：agent 或底层报的原话，加上运行时认出来的下一步。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FailedTurn {
+    pub detail: String,
+    pub hint: Option<TurnHint>,
+}
+
+impl From<String> for FailedTurn {
+    fn from(detail: String) -> Self {
+        Self { detail, hint: None }
+    }
+}
+
+impl From<&str> for FailedTurn {
+    fn from(detail: &str) -> Self {
+        detail.to_string().into()
+    }
 }
 
 impl ConversationEvent {
@@ -567,7 +610,7 @@ fn elicitation_fields(request: &CreateElicitationRequest) -> Option<Vec<ElicitFi
         ElicitationMode::Form(form) => parse_elicit_fields(&form.requested_schema),
         ElicitationMode::Url(url) => {
             let title = if request.message.trim().is_empty() {
-                "在浏览器完成".to_string()
+                "Continue in the browser".to_string()
             } else {
                 request.message.clone()
             };
@@ -602,6 +645,7 @@ fn parse_elicit_fields(schema: &ElicitationSchema) -> Option<Vec<ElicitField>> {
                         .map(|o| ElicitOption {
                             value: ElicitationContentValue::String(o.value.clone()),
                             label: o.title.clone(),
+                            description: o.description.clone(),
                         })
                         .collect()
                 } else if let Some(values) = &s.enum_values {
@@ -610,6 +654,7 @@ fn parse_elicit_fields(schema: &ElicitationSchema) -> Option<Vec<ElicitField>> {
                         .map(|v| ElicitOption {
                             value: ElicitationContentValue::String(v.clone()),
                             label: v.clone(),
+                            description: None,
                         })
                         .collect()
                 } else {
@@ -635,11 +680,13 @@ fn parse_elicit_fields(schema: &ElicitationSchema) -> Option<Vec<ElicitField>> {
                 kind: ElicitFieldKind::Select(vec![
                     ElicitOption {
                         value: ElicitationContentValue::Boolean(true),
-                        label: "是".into(),
+                        label: "Yes".into(),
+                        description: None,
                     },
                     ElicitOption {
                         value: ElicitationContentValue::Boolean(false),
-                        label: "否".into(),
+                        label: "No".into(),
+                        description: None,
                     },
                 ]),
             }),
@@ -651,6 +698,7 @@ fn parse_elicit_fields(schema: &ElicitationSchema) -> Option<Vec<ElicitField>> {
                         .map(|v| ElicitOption {
                             value: ElicitationContentValue::String(v.clone()),
                             label: v.clone(),
+                            description: None,
                         })
                         .collect(),
                     MultiSelectItems::Titled(items) => items
@@ -659,6 +707,7 @@ fn parse_elicit_fields(schema: &ElicitationSchema) -> Option<Vec<ElicitField>> {
                         .map(|o| ElicitOption {
                             value: ElicitationContentValue::String(o.value.clone()),
                             label: o.title.clone(),
+                            description: o.description.clone(),
                         })
                         .collect(),
                     _ => Vec::new(),
@@ -769,6 +818,9 @@ pub fn shutdown_and_wait(handle: ConversationHandle, timeout: std::time::Duratio
 /// 重建同号组，不可能在该窗口内完成，探得缺席即原组已死。D-state 等杀不死的
 /// 只会探得仍在，超时返回 false（与 waitpid 路径同语义）。
 ///
+/// 僵尸让 `kill` 探针一直成功。不归我们收的僵尸（容器里 PID 1 常常不收尸）在
+/// Linux 上按 `/proc` 判：整个线程组都退出了才算不在，见 [`process_absent`]。
+///
 /// 组缺席之外还查 leader 本人：若该 pid 活着却已不在自编号组里（重设过 pgid
 /// 的非 leader），光看组会误判已死。双条件缺一不可。
 pub fn prove_process_group_dead(pid: i32, timeout: Duration) -> bool {
@@ -777,9 +829,9 @@ pub fn prove_process_group_dead(pid: i32, timeout: Duration) -> bool {
 
 /// 和 [`prove_process_group_dead`] 一样查组是否已经空了，但绝不 `waitpid`。
 ///
-/// 给「上一次等待还占着这个 pid」的重试用。僵尸对 `kill(pid, 0)` 仍算活着，
-/// 组长还没被原来的 wait 收走时，这里返回 false。原来的 wait 返回之后，
-/// 下一次才能看到这个号已经不在。
+/// 给「上一次等待还占着这个 pid」的重试用。我们自己的僵尸仍算在：组长还没被
+/// 原来的 wait 收走时，这里返回 false。原来的 wait 返回之后，下一次才能看到
+/// 这个号已经不在。
 pub fn prove_process_group_dead_without_reaping(pid: i32, timeout: Duration) -> bool {
     prove_process_group_dead_inner(pid, timeout, false)
 }
@@ -864,8 +916,9 @@ fn prove_unix_process_group_dead(pid: i32, timeout: Duration, reap_child: bool) 
         watch.sort_unstable();
         watch.dedup();
         if watch.is_empty() {
-            // 能看的 pid 都已经报过退出，组探针却还说人在（多半是还没被收走的僵尸）。
-            // 把剩下的截止时间一次睡完再查，不再隔几毫秒问。
+            // 能看的 pid 都已经报过退出，组探针却还说人在：还没被收走的僵尸，我们自己
+            // 的，或者 macOS 上等 launchd 收的。把剩下的截止时间一次睡完再查，不再隔
+            // 几毫秒问。
             if blind_wait_used {
                 return false;
             }
@@ -887,14 +940,51 @@ fn prove_unix_process_group_dead(pid: i32, timeout: Duration, reap_child: bool) 
     }
 }
 
-/// pid 本人是否已不存在。EPERM（活着但无权限）按存在处理。
+/// pid 本人已经不在，或者已经退出、只剩一个不归我们收的僵尸。EPERM（活着但
+/// 无权限）按在处理。
+///
+/// 僵尸对 `kill(pid, 0)` 仍算在。别人的僵尸可能永远没人收：容器里的 PID 1 常常
+/// 不收尸（Jupyter、sleep 之类）。它已经退出，号在被收走前也不会复用，所以算
+/// 不在。我们自己的僵尸仍算在，要留给原来的 wait 收走，见
+/// [`prove_process_group_dead_without_reaping`]。
 #[cfg(unix)]
 fn process_absent(pid: i32) -> bool {
     if pid <= 1 {
         return true;
     }
     let sent = unsafe { libc::kill(pid, 0) };
-    sent != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    if sent != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    is_foreign_zombie(pid)
+}
+
+/// 整个线程组都已退出、父进程又不是我们的僵尸。
+#[cfg(target_os = "linux")]
+fn is_foreign_zombie(pid: i32) -> bool {
+    linux_stat_after_comm(pid).is_some_and(|stat| stat_is_foreign_zombie(&stat, std::process::id()))
+}
+
+/// macOS 上过继的孤儿由 launchd 收走，不会久留僵尸；也没有 `/proc` 可以判断整个
+/// 线程组退出没有。按在处理。
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_foreign_zombie(_pid: i32) -> bool {
+    false
+}
+
+/// `/proc/<pid>/stat` 里 comm 之后的部分，是否表示整个线程组已经退出、父进程不是
+/// `self_pid`。
+///
+/// 只看状态 Z 不够：主线程先退出、别的线程还活着时（比如 SIGKILL 后有线程卡在
+/// D 状态）状态也是 Z，这时线程数大于 1，`ps` 显示成 `Zl`。
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn stat_is_foreign_zombie(after_comm: &str, self_pid: u32) -> bool {
+    // 从第 3 个字段 state 数起：state 是 0，ppid 是 1，num_threads（第 20 个字段）是 17。
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let ppid = fields.get(1).and_then(|ppid| ppid.parse::<u32>().ok());
+    fields.first() == Some(&"Z")
+        && fields.get(17) == Some(&"1")
+        && ppid.is_some_and(|ppid| ppid != self_pid)
 }
 
 /// 终止一个 provider 进程组并证明它死了：发 SIGKILL + [`prove_process_group_dead`]。
@@ -977,9 +1067,19 @@ fn process_start_time_inner(pid: i32) -> Option<std::time::SystemTime> {
 /// `/proc/<pid>/stat` 第 22 字段：自开机起的启动 tick。同一次开机内对一个进程恒定。
 #[cfg(target_os = "linux")]
 fn linux_start_ticks(pid: i32) -> Option<u64> {
+    linux_stat_after_comm(pid)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// `/proc/<pid>/stat` 里 comm 之后的部分，从第 3 个字段 state 起。comm 可能带空格
+/// 和括号，所以按最后一个 `)` 切。
+#[cfg(target_os = "linux")]
+fn linux_stat_after_comm(pid: i32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(')')?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
+    Some(stat.rsplit_once(')')?.1.to_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -1057,7 +1157,14 @@ fn process_group_absent(pgid: i32) -> bool {
         return true;
     }
     let sent = unsafe { libc::kill(-pgid, 0) };
-    sent != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    if sent != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    // 僵尸也让 kill(-pgid, 0) 成功。provider 的子进程在组长死后过继给 PID 1，
+    // 容器里的 PID 1 常常不收尸，这些僵尸会永远挂在组里。组员一个个看，全都不在
+    // 才算组已空，规则和组长本人一样，见 `process_absent`。
+    let members = process_group_members(pgid);
+    !members.is_empty() && members.iter().all(|&pid| process_absent(pid))
 }
 
 /// 这个进程组里现在还挂着哪些 pid。用来等组员退出，而不是隔几毫秒问组还在不在。
@@ -1128,9 +1235,11 @@ fn process_group_members_os(pgid: i32) -> Vec<i32> {
 
 #[cfg(target_os = "linux")]
 fn linux_process_group(pid: i32) -> Option<i32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(')')?.1;
-    after_comm.split_whitespace().nth(2)?.parse().ok()
+    linux_stat_after_comm(pid)?
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
@@ -1144,7 +1253,7 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .downcast_ref::<&str>()
         .map(|message| (*message).to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "未知异常".to_string())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 /// 一个会话的驱动崩了只结束这一次运行。调用方据此把这个会话标成失败。
@@ -1199,7 +1308,8 @@ pub fn spawn_agent_runtime(
     launch: ConversationLaunch,
     spawn_gate: Option<Arc<RwLock<()>>>,
 ) -> ConversationHandle {
-    if crate::pi_rpc::is_smelt_pi_launch(&launch.launch) {
+    // 带工具限制的 Pi 也交给 ACP 驱动：它在拉起进程之前就按「不支持限制工具」报错。
+    if crate::pi_rpc::is_smelt_pi_launch(&launch.launch) && launch.disallowed_tools.is_empty() {
         crate::pi_rpc::spawn_pi_rpc(launch, spawn_gate)
     } else {
         spawn_acp(launch, spawn_gate)
@@ -1249,17 +1359,25 @@ pub fn spawn_acp(
                 ));
                 if let Err(e) = result {
                     let tail = stderr_tail.lock().unwrap().join("\n");
-                    let msg = with_auth_required_hint(&e, &launch.launch.command, format!("{e}"));
                     let msg = if tail.is_empty() {
-                        msg
+                        format!("{e}")
                     } else {
-                        format!("{msg}\n--- agent stderr ---\n{tail}")
+                        format!("{e}\n--- agent stderr ---\n{tail}")
                     };
                     crate::app_log::error(
                         "acp",
                         &format!("会话 {} 连接异常终止：{msg}", launch.sid),
                     );
-                    let _ = event_tx.try_send(ConversationEvent::Fatal(msg));
+                    // 码也可能被 agent 用错，所以原话和 stderr 原样留着当细节。
+                    let event = if requires_sign_in(&e) {
+                        ConversationEvent::SignInRequired {
+                            agent: sign_in_agent(&launch.launch.command),
+                            detail: msg,
+                        }
+                    } else {
+                        ConversationEvent::Fatal(msg)
+                    };
+                    let _ = event_tx.try_send(event);
                 }
                 // Ok 结束（Shutdown）不发 Fatal——UI 主动关的，没必要再报。
             }));
@@ -1269,9 +1387,7 @@ pub fn spawn_acp(
                     "acp",
                     &format!("会话 {sid_for_panic} 驱动异常退出：{message}"),
                 );
-                let _ = event_tx_for_panic.try_send(ConversationEvent::Fatal(format!(
-                    "会话驱动异常退出：{message}"
-                )));
+                let _ = event_tx_for_panic.try_send(ConversationEvent::DriverCrashed(message));
             }
         })
         .expect("spawn smelt-acp thread");
@@ -1517,11 +1633,13 @@ fn classify_restore_failure(
     if error.code == agent_client_protocol::ErrorCode::METHOD_NOT_FOUND {
         return ConversationRestoreFailure::UnsupportedLoad;
     }
-    ConversationRestoreFailure::Failed(with_auth_required_hint(
-        error,
-        command,
-        format!("恢复历史对话失败，可重试：{error}"),
-    ))
+    if requires_sign_in(error) {
+        return ConversationRestoreFailure::SignInRequired {
+            agent: sign_in_agent(command),
+            detail: error.to_string(),
+        };
+    }
+    ConversationRestoreFailure::Failed(error.to_string())
 }
 
 /// 不同 ACP adapter 对「历史 rollout 不存在」使用了不同的错误形态：有的返回
@@ -1620,6 +1738,12 @@ async fn run_connection(
         in_flight_rpc,
         shutdown_requested,
     } = sync;
+    if !launch.disallowed_tools.is_empty() && !supports_disallowed_tools(&launch.launch) {
+        return Err(agent_client_protocol::Error::invalid_params().data(
+            "This agent can't restrict tools, so it can't start with the requested restrictions"
+                .to_string(),
+        ));
+    }
     let agent = build_agent(&launch.launch, &launch.ephemeral_env)?;
     let spawned = with_spawn_gate(spawn_gate.as_ref(), || {
         let mut stdio = stdio_out
@@ -1811,7 +1935,7 @@ async fn run_connection(
                         let id = request.terminal_id.to_string();
                         let snapshot = terminals
                             .snapshot(&id)
-                            .ok_or_else(|| acp_err(format!("终端不存在：{id}")))?;
+                            .ok_or_else(|| acp_err(format!("terminal not found: {id}")))?;
                         let mut response =
                             TerminalOutputResponse::new(snapshot.output, snapshot.truncated);
                         if let Some(exit) = terminals.proto_exit(&id) {
@@ -1834,7 +1958,7 @@ async fn run_connection(
                     async move {
                         let id = request.terminal_id.to_string();
                         if terminals.snapshot(&id).is_none() {
-                            return Err(acp_err(format!("终端不存在：{id}")));
+                            return Err(acp_err(format!("terminal not found: {id}")));
                         }
                         std::thread::Builder::new()
                             .name("smelt-acp-term-wait-rpc".into())
@@ -1845,7 +1969,7 @@ async fn run_connection(
                                 let _ = responder
                                     .respond(WaitForTerminalExitResponse::new(status));
                             })
-                            .map_err(|err| acp_err(format!("等待线程启动失败：{err}")))?;
+                            .map_err(|err| acp_err(format!("couldn't start the wait thread: {err}")))?;
                         Ok(())
                     }
                 }
@@ -1944,7 +2068,7 @@ async fn run_connection(
                     // 清空事件必须排在请求之前，不能等到 Ready 再清。
                     let _ = channels.event_tx.try_send(ConversationEvent::HistoryReplayStarted);
                     let mut load_request = LoadSessionRequest::new(sid.clone(), cwd.clone());
-                    if let Some(meta) = claude_raw_sdk_meta(&launch.launch.command) {
+                    if let Some(meta) = claude_session_meta(launch, true) {
                         load_request = load_request.meta(meta);
                     }
                     match connection
@@ -1998,10 +2122,14 @@ async fn run_connection(
 
             // 走官方 builder 就能同时拿到 session/new 的响应（模型档位、模式）
             // 和 session 路由。
+            let mut new_request = NewSessionRequest::new(std::path::Path::new(&cwd));
+            if let Some(meta) = claude_session_meta(launch, false) {
+                new_request = new_request.meta(meta);
+            }
             let SessionSetup {
                 session, response, ..
             } = connection
-                .build_session_from(NewSessionRequest::new(std::path::Path::new(&cwd)))
+                .build_session_from(new_request)
                 .block_task()
                 .start_session()
                 .await?;
@@ -2024,7 +2152,7 @@ async fn run_connection(
     child_guard.kill_and_reap();
     if handshake_watchdog.timed_out() {
         return Err(agent_client_protocol::Error::internal_error().data(format!(
-            "ACP 启动握手超时（{} 秒），agent 进程已终止",
+            "ACP startup handshake timed out ({}s); the agent process was stopped",
             ACP_HANDSHAKE_TIMEOUT.as_secs()
         )));
     }
@@ -2290,26 +2418,26 @@ async fn drive_session<S: SessionDrive>(
             // 通用 ACP 不该收到 Steer（daemon 按 `supports_mid_turn_input` 过滤）。
             // 万一漏进来，当成新一轮 prompt 会破坏回合闸门，这里只出个提示。
             Next::Cmd(Some(ConversationCommand::Steer { .. })) => {
-                let _ = channels.event_tx.try_send(ConversationEvent::Notice(
-                    "当前智能体不支持运行中插入消息".to_string(),
+                let _ = channels.event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::MidTurnInputUnsupported,
                 ));
             }
             Next::Cmd(Some(
                 ConversationCommand::FollowUp { .. } | ConversationCommand::ClearQueue,
             )) => {
-                let _ = channels.event_tx.try_send(ConversationEvent::Notice(
-                    "当前智能体不支持原生消息队列".to_string(),
+                let _ = channels.event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::QueueUnsupported,
                 ));
             }
             Next::Cmd(Some(ConversationCommand::Compact { .. })) => {
-                let _ = channels.event_tx.try_send(ConversationEvent::Notice(
-                    "当前智能体不支持压缩上下文".to_string(),
+                let _ = channels.event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::CompactUnsupported,
                 ));
             }
             // daemon 按 `supports_rewind` 过滤，这里只防漏进来。
             Next::Cmd(Some(ConversationCommand::Rewind { .. })) => {
-                let _ = channels.event_tx.try_send(ConversationEvent::Notice(
-                    "当前智能体不支持回退消息".to_string(),
+                let _ = channels.event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::RewindUnsupported,
                 ));
             }
             Next::Cmd(Some(ConversationCommand::Cancel)) => {
@@ -2397,60 +2525,33 @@ async fn drain_ready_updates<S: SessionDrive>(
 /// 两个词把「没配 key」和「key 不对」这类相邻情况分开。
 ///
 /// 只放**确定能给出动作**的条目。猜错了比不猜更坏：它会把人支到错的地方。
-const PROMPT_ERROR_HINTS: &[(&[&str], &str)] = &[
-    (
-        &["no api key"],
-        "还没配 API key：在「设置 → Agent → 自定义 Agent」新建一个基于这个 agent 的 Agent，在「环境变量」里按 `KEY=值` 每行一条填好（比如 OPENAI_API_KEY=sk-...），再用它新建对话。",
-    ),
-    (
-        &["api key", "invalid"],
-        "API key 被服务端拒绝了：到「设置 → Agent → 自定义 Agent」里这个 Agent 的「环境变量」核对一遍，注意别把前后空格或引号一起粘进去。",
-    ),
-    (
-        &["econnrefused"],
-        "连不上模型服务：如果配了自定义 base URL（如 OPENAI_BASE_URL），到「设置 → Agent → 自定义 Agent」里这个 Agent 的「环境变量」确认地址和端口，以及本机能否访问。",
-    ),
-    (
-        &["rate limit"],
-        "被服务端限流了，等一会儿再发；持续出现就要看账号配额。",
-    ),
+/// 建议的话由各端按语言说（[`TurnHint::text`]）。
+const PROMPT_ERROR_HINTS: &[(&[&str], TurnHint)] = &[
+    (&["no api key"], TurnHint::NoApiKey),
+    (&["api key", "invalid"], TurnHint::ApiKeyRejected),
+    (&["econnrefused"], TurnHint::ConnectionRefused),
+    (&["rate limit"], TurnHint::RateLimited),
 ];
 
 /// agent 用 ACP 标准错误码 `auth_required`（-32000）表示「CLI 没登录或登录失效」。
 /// 按错误码判断，不看文案：各家措辞不同，码是协议约定的。
-///
-/// 建议放在最前面，原始错误原样保留在后面：码也可能被 agent 用错，排查时要能
-/// 看到 agent 实际回了什么。
-fn with_auth_required_hint(
-    error: &agent_client_protocol::Error,
-    command: &str,
-    original: String,
-) -> String {
-    if error.code != agent_client_protocol::ErrorCode::AUTH_REQUIRED {
-        return original;
-    }
-    format!("{}\n\n原始错误：{original}", auth_required_hint(command))
+fn requires_sign_in(error: &agent_client_protocol::Error) -> bool {
+    error.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED
 }
 
-/// 各家 CLI 的登录方式。只写确认过的几家，其余给通用说法，免得把人支错地方。
-fn auth_required_hint(command: &str) -> String {
-    let login = match ConversationAgentKind::from_command_loose(command) {
-        Some(ConversationAgentKind::Copilot) => {
-            "GitHub Copilot 还没登录或登录已失效：在终端运行 `copilot`，输入 `/login` 完成 GitHub 登录（账号需要有 Copilot 订阅）"
-        }
-        Some(ConversationAgentKind::Claude) => {
-            "Claude Code 还没登录或登录已失效：在终端运行 `claude`，输入 `/login` 完成登录"
-        }
-        Some(ConversationAgentKind::Codex) => {
-            "Codex 还没登录或登录已失效：在终端运行 `codex login` 完成登录"
-        }
-        _ => "agent 要求先登录：在终端里用这个 agent 的 CLI 完成登录",
-    };
-    format!("{login}，然后新建会话。")
+/// 要求登录的是哪家：决定各端怎么教人登录。只认确认过登录方式的几家，其余说通用的。
+fn sign_in_agent(command: &str) -> SignInAgent {
+    match ConversationAgentKind::from_command_loose(command) {
+        Some(ConversationAgentKind::Copilot) => SignInAgent::Copilot,
+        Some(ConversationAgentKind::Claude) => SignInAgent::Claude,
+        Some(ConversationAgentKind::Codex) => SignInAgent::Codex,
+        Some(ConversationAgentKind::Antigravity) => SignInAgent::Antigravity,
+        _ => SignInAgent::Other,
+    }
 }
 
 /// 给错误文本配一条可操作的建议，配不上就不配。
-fn prompt_error_hint(text: &str) -> Option<&'static str> {
+fn prompt_error_hint(text: &str) -> Option<TurnHint> {
     let hay = text.to_lowercase();
     PROMPT_ERROR_HINTS
         .iter()
@@ -2458,33 +2559,31 @@ fn prompt_error_hint(text: &str) -> Option<&'static str> {
         .map(|(_, hint)| *hint)
 }
 
-/// agent 明确回错时给用户看的文本。ACP 的 `Error` 把有用信息分散在 message 和
-/// data 两处，只打印其一常常只剩「Internal error」这种废话。
+/// agent 明确回错时的失败回合。ACP 的 `Error` 把有用信息分散在 message 和
+/// data 两处，只取其一常常只剩「Internal error」这种废话。
 ///
-/// 认得出来的失败还会附一句下一步做什么——用户报「一发消息就断开」时，
+/// 认得出来的失败还带一个下一步的种类——用户报「一发消息就断开」时，
 /// 屏幕上一个字都没有，光有英文堆栈也只是从「不知道为什么」变成「不知道该
 /// 干什么」。
-fn describe_prompt_error(e: &agent_client_protocol::Error) -> String {
-    let mut out = e.message.trim().to_string();
+fn describe_prompt_error(e: &agent_client_protocol::Error) -> FailedTurn {
+    let mut detail = e.message.trim().to_string();
     if let Some(data) = &e.data {
-        let detail = match data {
+        let extra = match data {
             serde_json::Value::String(s) => s.trim().to_string(),
             other => other.to_string(),
         };
         // data 常常是 message 的超集（原样重复一遍），重复了就别显示两次。
-        if !detail.is_empty() && !out.contains(&detail) && !detail.contains(&out) {
-            out = format!("{out}：{detail}");
-        } else if detail.len() > out.len() {
-            out = detail;
+        if !extra.is_empty() && !detail.contains(&extra) && !extra.contains(&detail) {
+            detail = format!("{detail}: {extra}");
+        } else if extra.len() > detail.len() {
+            detail = extra;
         }
     }
-    if out.is_empty() {
-        out = format!("agent 返回错误（{:?}）", e.code);
+    if detail.is_empty() {
+        detail = format!("the agent returned an error ({:?})", e.code);
     }
-    match prompt_error_hint(&out) {
-        Some(hint) => format!("{out}\n\n{hint}"),
-        None => out,
-    }
+    let hint = prompt_error_hint(&detail);
+    FailedTurn { detail, hint }
 }
 
 struct RpcCompletionGuard(Arc<AtomicUsize>);
@@ -2547,9 +2646,11 @@ async fn send_config_option(
             publish_config_options(Some(&resp.config_options), event_tx);
         }
         Err(e) => {
-            let _ = event_tx.try_send(ConversationEvent::ConfigRejected(format!(
-                "更新会话配置失败：{e}"
-            )));
+            let _ = event_tx.try_send(ConversationEvent::ConfigRejected(
+                RuntimeNote::ConfigUpdateFailed {
+                    detail: e.to_string(),
+                },
+            ));
         }
     }
 }
@@ -2620,21 +2721,21 @@ fn detect_shell_type() -> String {
 /// data 里那份 token 对象。测试用假信封，绝不把真实 token 写进断言。
 pub(crate) fn kiro_token_from_cli_output(stdout: &str) -> Result<serde_json::Value, String> {
     let value: serde_json::Value = serde_json::from_str(stdout.trim())
-        .map_err(|err| format!("解析 kiro token 输出失败：{err}"))?;
+        .map_err(|err| format!("couldn't parse the kiro token output: {err}"))?;
     match value.get("kind").and_then(|kind| kind.as_str()) {
         Some("error") => {
             let message = value
                 .get("data")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            Err(format!("kiro 取 token 失败：{message}"))
+            Err(format!("kiro couldn't get a token: {message}"))
         }
         Some("getKasToken") => value
             .get("data")
             .cloned()
-            .ok_or_else(|| "kiro token 输出缺少 data".to_string()),
+            .ok_or_else(|| "the kiro token output has no data".to_string()),
         _ if value.get("accessToken").is_some() => Ok(value),
-        _ => Err("kiro token 输出无法识别".to_string()),
+        _ => Err("the kiro token output isn't recognized".to_string()),
     }
 }
 
@@ -2649,11 +2750,11 @@ fn kiro_cli_get_kas_token(force_refresh: bool) -> Result<serde_json::Value, Stri
     }
     let output = command
         .output()
-        .map_err(|err| format!("启动 kiro-cli get-kas-token 失败：{err}"))?;
+        .map_err(|err| format!("couldn't start kiro-cli get-kas-token: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "kiro-cli get-kas-token 退出 {}：{}",
+            "kiro-cli get-kas-token exited {}: {}",
             output.status,
             stderr.trim()
         ));
@@ -2684,7 +2785,7 @@ async fn respond_vendor_ext_request(
     responder: Responder<serde_json::Value>,
 ) -> Result<(), agent_client_protocol::Error> {
     let AgentRequest::ExtMethodRequest(request) = request else {
-        return Err(acp_err("未处理的 ACP 扩展请求"));
+        return Err(acp_err("unhandled ACP extension request"));
     };
     let method = request.method.to_string();
     let params = request.params.get().to_string();
@@ -2715,11 +2816,6 @@ fn plan_from_update(update: PlanUpdate) -> Plan {
         PlanUpdateContent::Items(items) => Plan::new(items.entries),
         PlanUpdateContent::Markdown(markdown) => Plan::new(vec![PlanEntry::new(
             markdown.content,
-            PlanEntryPriority::Medium,
-            PlanEntryStatus::Pending,
-        )]),
-        PlanUpdateContent::File(file) => Plan::new(vec![PlanEntry::new(
-            file.uri,
             PlanEntryPriority::Medium,
             PlanEntryStatus::Pending,
         )]),
@@ -2940,17 +3036,17 @@ fn spawn_agent_process(
     if let Err(error) = smelt_sys::process::attach_suspended(child.id()) {
         drop(child);
         return Err(agent_client_protocol::Error::internal_error().data(format!(
-            "无法把 agent 放进进程树：{error}"
+            "couldn't put the agent into the process tree: {error}"
         )));
     }
     let child_stdin = child.stdin.take().ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("无法打开 agent stdin")
+        agent_client_protocol::Error::internal_error().data("couldn't open the agent's stdin")
     })?;
     let child_stdout = child.stdout.take().ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("无法打开 agent stdout")
+        agent_client_protocol::Error::internal_error().data("couldn't open the agent's stdout")
     })?;
     let child_stderr = child.stderr.take().ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("无法打开 agent stderr")
+        agent_client_protocol::Error::internal_error().data("couldn't open the agent's stderr")
     })?;
     Ok((child_stdin, child_stdout, child_stderr, child))
 }
@@ -3124,19 +3220,44 @@ fn use_local_adapter_cli(
     Ok(())
 }
 
-/// Ask Claude's adapter to include raw SDK messages so usage/cache-token
-/// details remain available when history is reconstructed by session/load.
-fn claude_raw_sdk_meta(cmd: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
-    if !cmd.contains("claude") {
+fn is_claude_command(cmd: &str) -> bool {
+    cmd.contains("claude")
+}
+
+/// 这个启动规格起的 agent 能不能按 [`ConversationLaunch::disallowed_tools`] 限制工具。
+/// 目前只有 Claude 适配器：它把 `_meta.claudeCode.options.disallowedTools` 并进 Claude SDK
+/// 的同名选项，由 Claude 自己的权限引擎执行。
+pub fn supports_disallowed_tools(launch: &ConversationLaunchSpec) -> bool {
+    !crate::pi_rpc::is_smelt_pi_launch(launch) && is_claude_command(&launch.command)
+}
+
+/// 开会话时给 Claude 适配器的 `_meta.claudeCode`。`session/load` 要原始 SDK 消息，重建
+/// 历史时用量和缓存 token 的细节才还在；工具限制两条路都要带，新开和续上的进程才一样。
+fn claude_session_meta(
+    launch: &ConversationLaunch,
+    load: bool,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if !is_claude_command(&launch.launch.command) {
         return None;
     }
-    let mut inner = serde_json::Map::new();
-    inner.insert(
-        "emitRawSDKMessages".to_string(),
-        serde_json::Value::Bool(true),
-    );
+    let mut claude = serde_json::Map::new();
+    if load {
+        claude.insert(
+            "emitRawSDKMessages".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if !launch.disallowed_tools.is_empty() {
+        claude.insert(
+            "options".to_string(),
+            serde_json::json!({ "disallowedTools": launch.disallowed_tools }),
+        );
+    }
+    if claude.is_empty() {
+        return None;
+    }
     let mut meta = serde_json::Map::new();
-    meta.insert("claudeCode".to_string(), serde_json::Value::Object(inner));
+    meta.insert("claudeCode".to_string(), serde_json::Value::Object(claude));
     Some(meta)
 }
 
@@ -3234,19 +3355,22 @@ pub(crate) fn session_configs_from_config(
                         .map(|o| (o.value.to_string(), o.name.clone()))
                         .collect(),
                     boolean: None,
+                    smelt: None,
                 })
             }
             SessionConfigKind::Boolean(flag) => Some(SessionConfigState {
                 config_id: opt.id.to_string(),
                 name: opt.name.clone(),
                 description: opt.description.clone(),
+                // 原名是英文兜底，也用来认选项；各端显示时按语言说开 / 关。
                 current_name: if flag.current_value {
-                    "开".to_string()
+                    "On".to_string()
                 } else {
-                    "关".to_string()
+                    "Off".to_string()
                 },
-                options: vec![("true".into(), "开".into()), ("false".into(), "关".into())],
+                options: vec![("true".into(), "On".into()), ("false".into(), "Off".into())],
                 boolean: Some(flag.current_value),
+                smelt: None,
             }),
             _ => None,
         })
@@ -3519,7 +3643,7 @@ pub(crate) fn permission_view(
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("工具调用 {tool_call_id}"));
+        .unwrap_or_else(|| format!("Tool call {tool_call_id}"));
     let input = raw_input.and_then(serde_json::Value::as_object);
     let text = |keys: &[&str]| {
         let input = input?;
@@ -3567,7 +3691,7 @@ pub(crate) fn permission_view(
             if clipped.len() < target.len() {
                 clipped.push('…');
             }
-            format!("{title}：{clipped}")
+            format!("{title}: {clipped}")
         }
         _ => title,
     };
@@ -3578,11 +3702,11 @@ pub(crate) fn permission_view(
 pub fn content_text(content: &ContentBlock) -> String {
     match content {
         ContentBlock::Text(t) => t.text.clone(),
-        ContentBlock::Image(_) => "[图片]".to_string(),
-        ContentBlock::Audio(_) => "[音频]".to_string(),
-        ContentBlock::ResourceLink(l) => format!("[资源 {}]", l.uri),
-        ContentBlock::Resource(_) => "[内嵌资源]".to_string(),
-        _ => "[未知内容]".to_string(), // schema #[non_exhaustive]，协议会长新枝
+        ContentBlock::Image(_) => "[image]".to_string(),
+        ContentBlock::Audio(_) => "[audio]".to_string(),
+        ContentBlock::ResourceLink(l) => format!("[resource {}]", l.uri),
+        ContentBlock::Resource(_) => "[embedded resource]".to_string(),
+        _ => "[unknown content]".to_string(), // schema #[non_exhaustive]，协议会长新枝
     }
 }
 
@@ -3743,6 +3867,7 @@ fn recognize_collaboration_title(
         "subagentactivity",
     ]
     .contains(&normalized.as_str());
+    // 智能体发来的工具标题，不是界面文案：有的智能体给中文标题。
     let descriptive =
         normalized.contains("subagent") || title.contains("子代理") || title.contains("协作代理");
     (explicit_name || descriptive).then_some(crate::acp_chat::ToolKind::Collaborate)
@@ -3815,6 +3940,30 @@ pub fn inspect_acp_runtime() -> AcpRuntimeDiagnostics {
     diagnostics
 }
 
+/// 只找 Agent CLI 装在哪，不起进程。新建目录只看装没装（[`RuntimeExecutable::is_available`]
+/// 只认路径），不必每次打开菜单都把各家 `--version` 跑一遍；版本和报错归设置页，
+/// 由 [`inspect_acp_runtime`] 现探。
+pub fn locate_acp_runtime() -> AcpRuntimeDiagnostics {
+    let search_path = extended_search_path();
+    let mut diagnostics = AcpRuntimeDiagnostics::default();
+    for agent in TerminalAgentKind::ALL {
+        diagnostics.record_terminal(
+            agent,
+            locate_runtime_program(agent.cli_program(), &search_path),
+        );
+    }
+    diagnostics.record_agent(ConversationAgentKind::Pi, inspect_smelt_pi_runtime());
+    diagnostics
+}
+
+fn locate_runtime_program(program: &str, search_path: &str) -> RuntimeExecutable {
+    RuntimeExecutable {
+        program: program.to_string(),
+        path: resolve_in_path(program, search_path),
+        ..Default::default()
+    }
+}
+
 fn inspect_smelt_pi_runtime() -> RuntimeExecutable {
     let program = SMELT_PI_AGENT_COMMAND.to_string();
     match crate::managed_runtime::managed_pi_diagnostic() {
@@ -3823,12 +3972,12 @@ fn inspect_smelt_pi_runtime() -> RuntimeExecutable {
             path: Some(entry.to_string_lossy().into_owned()),
             version: Some(if ready {
                 format!(
-                    "Smelt Pi Runtime {} · 已就绪",
+                    "Smelt Pi Runtime {} · ready",
                     crate::managed_runtime::pi_runtime_version()
                 )
             } else {
                 format!(
-                    "Smelt Pi Runtime {} · 缺少 photon_rs_bg.wasm",
+                    "Smelt Pi Runtime {} · photon_rs_bg.wasm is missing",
                     crate::managed_runtime::pi_runtime_version()
                 )
             }),
@@ -3846,10 +3995,15 @@ fn inspect_runtime_program(program: &str, search_path: &str) -> RuntimeExecutabl
     inspect_runtime_path(
         program,
         resolve_in_path(program, search_path).map(std::path::PathBuf::from),
+        search_path,
     )
 }
 
-fn inspect_runtime_path(program: &str, path: Option<std::path::PathBuf>) -> RuntimeExecutable {
+fn inspect_runtime_path(
+    program: &str,
+    path: Option<std::path::PathBuf>,
+    search_path: &str,
+) -> RuntimeExecutable {
     let mut status = RuntimeExecutable {
         program: program.to_string(),
         ..Default::default()
@@ -3859,20 +4013,17 @@ fn inspect_runtime_path(program: &str, path: Option<std::path::PathBuf>) -> Runt
     };
 
     status.path = Some(path.to_string_lossy().into_owned());
-    match run_runtime_version(&path) {
+    match run_runtime_version(&path, search_path) {
         Ok(output) if output.status.success() => {
             status.version = runtime_output_line(&output.stdout, &output.stderr);
             if status.version.is_none() {
-                status.error = Some("`--version` 未输出版本信息".to_string());
+                status.error = Some("`--version` printed no version".to_string());
             }
         }
         Ok(output) => {
             let detail = runtime_output_line(&output.stderr, &output.stdout)
-                .unwrap_or_else(|| "没有输出错误信息".to_string());
-            status.error = Some(format!(
-                "`--version` 执行失败（{}）：{detail}",
-                output.status
-            ));
+                .unwrap_or_else(|| "no error output".to_string());
+            status.error = Some(format!("`--version` failed ({}): {detail}", output.status));
         }
         Err(error) => status.error = Some(error),
     }
@@ -3882,7 +4033,10 @@ fn inspect_runtime_path(program: &str, path: Option<std::path::PathBuf>) -> Runt
 /// 版本查询必须有上限：用户自己的 shell shim 或损坏的 CLI 不能让设置页永久处于
 /// 「检测中」。stdout / stderr 各由一条线程边跑边读，输出再多也不会把子进程卡在写
 /// 管道上；进程退出由 `wait` 告知，超过上限便杀掉并收回。
-fn run_runtime_version(path: &std::path::Path) -> Result<std::process::Output, String> {
+fn run_runtime_version(
+    path: &std::path::Path,
+    search_path: &str,
+) -> Result<std::process::Output, String> {
     const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
     let mut command = std::process::Command::new(path);
     command
@@ -3895,9 +4049,10 @@ fn run_runtime_version(path: &std::path::Path) -> Result<std::process::Output, S
     // 都会失败，设置页于是把"装好了但环境没带全"误报成"未安装"，把用户引向
     // 重装这条完全错误的路。
     crate::login_env::apply_login_environment(&mut command, []);
+    command.env("PATH", search_path);
     let mut child = command
         .spawn()
-        .map_err(|error| format!("无法执行 `--version`：{error}"))?;
+        .map_err(|error| format!("couldn't run `--version`: {error}"))?;
     let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
     let stdout = read_pipe_in_background(child.stdout.take());
     let stderr = read_pipe_in_background(child.stderr.take());
@@ -3909,9 +4064,9 @@ fn run_runtime_version(path: &std::path::Path) -> Result<std::process::Output, S
             let _ = smelt_sys::process::terminate_pid(pid);
         })
     }
-    .map_err(|error| format!("等待 `--version` 失败：{error}"))?;
+    .map_err(|error| format!("couldn't wait for `--version`: {error}"))?;
     if timed_out.load(Ordering::SeqCst) {
-        return Err("`--version` 检测超时（5 秒）".to_string());
+        return Err("`--version` timed out (5s)".to_string());
     }
     // 子进程已经退出。它派生的后代可能还握着管道，读的一侧也只等到同一个截止。
     let collect = |pipe: std::sync::mpsc::Receiver<Vec<u8>>| {
@@ -3993,17 +4148,18 @@ impl AcpCliInstallPlan {
     }
 }
 
-/// 通过本机已有的 Homebrew 或 npm 安装指定的 Agent CLI。
+/// 通过本机已有的 Homebrew、npm 或 Bun 安装指定的 Agent CLI。
 ///
 /// 不执行各厂商的 `curl | sh` 安装器，也不调用 shell 或 sudo；只有用户点设置页
-/// 的「安装」按钮时才会进入这里。Claude、Codex、Copilot 优先使用官方 Homebrew
-/// cask，Grok 使用 xAI 官方 npm 包。包管理器不存在或命令失败时会返回可展示错误。
+/// 的「安装」按钮时才会进入这里。优先使用官方 Homebrew 包，否则使用对应的包管理器。
+/// 包管理器不存在或命令失败时会返回可展示错误。
 pub fn install_acp_cli(agent: ConversationAgentKind) -> Result<AcpCliInstallReport, String> {
     let search_path = extended_search_path();
     let plan = acp_cli_install_plan(
         agent,
         resolve_in_path("brew", &search_path),
         resolve_in_path("npm", &search_path),
+        resolve_in_path("bun", &search_path),
     )?;
     let report = plan.report();
     run_acp_cli_install(&plan, &search_path)?;
@@ -4014,24 +4170,37 @@ fn acp_cli_install_plan(
     agent: ConversationAgentKind,
     brew: Option<String>,
     npm: Option<String>,
+    bun: Option<String>,
 ) -> Result<AcpCliInstallPlan, String> {
-    if let (Some(executable), Some(cask)) = (brew, agent.homebrew_cask()) {
-        return Ok(AcpCliInstallPlan {
-            installer: "Homebrew",
-            executable,
-            display_executable: "brew",
-            args: ["install", "--cask", cask]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        });
+    let formula = agent.descriptor().homebrew_formula;
+    let cask = agent.homebrew_cask();
+    if let Some(executable) = brew {
+        let args = if let Some(formula) = formula {
+            Some(vec!["install", formula])
+        } else {
+            cask.map(|cask| vec!["install", "--cask", cask])
+        };
+        if let Some(args) = args {
+            return Ok(AcpCliInstallPlan {
+                installer: "Homebrew",
+                executable,
+                display_executable: "brew",
+                args: args.into_iter().map(str::to_string).collect(),
+            });
+        }
     }
 
-    if let (Some(executable), Some(package)) = (npm, agent.npm_package()) {
+    let use_bun = agent.descriptor().install_with_bun;
+    let (executable, installer, display_executable) = if use_bun {
+        (bun, "Bun", "bun")
+    } else {
+        (npm, "npm", "npm")
+    };
+    if let (Some(executable), Some(package)) = (executable, agent.npm_package()) {
         return Ok(AcpCliInstallPlan {
-            installer: "npm",
+            installer,
             executable,
-            display_executable: "npm",
+            display_executable,
             args: ["install", "--global", package]
                 .into_iter()
                 .map(str::to_string)
@@ -4039,16 +4208,25 @@ fn acp_cli_install_plan(
         });
     }
 
-    let help = match (agent.homebrew_cask(), agent.npm_package()) {
+    if let (Some(formula), Some(package)) = (formula, agent.npm_package()) {
+        return Err(format!(
+            "Can't install {}: needs Homebrew or {installer} (`brew install {formula}` or `{display_executable} install -g {package}`)",
+            agent.label()
+        ));
+    }
+    let help = match (cask, agent.npm_package()) {
         (None, None) => format!(
-            "{} CLI 请用官方安装器：curl https://cursor.com/install -fsS | bash",
+            "use the official installer for the {} CLI: curl https://cursor.com/install -fsS | bash",
             agent.label()
         ),
-        (None, Some(package)) => format!("{} CLI 需要 npm（官方包：{package}）", agent.label()),
-        _ => "需要 Homebrew 或 npm".to_string(),
+        (None, Some(package)) => format!(
+            "the {} CLI needs npm (official package: {package})",
+            agent.label()
+        ),
+        _ => "needs Homebrew or npm".to_string(),
     };
     Err(format!(
-        "无法安装 {}：未找到可用的包管理器（{help}）",
+        "Can't install {}: no package manager found ({help})",
         agent.label()
     ))
 }
@@ -4071,7 +4249,7 @@ fn run_acp_cli_install(plan: &AcpCliInstallPlan, search_path: &str) -> Result<()
     crate::login_env::apply_login_environment(&mut command, [("PATH", search_path)]);
     let child = command
         .spawn()
-        .map_err(|error| format!("无法启动 {}：{error}", report.installer))?;
+        .map_err(|error| format!("couldn't start {}: {error}", report.installer))?;
     let timed_out = Arc::new(AtomicBool::new(false));
     let status = {
         let timed_out = timed_out.clone();
@@ -4080,10 +4258,15 @@ fn run_acp_cli_install(plan: &AcpCliInstallPlan, search_path: &str) -> Result<()
             let _ = smelt_sys::process::terminate_pid(pid);
         })
     }
-    .map_err(|error| format!("等待 {} 安装进程失败：{error}", report.installer))?;
+    .map_err(|error| {
+        format!(
+            "couldn't wait for the {} install: {error}",
+            report.installer
+        )
+    })?;
     if timed_out.load(Ordering::SeqCst) {
         return Err(format!(
-            "{} 安装超时（15 分钟）。可在终端执行 `{}` 重试",
+            "{} install timed out (15 minutes). Run `{}` in a terminal to retry",
             report.installer, report.command
         ));
     }
@@ -4091,7 +4274,7 @@ fn run_acp_cli_install(plan: &AcpCliInstallPlan, search_path: &str) -> Result<()
         return Ok(());
     }
     Err(format!(
-        "{} 安装命令退出（{status}）。可在终端执行 `{}` 查看完整错误",
+        "{} install exited ({status}). Run `{}` in a terminal to see the full error",
         report.installer, report.command
     ))
 }
@@ -4121,6 +4304,7 @@ fn extend_search_path(login: &str, home: Option<&std::path::Path>) -> String {
             "bin",
             ".cargo/bin",
             ".volta/bin",
+            ".bun/bin",
         ] {
             entries.push(home.join(sub));
         }
@@ -4325,8 +4509,49 @@ mod runtime_tests {
         } else {
             std::path::PathBuf::from("/usr/bin/true")
         };
-        let output = run_runtime_version(&program);
+        let output = run_runtime_version(&program, &extended_search_path());
         assert!(output.is_ok(), "短命令的版本探测应正常收尾：{output:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_version_probe_uses_the_same_path_as_cli_detection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("test-bun");
+        let cli = dir.path().join("omp");
+        std::fs::write(&runtime, "#!/bin/sh\necho omp 1.0\n").unwrap();
+        std::fs::write(&cli, "#!/usr/bin/env test-bun\n").unwrap();
+        for path in [&runtime, &cli] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let status = inspect_runtime_program("omp", dir.path().to_str().unwrap());
+        assert_eq!(
+            (status.version.as_deref(), status.error.as_deref()),
+            (Some("omp 1.0"), None)
+        );
+    }
+
+    /// 新建目录只找路径：找到了算装了，但不运行它。
+    #[cfg(unix)]
+    #[test]
+    fn locating_a_cli_does_not_run_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let cli = dir.path().join("omp");
+        std::fs::write(&cli, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = locate_runtime_program("omp", dir.path().to_str().unwrap());
+        assert!(status.is_available());
+        assert_eq!(status.path.as_deref(), cli.to_str());
+        assert!(!ran.exists(), "找路径不该起进程");
+
+        let missing = locate_runtime_program("crush", dir.path().to_str().unwrap());
+        assert!(!missing.is_available());
     }
 
     /// 输出超过管道容量时，退出前没人读就会卡在写上，只能等到超时。
@@ -4346,7 +4571,8 @@ mod runtime_tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&program, permissions).unwrap();
 
-        let output = run_runtime_version(&program).expect("大量输出不该让版本探测超时");
+        let output = run_runtime_version(&program, &extended_search_path())
+            .expect("大量输出不该让版本探测超时");
         assert!(output.status.success());
         assert_eq!(output.stderr.len(), 256 * 1024);
         assert_eq!(
@@ -4360,40 +4586,63 @@ mod runtime_tests {
         let brew = Some("/opt/homebrew/bin/brew".to_string());
         let npm = Some("/opt/homebrew/bin/npm".to_string());
 
-        let claude = acp_cli_install_plan(ConversationAgentKind::Claude, brew.clone(), npm.clone())
-            .expect("Claude 应有安装方案");
+        let claude = acp_cli_install_plan(
+            ConversationAgentKind::Claude,
+            brew.clone(),
+            npm.clone(),
+            None,
+        )
+        .expect("Claude 应有安装方案");
         assert_eq!(claude.report().command, "brew install --cask claude-code");
 
-        let codex = acp_cli_install_plan(ConversationAgentKind::Codex, brew.clone(), npm.clone())
-            .expect("Codex 应有安装方案");
+        let codex = acp_cli_install_plan(
+            ConversationAgentKind::Codex,
+            brew.clone(),
+            npm.clone(),
+            None,
+        )
+        .expect("Codex 应有安装方案");
         assert_eq!(codex.report().command, "brew install --cask codex");
 
-        let copilot =
-            acp_cli_install_plan(ConversationAgentKind::Copilot, brew.clone(), npm.clone())
-                .expect("Copilot 应有安装方案");
+        let copilot = acp_cli_install_plan(
+            ConversationAgentKind::Copilot,
+            brew.clone(),
+            npm.clone(),
+            None,
+        )
+        .expect("Copilot 应有安装方案");
         assert_eq!(copilot.report().command, "brew install --cask copilot-cli");
 
-        let grok = acp_cli_install_plan(ConversationAgentKind::Grok, brew.clone(), npm.clone())
-            .expect("Grok 应有安装方案");
+        let grok =
+            acp_cli_install_plan(ConversationAgentKind::Grok, brew.clone(), npm.clone(), None)
+                .expect("Grok 应有安装方案");
         assert_eq!(
             grok.report().command,
             "npm install --global @xai-official/grok"
         );
 
-        let cursor_err =
-            acp_cli_install_plan(ConversationAgentKind::Cursor, brew.clone(), npm.clone())
-                .expect_err("Cursor 没有 brew/npm 包");
+        let cursor_err = acp_cli_install_plan(
+            ConversationAgentKind::Cursor,
+            brew.clone(),
+            npm.clone(),
+            None,
+        )
+        .expect_err("Cursor 没有 brew/npm 包");
         assert!(cursor_err.contains("cursor.com/install"));
 
-        let opencode =
-            acp_cli_install_plan(ConversationAgentKind::OpenCode, brew.clone(), npm.clone())
-                .expect("OpenCode 应有安装方案");
+        let opencode = acp_cli_install_plan(
+            ConversationAgentKind::OpenCode,
+            brew.clone(),
+            npm.clone(),
+            None,
+        )
+        .expect("OpenCode 应有安装方案");
         assert_eq!(
             opencode.report().command,
             "npm install --global opencode-ai"
         );
 
-        let pi = acp_cli_install_plan(ConversationAgentKind::Pi, brew, npm)
+        let pi = acp_cli_install_plan(ConversationAgentKind::Pi, brew, npm, None)
             .expect("Pi 应有 npm 安装方案");
         assert_eq!(
             pi.report().command,
@@ -4407,6 +4656,7 @@ mod runtime_tests {
             ConversationAgentKind::Codex,
             None,
             Some("/usr/local/bin/npm".to_string()),
+            None,
         )
         .expect("npm 应作为回退安装器");
 
@@ -4415,11 +4665,62 @@ mod runtime_tests {
     }
 
     #[test]
+    fn oh_my_pi_prefers_formula_and_falls_back_to_bun_only() {
+        let brew = Some("/opt/homebrew/bin/brew".to_string());
+        let npm = Some("/usr/local/bin/npm".to_string());
+        let bun = Some("/home/user/.bun/bin/bun".to_string());
+
+        let plan = acp_cli_install_plan(
+            ConversationAgentKind::OhMyPi,
+            brew,
+            npm.clone(),
+            bun.clone(),
+        )
+        .expect("应优先使用 Homebrew 公式");
+        assert_eq!(plan.executable, "/opt/homebrew/bin/brew");
+        assert_eq!(plan.report().command, "brew install can1357/tap/omp");
+        let brew_only = acp_cli_install_plan(
+            ConversationAgentKind::OhMyPi,
+            Some("/opt/homebrew/bin/brew".to_string()),
+            None,
+            None,
+        )
+        .expect("Homebrew 不应依赖 npm 或 Bun");
+        assert_eq!(brew_only.report().command, "brew install can1357/tap/omp");
+
+        let plan = acp_cli_install_plan(ConversationAgentKind::OhMyPi, None, npm.clone(), bun)
+            .expect("没有 Homebrew 时应使用 Bun");
+        assert_eq!(plan.executable, "/home/user/.bun/bin/bun");
+        assert_eq!(plan.installer, "Bun");
+        assert_eq!(
+            plan.report().command,
+            "bun install --global @oh-my-pi/pi-coding-agent"
+        );
+        let bun_only = acp_cli_install_plan(
+            ConversationAgentKind::OhMyPi,
+            None,
+            None,
+            Some("/home/user/.bun/bin/bun".to_string()),
+        )
+        .expect("Bun 不应依赖 npm");
+        assert_eq!(bun_only.report(), plan.report());
+
+        for npm in [npm, None] {
+            let error = acp_cli_install_plan(ConversationAgentKind::OhMyPi, None, npm, None)
+                .expect_err("没有 Homebrew 和 Bun 时不能使用 npm");
+            assert!(error.contains("Homebrew"));
+            assert!(error.contains("Bun"));
+            assert!(error.contains("can1357/tap/omp"));
+            assert!(error.contains("@oh-my-pi/pi-coding-agent"));
+        }
+    }
+
+    #[test]
     fn missing_package_managers_produces_actionable_error() {
-        let error = acp_cli_install_plan(ConversationAgentKind::Claude, None, None)
+        let error = acp_cli_install_plan(ConversationAgentKind::Claude, None, None, None)
             .expect_err("没有安装器时应失败");
 
-        assert!(error.contains("Homebrew 或 npm"));
+        assert!(error.contains("Homebrew or npm"));
     }
 }
 
@@ -4466,6 +4767,64 @@ mod client_capability_tests {
             Some("agent-1")
         );
         assert_eq!(parent_tool_id_from_meta(None), None);
+    }
+}
+
+#[cfg(test)]
+mod tool_restriction_tests {
+    use std::collections::BTreeMap;
+
+    use super::{ConversationLaunch, claude_session_meta, supports_disallowed_tools};
+    use crate::agent_kind::ConversationLaunchSpec;
+
+    fn launch(command: &str, disallowed_tools: &[&str]) -> ConversationLaunch {
+        ConversationLaunch {
+            launch: ConversationLaunchSpec::from_command(command),
+            ephemeral_env: BTreeMap::new(),
+            cwd: None,
+            sid: "acp-test".into(),
+            agent_token: String::new(),
+            resume_session_id: None,
+            fork_session_id: None,
+            fork_cut: None,
+            peer_handler: None,
+            disallowed_tools: disallowed_tools
+                .iter()
+                .map(|rule| rule.to_string())
+                .collect(),
+        }
+    }
+
+    /// 限制新开、续上都带；续上另要原始 SDK 消息。没限制的新会话不带 `_meta`。
+    #[test]
+    fn claude_sessions_carry_the_tool_restrictions() {
+        let restricted = launch("smelt-claude-agent", &["Edit", "Bash(git push:*)"]);
+        let expected = serde_json::json!(["Edit", "Bash(git push:*)"]);
+        let new = claude_session_meta(&restricted, false).unwrap();
+        assert_eq!(new["claudeCode"]["options"]["disallowedTools"], expected);
+        assert!(new["claudeCode"].get("emitRawSDKMessages").is_none());
+        let load = claude_session_meta(&restricted, true).unwrap();
+        assert_eq!(load["claudeCode"]["options"]["disallowedTools"], expected);
+        assert_eq!(load["claudeCode"]["emitRawSDKMessages"], true);
+
+        let open = launch("smelt-claude-agent", &[]);
+        assert!(claude_session_meta(&open, false).is_none());
+        assert!(
+            claude_session_meta(&open, true).unwrap()["claudeCode"]
+                .get("options")
+                .is_none()
+        );
+        assert!(claude_session_meta(&launch("codex-acp", &["Edit"]), false).is_none());
+    }
+
+    #[test]
+    fn only_the_claude_adapter_enforces_tool_restrictions() {
+        let spec = ConversationLaunchSpec::from_command;
+        assert!(supports_disallowed_tools(&spec("smelt-claude-agent")));
+        assert!(!supports_disallowed_tools(&spec("codex-acp")));
+        assert!(!supports_disallowed_tools(&spec(
+            crate::agent_kind::SMELT_PI_AGENT_COMMAND
+        )));
     }
 }
 
@@ -4528,8 +4887,8 @@ mod session_info_update_tests {
 #[cfg(test)]
 mod restore_failure_tests {
     use super::{
-        ConversationRestoreFailure, SessionStart, classify_restore_failure, select_session_start,
-        with_auth_required_hint,
+        ConversationRestoreFailure, SessionStart, SignInAgent, classify_restore_failure,
+        select_session_start, sign_in_agent,
     };
     use agent_client_protocol::Error;
 
@@ -4588,7 +4947,7 @@ mod restore_failure_tests {
         let failure = classify_restore_failure(&error, "");
         assert_eq!(
             failure,
-            ConversationRestoreFailure::Failed(format!("恢复历史对话失败，可重试：{error}"))
+            ConversationRestoreFailure::Failed(error.to_string())
         );
         assert!(!matches!(
             failure,
@@ -4596,45 +4955,28 @@ mod restore_failure_tests {
         ));
     }
 
-    /// Copilot 没登录时 `session/new` 回 -32000。提示按错误码给，原始错误
-    /// （含 SDK 附带的 data）必须原样留着，方便排查提示是否给错。
     #[test]
-    fn auth_required_gets_login_hint_and_keeps_original_error() {
-        let error = Error::auth_required().data(serde_json::json!({"spawned_at": "session.rs:1018:28"}));
-        let original = format!("{error}");
-        let text = with_auth_required_hint(&error, "copilot --acp --allow-all", original.clone());
-        assert!(text.starts_with("GitHub Copilot"), "{text}");
-        assert!(text.contains("/login"), "{text}");
-        assert!(text.ends_with(&format!("原始错误：{original}")), "{text}");
-        assert!(text.contains("spawned_at"), "{text}");
-    }
-
-    #[test]
-    fn auth_required_hint_falls_back_for_unknown_agents() {
-        let text = with_auth_required_hint(&Error::auth_required(), "my-agent --acp", "x".into());
-        assert!(text.starts_with("agent 要求先登录"), "{text}");
-        assert!(text.ends_with("原始错误：x"), "{text}");
-    }
-
-    #[test]
-    fn other_errors_are_left_untouched() {
-        let error = Error::internal_error();
+    fn sign_in_agent_follows_the_command_and_falls_back_for_unknown_agents() {
         assert_eq!(
-            with_auth_required_hint(&error, "copilot --acp", "boom".into()),
-            "boom"
+            sign_in_agent("copilot --acp --allow-all"),
+            SignInAgent::Copilot
         );
+        assert_eq!(sign_in_agent("my-agent --acp"), SignInAgent::Other);
     }
 
+    /// Copilot 没登录时回 -32000。按错误码认出要登录，原始错误（含 SDK 附带的 data）
+    /// 原样留着当细节，方便排查是不是认错了。
     #[test]
-    fn auth_required_on_restore_also_gets_login_hint() {
-        let error = Error::auth_required();
-        let ConversationRestoreFailure::Failed(text) =
-            classify_restore_failure(&error, "copilot --acp --allow-all")
-        else {
-            panic!("auth_required 不是缺历史，应走可重试的失败");
+    fn auth_required_on_restore_asks_for_sign_in_and_keeps_original_error() {
+        let error =
+            Error::auth_required().data(serde_json::json!({"spawned_at": "session.rs:1018:28"}));
+        let failure = classify_restore_failure(&error, "copilot --acp --allow-all");
+        let ConversationRestoreFailure::SignInRequired { agent, detail } = &failure else {
+            panic!("auth_required 应该要求登录：{failure:?}");
         };
-        assert!(text.starts_with("GitHub Copilot"), "{text}");
-        assert!(text.contains(&format!("恢复历史对话失败，可重试：{error}")), "{text}");
+        assert_eq!(*agent, SignInAgent::Copilot);
+        assert_eq!(*detail, error.to_string());
+        assert!(detail.contains("spawned_at"), "{detail}");
     }
 }
 
@@ -4705,7 +5047,8 @@ mod spawn_gate_tests {
 
 #[cfg(test)]
 mod embedded_adapter_tests {
-    use super::{ConversationAgentKind, auth_required_hint, build_agent_args_with_ephemeral_env};
+    use super::{ConversationAgentKind, build_agent_args_with_ephemeral_env, sign_in_agent};
+    use crate::acp_session::SignInAgent;
     use crate::agent_kind::{
         CLAUDE_ADAPTER_COMMAND, CODEX_ADAPTER_COMMAND, ConversationLaunchSpec,
     };
@@ -4941,10 +5284,15 @@ mod embedded_adapter_tests {
 
     #[test]
     fn default_commands_keep_the_right_login_hint() {
-        let claude = auth_required_hint(&claude_default());
-        assert!(claude.contains("Claude Code"), "{claude}");
-        let codex = auth_required_hint(&ConversationAgentKind::Codex.default_cmd());
-        assert!(codex.contains("codex login"), "{codex}");
+        assert_eq!(sign_in_agent(&claude_default()), SignInAgent::Claude);
+        assert_eq!(
+            sign_in_agent(&ConversationAgentKind::Codex.default_cmd()),
+            SignInAgent::Codex
+        );
+        assert_eq!(
+            sign_in_agent(&ConversationAgentKind::Antigravity.default_cmd()),
+            SignInAgent::Antigravity
+        );
     }
 }
 
@@ -5068,6 +5416,20 @@ mod path_resolve_tests {
         let entries: Vec<_> = std::env::split_paths(&extended).collect();
         assert_eq!(&entries[..2], &login_dirs[..]);
         assert!(entries.contains(&home.join(".cargo/bin")), "{extended}");
+        assert!(entries.contains(&home.join(".bun/bin")), "{extended}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bun_default_bin_is_available_to_installer_and_cli_detection() {
+        let root = temp_root("bun-bin");
+        let bin = root.join(".bun/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bun = write_executable(&bin, "bun");
+        let omp = write_executable(&bin, "omp");
+        let path = extend_search_path("", Some(&root));
+        assert_eq!(resolve_in_path("bun", &path).as_deref(), bun.to_str());
+        assert_eq!(resolve_in_path("omp", &path).as_deref(), omp.to_str());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5327,12 +5689,12 @@ mod model_tests {
         let configs = super::session_configs_from_config(&[fast]);
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].boolean, Some(true));
-        assert_eq!(configs[0].current_name, "开");
+        assert_eq!(configs[0].current_name, "On");
         assert_eq!(
             configs[0].options,
             vec![
-                ("true".to_string(), "开".to_string()),
-                ("false".to_string(), "关".to_string())
+                ("true".to_string(), "On".to_string()),
+                ("false".to_string(), "Off".to_string())
             ]
         );
     }
@@ -5636,7 +5998,7 @@ mod model_tests {
 mod process_reap_tests {
     use super::{
         Waitpid, kill_and_reap_process_group, process_birth, process_start_time,
-        prove_process_group_dead, waitpid_child,
+        prove_process_group_dead, stat_is_foreign_zombie, waitpid_child,
     };
     use std::os::unix::process::CommandExt as _;
     use std::process::Command;
@@ -5692,21 +6054,7 @@ mod process_reap_tests {
             unsafe { libc::_exit(0) };
         }
         unsafe { libc::close(pipe[1]) };
-        let mut pid: libc::pid_t = 0;
-        let mut read_bytes = 0;
-        while read_bytes < std::mem::size_of::<libc::pid_t>() {
-            let n = unsafe {
-                libc::read(
-                    pipe[0],
-                    (&mut pid as *mut libc::pid_t)
-                        .cast::<libc::c_void>()
-                        .byte_add(read_bytes),
-                    std::mem::size_of::<libc::pid_t>() - read_bytes,
-                )
-            };
-            assert!(n > 0, "读孙进程 pid 失败");
-            read_bytes += n as usize;
-        }
+        let pid = read_pid(pipe[0]);
         unsafe { libc::close(pipe[0]) };
         let mut status = 0;
         unsafe { libc::waitpid(first, &mut status, 0) };
@@ -5716,6 +6064,26 @@ mod process_reap_tests {
             matches!(waitpid_child(pid, libc::WNOHANG), Waitpid::NotOurChild),
             "孤儿必须已重定父，waitpid 应 ECHILD"
         );
+        pid
+    }
+
+    /// 从管道读子进程报上来的 pid。
+    fn read_pid(fd: i32) -> libc::pid_t {
+        let mut pid: libc::pid_t = 0;
+        let mut read_bytes = 0;
+        while read_bytes < std::mem::size_of::<libc::pid_t>() {
+            let n = unsafe {
+                libc::read(
+                    fd,
+                    (&mut pid as *mut libc::pid_t)
+                        .cast::<libc::c_void>()
+                        .byte_add(read_bytes),
+                    std::mem::size_of::<libc::pid_t>() - read_bytes,
+                )
+            };
+            assert!(n > 0, "读子进程 pid 失败");
+            read_bytes += n as usize;
+        }
         pid
     }
 
@@ -5870,11 +6238,93 @@ mod process_reap_tests {
         let started = std::time::Instant::now();
         assert!(
             !super::prove_process_group_dead_without_reaping(pid, Duration::from_millis(200)),
-            "僵尸对 kill 仍算在，不能当成已经收走"
+            "我们自己的僵尸仍算在，要留给原来的 wait 收走"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         let status = child.wait().expect("原来的 wait 必须还能收走这个僵尸");
         assert!(status.success());
+    }
+
+    /// 容器里 PID 1 常常不收尸：provider 组被 SIGKILL 后，组长和过继出去的组员都
+    /// 停在僵尸，`kill(-pgid, 0)` 一直成功。用一个设成 subreaper、exec 成 sleep、
+    /// 从不 wait 的进程模拟这个 PID 1：组里只剩不归我们收的僵尸时必须算已死，否则
+    /// 每次重启都报「旧 provider 未能退出」。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_left_as_zombies_under_non_reaping_init_is_proven_dead() {
+        let mut pipe = [0; 2];
+        // O_CLOEXEC：别的测试同时拉起的子进程不要带走这两个 fd。
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let init = unsafe { libc::fork() };
+        assert!(init >= 0, "fork 失败");
+        if init == 0 {
+            // 多线程测试进程 fork 出来的，只用 async-signal-safe 调用。
+            unsafe {
+                // 像容器的 PID 1：孤儿过继给它，它却从不 wait。这个属性跨 exec 保留。
+                libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1 as libc::c_ulong);
+                if libc::fork() == 0 {
+                    // 组长：自成一组，先 fork 一个组员，再报出自己的 pid。
+                    libc::setpgid(0, 0);
+                    if libc::fork() == 0 {
+                        loop {
+                            libc::pause();
+                        }
+                    }
+                    libc::close(pipe[0]);
+                    let pid = libc::getpid();
+                    let _ = libc::write(
+                        pipe[1],
+                        (&pid as *const libc::pid_t).cast(),
+                        std::mem::size_of::<libc::pid_t>(),
+                    );
+                    libc::close(pipe[1]);
+                    loop {
+                        libc::pause();
+                    }
+                }
+                let sleep = c"/bin/sleep".as_ptr();
+                let arg = c"30".as_ptr();
+                let argv = [sleep, arg, std::ptr::null::<libc::c_char>()];
+                libc::execv(sleep, argv.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        unsafe { libc::close(pipe[1]) };
+        let leader = read_pid(pipe[0]);
+        unsafe { libc::close(pipe[0]) };
+
+        let dead = kill_and_reap_process_group(leader, Duration::from_secs(5));
+        let left = super::process_group_members(leader);
+        unsafe {
+            libc::kill(init, libc::SIGKILL);
+            libc::waitpid(init, std::ptr::null_mut(), 0);
+        }
+        assert_eq!(
+            left.len(),
+            2,
+            "组长和组员都应停在没人收的僵尸，实际 {left:?}"
+        );
+        assert!(dead, "只剩不归我们收的僵尸的组应证明已死");
+    }
+
+    /// 整个线程组都退出、父进程又不是我们的僵尸才算不在。
+    #[test]
+    fn foreign_zombie_needs_whole_thread_group_exited() {
+        fn stat(state: &str, ppid: u32, threads: u32) -> String {
+            format!(" {state} {ppid} 10 10 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 12345")
+        }
+        let me = 7;
+        assert!(stat_is_foreign_zombie(&stat("Z", 1, 1), me));
+        // 主线程退出、别的线程还活着（比如卡在 D 状态）：ps 显示 Zl，进程没死完。
+        assert!(!stat_is_foreign_zombie(&stat("Z", 1, 2), me));
+        // 我们自己的僵尸留给原来的 wait。
+        assert!(!stat_is_foreign_zombie(&stat("Z", me, 1), me));
+        assert!(!stat_is_foreign_zombie(&stat("S", 1, 1), me));
+        assert!(!stat_is_foreign_zombie(&stat("D", 1, 1), me));
+        assert!(!stat_is_foreign_zombie("", me));
     }
 
     /// 出生标识：同一进程反复读不变，不同进程不同，死进程读不出。
@@ -5947,7 +6397,7 @@ mod prompt_failure_tests {
             "Internal error: turn failed: llm-deepseek: no API key for provider route \"deepseek-official\"; export DEEPSEEK_API_KEY in the launching environment",
             None,
         );
-        let text = describe_prompt_error(&e);
+        let text = describe_prompt_error(&e).detail;
         assert!(text.contains("DEEPSEEK_API_KEY"), "{text}");
         assert!(text.contains("no API key"), "{text}");
     }
@@ -5960,22 +6410,23 @@ mod prompt_failure_tests {
             "Internal error",
             Some(serde_json::json!("rate limit exceeded, retry in 30s")),
         );
-        let text = describe_prompt_error(&e);
-        assert!(text.contains("rate limit exceeded"), "{text}");
+        let failed = describe_prompt_error(&e);
+        assert!(failed.detail.contains("rate limit exceeded"), "{failed:?}");
+        assert_eq!(failed.hint, Some(TurnHint::RateLimited));
     }
 
     /// data 只是 message 的复读时不要显示两遍。
     #[test]
     fn prompt_error_does_not_duplicate_message_and_data() {
         let e = err(-32603, "boom", Some(serde_json::json!("boom")));
-        assert_eq!(describe_prompt_error(&e), "boom");
+        assert_eq!(describe_prompt_error(&e).detail, "boom");
     }
 
     /// agent 什么都不说时也得给出一句能搜的话，不能是空字符串。
     #[test]
     fn prompt_error_never_renders_empty() {
         let e = err(-32000, "  ", None);
-        let text = describe_prompt_error(&e);
+        let text = describe_prompt_error(&e).detail;
         assert!(
             !text.trim().is_empty(),
             "空错误会渲染成一张什么都没有的卡片"
@@ -5984,34 +6435,31 @@ mod prompt_failure_tests {
         assert!(text.contains("Authentication required"), "{text}");
         assert!(text.contains("-32000"), "码要能直接搜：{text}");
         let unknown = err(-31999, "", None);
-        assert!(describe_prompt_error(&unknown).contains("-31999"));
+        assert!(describe_prompt_error(&unknown).detail.contains("-31999"));
     }
 
-    /// 用户看到的第一句必须是「我现在该做什么」。agent 的原文常是英文长句，
-    /// 还可能指向 smelt 根本没有的页面（如「web Models page」）——照抄等于把人
-    /// 支到不存在的地方。
+    /// 光照抄 agent 的原文不够：它常是英文长句，还可能指向 smelt 根本没有的页面
+    /// （如「web Models page」）。认出来的要带上下一步的种类，各端据此指到设置页。
     #[test]
-    fn missing_key_error_points_at_smelt_settings() {
+    fn missing_key_error_carries_a_hint() {
         let e = err(
             -32603,
             "Internal error: turn failed: llm-deepseek: no API key for provider route \"deepseek-official\"; store DEEPSEEK_API_KEY through the credentials service (the web Models page writes it)",
             None,
         );
-        let text = describe_prompt_error(&e);
-        assert!(text.contains("设置"), "要指到设置页：{text}");
-        assert!(text.contains("环境变量"), "要指到具体那个输入框：{text}");
-        // 只有自定义 Agent 能填环境变量，内置的没有这个输入框。
-        assert!(text.contains("自定义 Agent"), "{text}");
+        let failed = describe_prompt_error(&e);
+        assert_eq!(failed.hint, Some(TurnHint::NoApiKey));
         // 原文仍然保留：诊断信息不能因为「友好」就被吞掉。
-        assert!(text.contains("no API key"), "{text}");
+        assert!(failed.detail.contains("no API key"), "{failed:?}");
     }
 
     /// 认不出来的错误就老老实实只给原文，别硬编一条可能是错的建议。
     #[test]
     fn unrecognised_error_gets_no_invented_advice() {
         let e = err(-32603, "tool `bash` exited with code 3", None);
-        let text = describe_prompt_error(&e);
-        assert_eq!(text, "tool `bash` exited with code 3");
+        let failed = describe_prompt_error(&e);
+        assert_eq!(failed.detail, "tool `bash` exited with code 3");
+        assert_eq!(failed.hint, None);
     }
 
     /// 「没配 key」和「key 不对」是两件事，建议不能串。
@@ -6019,8 +6467,8 @@ mod prompt_failure_tests {
     fn invalid_key_and_missing_key_get_different_advice() {
         let missing = describe_prompt_error(&err(-32603, "no api key configured", None));
         let invalid = describe_prompt_error(&err(-32000, "invalid api key provided", None));
-        assert!(missing.contains("还没配"), "{missing}");
-        assert!(invalid.contains("被服务端拒绝"), "{invalid}");
+        assert_eq!(missing.hint, Some(TurnHint::NoApiKey));
+        assert_eq!(invalid.hint, Some(TurnHint::ApiKeyRejected));
     }
 
     /// 回合结束的判定只有一份：新增结束方式时别再让每个消费点各自 `matches!`。
@@ -6085,7 +6533,7 @@ mod permission_view_tests {
             Some(&json!({"url": "https://example.com/a", "prompt": "summarize"})),
             &[],
         );
-        assert_eq!(question, "Fetch URL：https://example.com/a");
+        assert_eq!(question, "Fetch URL: https://example.com/a");
         assert!(matches!(details, ApprovalDetailsView::Generic));
     }
 
@@ -6098,7 +6546,7 @@ mod permission_view_tests {
             Some(&json!({"command": ["git", "push"], "cwd": "/repo"})),
             &[],
         );
-        assert_eq!(question, "Run shell：git push");
+        assert_eq!(question, "Run shell: git push");
         assert!(matches!(
             details,
             ApprovalDetailsView::Command { command, cwd, .. }
@@ -6136,7 +6584,7 @@ mod permission_view_tests {
     #[test]
     fn without_a_title_or_input_it_falls_back_to_the_tool_id() {
         let (question, details) = permission_view(None, "t9", None, None, &[]);
-        assert_eq!(question, "工具调用 t9");
+        assert_eq!(question, "Tool call t9");
         assert!(matches!(details, ApprovalDetailsView::Generic));
     }
 

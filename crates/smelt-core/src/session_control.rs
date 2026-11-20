@@ -10,7 +10,9 @@ pub use smelt_runtime_client::local::daemon_request;
 use crate::agent_kind::{ConversationAgentKind, ConversationLaunchSpec, HistorySourceKind};
 use crate::control_api::SessionList;
 use serde_json::{Value, json};
-use smelt_runtime_client::protocol::control::EmptyParams;
+use smelt_runtime_client::protocol::control::{
+    ControlError, ControlErrorCode, ControlReason, EmptyParams,
+};
 use smelt_runtime_client::protocol::daemon::DaemonOperation;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -174,29 +176,59 @@ pub fn publish_automation_event(
     }))
 }
 
+/// 运行时自己开的新对话拉起后、第一轮之前要设好的选项（规则见
+/// [`crate::agent_host::AgentHostSettings::new_conversation_config`]）。读不到配置只记日志、
+/// 不预设，agent 用自己的默认值，不挡开对话。
+pub fn new_conversation_config(option: &AcpAgentOption) -> Vec<(String, String)> {
+    let Some(kind) = ConversationAgentKind::from_id(&option.kind) else {
+        return Vec::new();
+    };
+    match crate::agent_host::load() {
+        Ok(settings) => settings.new_conversation_config(kind, option.agent_definition_id()),
+        Err(error) => {
+            eprintln!("[session] 读智能体配置失败，新对话不预设选项：{error}");
+            Vec::new()
+        }
+    }
+}
+
 /// 运行时开一场产品智能体对话之前，按定义组好它：校验定义能开对话、建好智能体的 space
 /// 作为工作目录、按定义解析启动规格。
-pub fn agent_conversation_session(agent_definition_id: &str) -> Result<DaemonConversation, String> {
+pub fn agent_conversation_session(
+    agent_definition_id: &str,
+) -> Result<DaemonConversation, ControlError> {
     let agent_definition_id = agent_definition_id.trim();
     if agent_definition_id.is_empty() {
-        return Err("智能体 id 不能为空".into());
+        return Err(ControlError::new(
+            ControlErrorCode::InvalidParams,
+            "the agent id is empty",
+        ));
     }
+    let failed = |reason| ControlError::because(ControlErrorCode::OperationFailed, reason);
     let definition = crate::agent_definition_store::load_agent_definitions()
         .into_iter()
         .find(|definition| definition.id == agent_definition_id)
-        .ok_or_else(|| format!("智能体不存在: {agent_definition_id}"))?;
+        .ok_or_else(|| {
+            failed(ControlReason::UnknownAgent {
+                agent: agent_definition_id.to_string(),
+            })
+        })?;
+    let not_ready = || failed(ControlReason::AgentNotConversationReady);
     if !definition.is_conversation_ready() {
-        return Err("智能体还不能开对话：需要已注册的产品引擎（目前是 Pi）".into());
+        return Err(not_ready());
     }
-    let option = find_agent_option(&format!("agent:{agent_definition_id}"))
-        .ok_or_else(|| "智能体不可开对话".to_string())?;
+    let option =
+        find_agent_option(&format!("agent:{agent_definition_id}")).ok_or_else(not_ready)?;
     let cwd = crate::agent_definition_store::ensure_agent_space(agent_definition_id)
-        .ok_or_else(|| "无法创建智能体工作区".to_string())?;
+        .ok_or_else(|| failed(ControlReason::AgentWorkspaceUnavailable))?;
     Ok(DaemonConversation {
         sid: format!("acp-{}", uuid::Uuid::new_v4()),
         cwd: cwd.to_string_lossy().into_owned(),
+        initial_config: new_conversation_config(&option),
         option,
         resume_id: None,
+        title: None,
+        disallowed_tools: Vec::new(),
     })
 }
 
@@ -256,7 +288,12 @@ mod tests {
     #[test]
     fn agent_conversation_rejects_a_missing_definition() {
         let error = agent_conversation_session("missing-agent").unwrap_err();
-        assert!(error.contains("不存在"), "{error}");
+        assert_eq!(
+            error.reason,
+            Some(ControlReason::UnknownAgent {
+                agent: "missing-agent".into()
+            })
+        );
     }
 
     #[test]
@@ -501,6 +538,8 @@ mod tests {
             revision: 1,
             epoch: String::new(),
             projects: Vec::new(),
+            repositories: Vec::new(),
+            worksets: Vec::new(),
             conversations: vec![
                 WorkspaceConversation {
                     id: "c-term".into(),
@@ -534,5 +573,4 @@ mod tests {
         assert_eq!(directory_session_kind(&directory, "c-term"), None);
         assert_eq!(directory_session_kind(&directory, "missing"), None);
     }
-
 }

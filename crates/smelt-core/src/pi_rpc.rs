@@ -19,11 +19,11 @@ use crate::acp_conn::{
     AcpForkCut, AcpStdio, ConfigValue, ContextUsageBreakdown, ConversationCommand,
     ConversationEvent, ConversationHandle, ConversationLaunch, ConversationRestoreFailure,
     ElicitField, ElicitFieldKind, ElicitOption, ElicitationResponder, ModelProviderGroup,
-    ModelState, PermissionResponder, ReadyKind, SessionConfigState,
+    ModelState, PermissionResponder, ReadyKind, SessionConfigState, SmeltConfig,
 };
 use crate::acp_session::{
     ApprovalDetailsView, PermissionOptionKindView, PermissionOptionView, RuntimeDebug,
-    RuntimeDebugModelCall,
+    RuntimeDebugModelCall, RuntimeNote,
 };
 use crate::agent_kind::{ConversationLaunchSpec, SMELT_PI_AGENT_COMMAND};
 use crate::pi_queue::QueueLane;
@@ -36,6 +36,8 @@ const SMELT_CONTEXT_USAGE_WIDGET: &str = "smelt-context-usage";
 const SMELT_RUNTIME_DEBUG_WIDGET: &str = "smelt-runtime-debug";
 const SMELT_BACKGROUND_TASK_WIDGET: &str = "smelt-background-tasks";
 const SMELT_CODEMODE_COMMAND: &str = "smelt-codemode";
+/// 脚本工具那一项配置的 id。
+const SMELT_CODEMODE_CONFIG_ID: &str = "codemode";
 /// 让会话重读 models.json 的扩展命令（`agent/src/model-refresh.ts`）。
 const SMELT_REFRESH_MODELS_COMMAND: &str = "smelt-refresh-models";
 const SMELT_CODEMODE_WIDGET: &str = "smelt-codemode";
@@ -311,9 +313,7 @@ pub fn spawn_pi_rpc(
                         let failure = if tail.to_ascii_lowercase().contains("no session found") {
                             ConversationRestoreFailure::HistoryMissing
                         } else {
-                            ConversationRestoreFailure::Failed(format!(
-                                "恢复 Pi 历史对话失败：{message}"
-                            ))
+                            ConversationRestoreFailure::Failed(message)
                         };
                         let _ = event_tx.try_send(ConversationEvent::RestoreFailed(failure));
                     } else {
@@ -327,9 +327,7 @@ pub fn spawn_pi_rpc(
                     "pi-rpc",
                     &format!("会话 {sid_for_panic} 驱动异常退出：{message}"),
                 );
-                let _ = event_tx_for_panic.try_send(ConversationEvent::Fatal(format!(
-                    "会话驱动异常退出：{message}"
-                )));
+                let _ = event_tx_for_panic.try_send(ConversationEvent::DriverCrashed(message));
             }
         })
         .expect("spawn smelt Pi RPC thread");
@@ -435,7 +433,7 @@ async fn run_connection(
         smol::future::race(initialize, async {
             smol::Timer::after(PI_RPC_HANDSHAKE_TIMEOUT).await;
             Err(format!(
-                "Pi RPC 启动握手超时（{} 秒）",
+                "Pi RPC startup handshake timed out ({}s)",
                 PI_RPC_HANDSHAKE_TIMEOUT.as_secs()
             ))
         })
@@ -476,7 +474,9 @@ async fn run_connection(
                         write_rpc(&mut writer, &message).await?;
                     }
                 }
-                Next::Outbound(Err(_)) => return Err("Pi RPC 回执通道已关闭".to_string()),
+                Next::Outbound(Err(_)) => {
+                    return Err("the Pi RPC reply channel is closed".to_string());
+                }
                 Next::Line(Some(Ok(line))) => {
                     let value = parse_rpc_line(&line)?;
                     if value.get("type").and_then(serde_json::Value::as_str) == Some("response") {
@@ -487,9 +487,9 @@ async fn run_connection(
                     }
                 }
                 Next::Line(Some(Err(error))) => {
-                    return Err(format!("读取 Pi RPC 输出失败：{error}"));
+                    return Err(format!("couldn't read Pi RPC output: {error}"));
                 }
-                Next::Line(None) => return Err("Pi RPC 进程已关闭 stdout".to_string()),
+                Next::Line(None) => return Err("the Pi RPC process closed stdout".to_string()),
             }
         }
     }
@@ -559,7 +559,7 @@ fn spawn_process(
     background_sock: Option<&std::path::Path>,
 ) -> Result<SpawnedPi, String> {
     if process_args.is_empty() {
-        return Err("Pi 启动参数不完整".to_string());
+        return Err("the Pi launch arguments are incomplete".to_string());
     }
     let program = process_args.remove(0);
     let mut command = std::process::Command::new(program);
@@ -614,15 +614,15 @@ fn spawn_process(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|error| format!("无法启动 Pi RPC：{error}"))?;
+        .map_err(|error| format!("couldn't start Pi RPC: {error}"))?;
     #[cfg(windows)]
     if let Err(error) = smelt_sys::process::attach_suspended(child.id()) {
         drop(child);
-        return Err(format!("无法把 Pi 放进进程树：{error}"));
+        return Err(format!("couldn't put Pi into the process tree: {error}"));
     }
-    let stdin = child.stdin.take().ok_or("无法打开 Pi RPC stdin")?;
-    let stdout = child.stdout.take().ok_or("无法打开 Pi RPC stdout")?;
-    let stderr = child.stderr.take().ok_or("无法打开 Pi RPC stderr")?;
+    let stdin = child.stdin.take().ok_or("couldn't open Pi RPC stdin")?;
+    let stdout = child.stdout.take().ok_or("couldn't open Pi RPC stdout")?;
+    let stderr = child.stderr.take().ok_or("couldn't open Pi RPC stderr")?;
     Ok((stdin, stdout, stderr, child))
 }
 
@@ -631,7 +631,7 @@ fn parse_logical_launch(command: &str) -> Result<(BTreeMap<String, String>, Vec<
     let mut words = command.split_whitespace();
     let program = loop {
         let Some(word) = words.next() else {
-            return Err("Pi 启动命令为空".to_string());
+            return Err("the Pi launch command is empty".to_string());
         };
         if let Some((name, value)) = crate::workspace_override::split_env_assignment(word) {
             environment.insert(
@@ -643,14 +643,14 @@ fn parse_logical_launch(command: &str) -> Result<(BTreeMap<String, String>, Vec<
         }
     };
     if program != SMELT_PI_AGENT_COMMAND {
-        return Err(format!("不是 Smelt Pi 逻辑入口：{program}"));
+        return Err(format!("not the Smelt Pi entry point: {program}"));
     }
     let trailing = words.map(str::to_string).collect::<Vec<_>>();
     if trailing
         .windows(2)
         .any(|pair| pair[0] == "--mode" && pair[1] != "rpc")
     {
-        return Err("smelt-pi-agent 的传输固定为 Pi RPC，不能通过 --mode 切换".to_string());
+        return Err("smelt-pi-agent always talks Pi RPC; --mode can't change it".to_string());
     }
     Ok((environment, trailing))
 }
@@ -927,7 +927,7 @@ where
         responses
             .get("smelt-init-thinking")
             .cloned()
-            .ok_or_else(|| "缺少 thinking level 回执".to_string())?
+            .ok_or_else(|| "the thinking level reply is missing".to_string())?
     };
     state.thinking_levels = response_data(&thinking)?["levels"]
         .as_array()
@@ -1239,7 +1239,7 @@ where
                 }
                 write_rpc(writer, &message).await?;
             }
-            Wait::Outbound(Err(_)) => return Err("Pi RPC 回执通道已关闭".to_string()),
+            Wait::Outbound(Err(_)) => return Err("the Pi RPC reply channel is closed".to_string()),
             Wait::Line(Some(Ok(line))) => {
                 let value = parse_rpc_line(&line)?;
                 if value.get("type").and_then(serde_json::Value::as_str) == Some("response") {
@@ -1267,9 +1267,11 @@ where
                 handle_event(value, event_tx, outbound_tx, state, launch);
             }
             Wait::Line(Some(Err(error))) => {
-                return Err(format!("读取 Pi RPC 握手响应失败：{error}"));
+                return Err(format!("couldn't read the Pi RPC handshake reply: {error}"));
             }
-            Wait::Line(None) => return Err("Pi RPC 在握手完成前退出".to_string()),
+            Wait::Line(None) => {
+                return Err("Pi RPC exited before the handshake finished".to_string());
+            }
         }
     }
     Ok(responses)
@@ -1320,7 +1322,7 @@ where
                 }
                 write_rpc(writer, &message).await?;
             }
-            Wait::Outbound(Err(_)) => return Err("Pi RPC 回执通道已关闭".to_string()),
+            Wait::Outbound(Err(_)) => return Err("the Pi RPC reply channel is closed".to_string()),
             Wait::Line(Some(Ok(line))) => {
                 let value = parse_rpc_line(&line)?;
                 if value.get("type").and_then(serde_json::Value::as_str) == Some("response") {
@@ -1343,9 +1345,11 @@ where
                 }
             }
             Wait::Line(Some(Err(error))) => {
-                return Err(format!("读取 Pi RPC 握手响应失败：{error}"));
+                return Err(format!("couldn't read the Pi RPC handshake reply: {error}"));
             }
-            Wait::Line(None) => return Err("Pi RPC 在握手完成前退出".to_string()),
+            Wait::Line(None) => {
+                return Err("Pi RPC exited before the handshake finished".to_string());
+            }
         }
     }
 }
@@ -1399,22 +1403,22 @@ async fn write_rpc<W: AsyncWrite + Unpin>(
     value: &serde_json::Value,
 ) -> Result<(), String> {
     let mut bytes =
-        serde_json::to_vec(value).map_err(|error| format!("编码 Pi RPC 失败：{error}"))?;
+        serde_json::to_vec(value).map_err(|error| format!("couldn't encode Pi RPC: {error}"))?;
     bytes.push(b'\n');
     writer
         .write_all(&bytes)
         .await
-        .map_err(|error| format!("写入 Pi RPC 失败：{error}"))?;
+        .map_err(|error| format!("couldn't write Pi RPC: {error}"))?;
     writer
         .flush()
         .await
-        .map_err(|error| format!("刷新 Pi RPC stdin 失败：{error}"))
+        .map_err(|error| format!("couldn't flush Pi RPC stdin: {error}"))
 }
 
 fn parse_rpc_line(line: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(line).map_err(|error| {
         let preview: String = line.chars().take(200).collect();
-        format!("Pi RPC 输出不是有效 JSON：{error}；内容：{preview}")
+        format!("Pi RPC output isn't valid JSON: {error}; content: {preview}")
     })
 }
 
@@ -1425,7 +1429,7 @@ fn ensure_response_success(response: &serde_json::Value) -> Result<(), String> {
     Err(response
         .get("error")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Pi RPC 请求失败")
+        .unwrap_or("Pi RPC request failed")
         .to_string())
 }
 
@@ -1433,7 +1437,7 @@ fn response_data(response: &serde_json::Value) -> Result<&serde_json::Value, Str
     ensure_response_success(response)?;
     response
         .get("data")
-        .ok_or_else(|| "Pi RPC 响应缺少 data".to_string())
+        .ok_or_else(|| "the Pi RPC reply has no data".to_string())
 }
 
 fn apply_state_response(state: &mut PiState, data: &serde_json::Value) -> Result<(), String> {
@@ -1441,7 +1445,7 @@ fn apply_state_response(state: &mut PiState, data: &serde_json::Value) -> Result
         .get("sessionId")
         .and_then(serde_json::Value::as_str)
         .filter(|id| !id.is_empty())
-        .ok_or("Pi RPC 状态缺少 sessionId")?
+        .ok_or("the Pi RPC state has no sessionId")?
         .to_string();
     state.session_name = data
         .get("sessionName")
@@ -1539,10 +1543,6 @@ fn apply_requested_pi_model(state: &mut PiState, value: &str, data: Option<&serd
     });
 }
 
-fn config_update_failure_status(detail: impl std::fmt::Display) -> String {
-    format!("更新会话配置失败：{detail}")
-}
-
 fn publish_model_event(state: &PiState, event_tx: &smol::channel::Sender<ConversationEvent>) {
     let effective_model = state
         .model
@@ -1618,26 +1618,28 @@ fn publish_configuration(state: &PiState, event_tx: &smol::channel::Sender<Conve
         levels.push(state.thinking_level.clone());
     }
     let permission_name = if state.permission_mode == "bypassPermissions" {
-        "完全访问"
+        "Full access"
     } else {
-        "逐次审批"
+        "Ask each time"
     };
+    // 名字、说明和选项是英文兜底，各端按 `smelt` 换成自己的语言。
     let mut configs = vec![
         SessionConfigState {
             config_id: "mode".to_string(),
-            name: "权限模式".to_string(),
-            description: Some("写入、执行命令和自定义工具的审批策略".to_string()),
+            name: "Permission mode".to_string(),
+            description: Some("How writes, commands and custom tools get approved".to_string()),
             current_name: permission_name.to_string(),
             options: vec![
-                ("default".to_string(), "逐次审批".to_string()),
-                ("bypassPermissions".to_string(), "完全访问".to_string()),
+                ("default".to_string(), "Ask each time".to_string()),
+                ("bypassPermissions".to_string(), "Full access".to_string()),
             ],
             boolean: None,
+            smelt: Some(SmeltConfig::PermissionMode),
         },
         SessionConfigState {
             config_id: "thought_level".to_string(),
-            name: "推理强度".to_string(),
-            description: Some("Pi 当前模型使用的 thinking level".to_string()),
+            name: "Reasoning effort".to_string(),
+            description: Some("The thinking level for Pi's current model".to_string()),
             current_name: thinking_name(&state.thinking_level).to_string(),
             options: levels
                 .into_iter()
@@ -1647,6 +1649,7 @@ fn publish_configuration(state: &PiState, event_tx: &smol::channel::Sender<Conve
                 })
                 .collect(),
             boolean: None,
+            smelt: Some(SmeltConfig::ThinkingLevel),
         },
     ];
     if codemode_command_available(state) {
@@ -1714,7 +1717,7 @@ async fn send_set_model<W: AsyncWrite + Unpin>(
     value: String,
 ) -> Result<(), String> {
     let Some((provider, model_id)) = value.split_once('/') else {
-        return Err(format!("Pi 模型值格式无效：{value}"));
+        return Err(format!("invalid Pi model value: {value}"));
     };
     let (provider, model_id) = (provider.to_string(), model_id.to_string());
     let id = state.request_id("config-model");
@@ -1742,15 +1745,19 @@ fn codemode_command_available(state: &PiState) -> bool {
 
 fn codemode_config(state: &PiState) -> SessionConfigState {
     SessionConfigState {
-        config_id: "codemode".to_string(),
-        name: "脚本工具".to_string(),
-        description: Some("模型写脚本调用其它工具，下一轮生效".to_string()),
-        current_name: if state.codemode_enabled { "开" } else { "关" }.to_string(),
+        // 名字、说明和选项是英文兜底，各端按 `smelt` 换成自己的语言。
+        config_id: SMELT_CODEMODE_CONFIG_ID.to_string(),
+        name: "Script tools".to_string(),
+        description: Some(
+            "The model writes scripts that call other tools. Takes effect next turn.".to_string(),
+        ),
+        current_name: if state.codemode_enabled { "On" } else { "Off" }.to_string(),
         options: vec![
-            ("off".to_string(), "关".to_string()),
-            ("on".to_string(), "开".to_string()),
+            ("off".to_string(), "Off".to_string()),
+            ("on".to_string(), "On".to_string()),
         ],
         boolean: None,
+        smelt: Some(SmeltConfig::ScriptTools),
     }
 }
 
@@ -1765,13 +1772,13 @@ fn publishable_commands(commands: &[(String, String)]) -> Vec<(String, String)> 
 
 fn thinking_name(level: &str) -> &str {
     match level {
-        "off" => "关闭",
-        "minimal" => "极简",
-        "low" => "低",
-        "medium" => "中",
-        "high" => "高",
-        "xhigh" => "很高",
-        "max" => "最高",
+        "off" => "Off",
+        "minimal" => "Minimal",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Very high",
+        "max" => "Max",
         other => other,
     }
 }
@@ -1888,8 +1895,8 @@ async fn consume_session_slash<W: AsyncWrite + Unpin>(
     match slash {
         PiSessionSlash::Reload => {
             finish_in_flight(in_flight_rpc);
-            let _ = event_tx.try_send(ConversationEvent::Notice(
-                "当前协议不支持 /reload，不会发给模型".to_string(),
+            let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                RuntimeNote::ReloadUnsupported,
             ));
             if !turn_is_active {
                 mark_provider_idle(state, event_tx);
@@ -1898,8 +1905,8 @@ async fn consume_session_slash<W: AsyncWrite + Unpin>(
         }
         PiSessionSlash::Shake if turn_is_active => {
             finish_in_flight(in_flight_rpc);
-            let _ = event_tx.try_send(ConversationEvent::Notice(
-                "回合进行中，结束后再 /shake".to_string(),
+            let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                RuntimeNote::ShakeWhileBusy,
             ));
             Ok(true)
         }
@@ -2116,19 +2123,11 @@ async fn handle_command<W: AsyncWrite + Unpin>(
         } => {
             // daemon 发命令前记了一笔在途 RPC，拒绝也要销账，否则热升级永远等不到它。
             if state.active_turn {
-                abort_rewind(
-                    event_tx,
-                    in_flight_rpc,
-                    "回退失败：回合还在运行，请先停止".to_string(),
-                );
+                abort_rewind(event_tx, in_flight_rpc, RuntimeNote::RewindWhileBusy);
                 return Ok(());
             }
             if state.pending_rewind.is_some() {
-                abort_rewind(
-                    event_tx,
-                    in_flight_rpc,
-                    "回退失败：已有一次回退在进行中".to_string(),
-                );
+                abort_rewind(event_tx, in_flight_rpc, RuntimeNote::RewindInProgress);
                 return Ok(());
             }
             let list_id = state.request_id("rewind-list");
@@ -2185,31 +2184,31 @@ async fn handle_command<W: AsyncWrite + Unpin>(
         ConversationCommand::StopBackgroundTask { id } => {
             let result = match &state.background {
                 Some(background) => background.stop(&id),
-                None => Err("后台任务服务还没就绪".to_string()),
+                None => Err("the background task service isn't ready".to_string()),
             };
             if let Err(error) = result {
-                let _ = event_tx.try_send(ConversationEvent::Notice(format!(
-                    "停止后台任务失败：{error}"
-                )));
+                let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::StopTaskFailed { detail: error },
+                ));
             }
         }
         ConversationCommand::DeliverPeerMessage(delivery) => match &state.background {
             Some(background) => background.deliver_peer(delivery),
             None => {
-                let _ = event_tx.try_send(ConversationEvent::Notice(
-                    "会话宿主还没就绪，丢掉了一条别的对话发来的消息".to_string(),
+                let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::PeerMessageDropped,
                 ));
             }
         },
         ConversationCommand::StopSubagent { id } => {
             let result = match &state.background {
                 Some(background) => background.stop_subagent(&id),
-                None => Err("子智能体服务还没就绪".to_string()),
+                None => Err("the subagent service isn't ready".to_string()),
             };
             if let Err(error) = result {
-                let _ = event_tx.try_send(ConversationEvent::Notice(format!(
-                    "停止子智能体失败：{error}"
-                )));
+                let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::StopSubagentFailed { detail: error },
+                ));
             }
         }
         ConversationCommand::SetSessionTitle(title) => {
@@ -2297,7 +2296,9 @@ async fn handle_config_command<W: AsyncWrite + Unpin>(
     let ConfigValue::Select(value) = value else {
         finish_in_flight(in_flight_rpc);
         let _ = event_tx.try_send(ConversationEvent::ConfigRejected(
-            config_update_failure_status(format!("Pi 配置 `{config_id}` 不接受布尔值")),
+            RuntimeNote::ConfigNotBoolean {
+                config: config_id.clone(),
+            },
         ));
         return Ok(());
     };
@@ -2318,11 +2319,11 @@ async fn handle_config_command<W: AsyncWrite + Unpin>(
             )
             .await?;
         }
-        "codemode" if matches!(value.as_str(), "off" | "on") => {
+        SMELT_CODEMODE_CONFIG_ID if matches!(value.as_str(), "off" | "on") => {
             if !codemode_command_available(state) {
                 finish_in_flight(in_flight_rpc);
                 let _ = event_tx.try_send(ConversationEvent::ConfigRejected(
-                    config_update_failure_status("当前 Pi 没有脚本工具"),
+                    RuntimeNote::NoScriptTools,
                 ));
                 return Ok(());
             }
@@ -2346,7 +2347,7 @@ async fn handle_config_command<W: AsyncWrite + Unpin>(
             if !value.contains('/') {
                 finish_in_flight(in_flight_rpc);
                 let _ = event_tx.try_send(ConversationEvent::ConfigRejected(
-                    config_update_failure_status("Pi 模型值格式无效"),
+                    RuntimeNote::InvalidModelValue,
                 ));
                 return Ok(());
             }
@@ -2368,9 +2369,10 @@ async fn handle_config_command<W: AsyncWrite + Unpin>(
         _ => {
             finish_in_flight(in_flight_rpc);
             let _ = event_tx.try_send(ConversationEvent::ConfigRejected(
-                config_update_failure_status(format!(
-                    "Pi 不支持会话配置 `{config_id}` = `{value}`"
-                )),
+                RuntimeNote::ConfigValueUnsupported {
+                    config: config_id.clone(),
+                    value: value.clone(),
+                },
             ));
         }
     }
@@ -2417,7 +2419,7 @@ async fn handle_response<W: AsyncWrite + Unpin>(
                 let error = state
                     .pending_refusal_error
                     .take()
-                    .unwrap_or_else(|| "Pi RPC 请求失败".to_string());
+                    .unwrap_or_else(|| "Pi RPC request failed".to_string());
                 resolve_prompt_refusal(state, event_tx, error, None);
             }
         } else {
@@ -2473,7 +2475,7 @@ async fn handle_response<W: AsyncWrite + Unpin>(
         let error = state
             .pending_refusal_error
             .take()
-            .unwrap_or_else(|| "Pi RPC 请求失败".to_string());
+            .unwrap_or_else(|| "Pi RPC request failed".to_string());
         match ensure_response_success(&response) {
             Ok(()) => {
                 let data = response.get("data").cloned().unwrap_or_default();
@@ -2532,7 +2534,9 @@ async fn handle_response<W: AsyncWrite + Unpin>(
         let result = ensure_response_success(&response);
         state.queue.acknowledged(&id, queued_by_pi(&response));
         if let Err(error) = result {
-            let _ = event_tx.try_send(ConversationEvent::Notice(format!("插入消息失败：{error}")));
+            let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(RuntimeNote::SteerFailed {
+                detail: error,
+            }));
         }
         finish_in_flight(in_flight_rpc);
         return Ok(());
@@ -2541,18 +2545,18 @@ async fn handle_response<W: AsyncWrite + Unpin>(
         let result = ensure_response_success(&response);
         state.queue.acknowledged(&id, queued_by_pi(&response));
         if let Err(error) = result {
-            let _ = event_tx.try_send(ConversationEvent::Notice(format!(
-                "排队后续消息失败：{error}"
-            )));
+            let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                RuntimeNote::FollowUpFailed { detail: error },
+            ));
         }
         finish_in_flight(in_flight_rpc);
         return Ok(());
     }
     if state.compact_request_ids.remove(&id) {
         if let Err(error) = ensure_response_success(&response) {
-            let _ = event_tx.try_send(ConversationEvent::Notice(format!(
-                "压缩上下文失败：{error}"
-            )));
+            let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                RuntimeNote::CompactFailed { detail: error },
+            ));
         }
         finish_in_flight(in_flight_rpc);
         return Ok(());
@@ -2576,8 +2580,9 @@ async fn handle_response<W: AsyncWrite + Unpin>(
                 emit_queue_restore(event_tx, state, restore);
             }
             Err(error) => {
-                let _ =
-                    event_tx.try_send(ConversationEvent::Notice(format!("清空队列失败：{error}")));
+                let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::ClearQueueFailed { detail: error },
+                ));
             }
         }
         if then_abort {
@@ -2653,14 +2658,14 @@ async fn handle_response<W: AsyncWrite + Unpin>(
                         == Some("handled");
                     if !handled || state.codemode_enabled != enabled {
                         let _ = event_tx.try_send(ConversationEvent::ConfigRejected(
-                            config_update_failure_status("脚本工具没有在下一轮生效"),
+                            RuntimeNote::ScriptToolsNotApplied,
                         ));
                     }
                 }
             },
             Err(error) => {
                 let _ = event_tx.try_send(ConversationEvent::ConfigRejected(
-                    config_update_failure_status(error),
+                    RuntimeNote::ConfigUpdateFailed { detail: error },
                 ));
             }
         }
@@ -2730,7 +2735,7 @@ where
         .unwrap_or_default();
     let Some(entry_id) = match_fork_entry_id(&messages, &cut.text, cut.occurrence) else {
         return Err(format!(
-            "分叉切点在 agent 历史里找不到（可能已被压缩）：{}",
+            "the fork point isn't in the agent's history (it may have been compacted): {}",
             cut.text.chars().take(50).collect::<String>()
         ));
     };
@@ -2751,7 +2756,7 @@ where
         .and_then(serde_json::Value::as_bool)
         == Some(true)
     {
-        return Err("分叉切点被扩展取消".to_string());
+        return Err("an extension cancelled the fork".to_string());
     }
     Ok(())
 }
@@ -2771,7 +2776,13 @@ async fn handle_rewind_list_response<W: AsyncWrite + Unpin>(
     let messages = match response_data(response) {
         Ok(data) => data.get("messages"),
         Err(error) => {
-            abort_rewind(event_tx, in_flight_rpc, format!("回退失败：{error}"));
+            abort_rewind(
+                event_tx,
+                in_flight_rpc,
+                RuntimeNote::RewindFailed {
+                    detail: error.to_string(),
+                },
+            );
             return Ok(());
         }
     };
@@ -2779,11 +2790,7 @@ async fn handle_rewind_list_response<W: AsyncWrite + Unpin>(
         .and_then(serde_json::Value::as_array)
         .and_then(|messages| match_fork_entry_id(messages, &pending.text, pending.occurrence));
     let Some(entry_id) = entry_id else {
-        abort_rewind(
-            event_tx,
-            in_flight_rpc,
-            "回退失败：agent 分支上找不到这条消息（可能已被压缩或属于另一条分支）".to_string(),
-        );
+        abort_rewind(event_tx, in_flight_rpc, RuntimeNote::RewindTargetMissing);
         return Ok(());
     };
     let fork_id = state.request_id("rewind-fork");
@@ -2797,7 +2804,13 @@ async fn handle_rewind_list_response<W: AsyncWrite + Unpin>(
         Ok(()) => {
             state.pending_rewind = Some(pending);
         }
-        Err(error) => abort_rewind(event_tx, in_flight_rpc, format!("回退失败：{error}")),
+        Err(error) => abort_rewind(
+            event_tx,
+            in_flight_rpc,
+            RuntimeNote::RewindFailed {
+                detail: error.to_string(),
+            },
+        ),
     }
     Ok(())
 }
@@ -2850,12 +2863,18 @@ async fn handle_rewind_fork_response<W: AsyncWrite + Unpin>(
     let data = match response_data(response) {
         Ok(data) => data,
         Err(error) => {
-            abort_rewind(event_tx, in_flight_rpc, format!("回退失败：{error}"));
+            abort_rewind(
+                event_tx,
+                in_flight_rpc,
+                RuntimeNote::RewindFailed {
+                    detail: error.to_string(),
+                },
+            );
             return Ok(());
         }
     };
     if data.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true) {
-        abort_rewind(event_tx, in_flight_rpc, "回退被扩展取消".to_string());
+        abort_rewind(event_tx, in_flight_rpc, RuntimeNote::RewindCancelled);
         return Ok(());
     }
     // fork 会中止运行中的 turn；正常路径下回退只在 Idle 时发起，这里只是
@@ -2898,9 +2917,9 @@ async fn handle_rewind_fork_response<W: AsyncWrite + Unpin>(
 fn abort_rewind(
     event_tx: &smol::channel::Sender<ConversationEvent>,
     in_flight_rpc: &AtomicUsize,
-    message: String,
+    note: RuntimeNote,
 ) {
-    let _ = event_tx.try_send(ConversationEvent::Notice(message));
+    let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(note));
     finish_in_flight(in_flight_rpc);
 }
 
@@ -3011,11 +3030,12 @@ fn finish_turn(
     let event = if state.cancel_requested || reason.as_deref() == Some("aborted") {
         ConversationEvent::TurnEnded(StopReason::Cancelled)
     } else if reason.as_deref() == Some("error") {
-        ConversationEvent::TurnFailed(error.unwrap_or_else(|| "Pi 模型请求失败".to_string()))
+        // Pi 没说为什么时细节留空，各端只说「回合失败」。
+        ConversationEvent::TurnFailed(error.unwrap_or_default().into())
     } else if reason.as_deref() == Some("length") {
         ConversationEvent::TurnEnded(StopReason::MaxTokens)
     } else if let Some(error) = error {
-        ConversationEvent::TurnFailed(error)
+        ConversationEvent::TurnFailed(error.into())
     } else {
         ConversationEvent::TurnEnded(StopReason::EndTurn)
     };
@@ -3198,6 +3218,7 @@ fn handle_event(
             }
             emit_tool_started(event_tx, id, &name, args.as_ref());
             emit_peer_send(event_tx, id, &name, args.as_ref(), None, None);
+            emit_ask_record(event_tx, id, &name, None);
         }
         Some("tool_execution_update") => {
             let Some(id) = event.get("toolCallId").and_then(serde_json::Value::as_str) else {
@@ -3277,6 +3298,17 @@ fn handle_event(
                 event.get("result").and_then(|value| value.get("details")),
                 failure.as_deref(),
             );
+            emit_ask_record(
+                event_tx,
+                id,
+                &name,
+                Some(
+                    event
+                        .get("result")
+                        .and_then(|value| value.get("details"))
+                        .unwrap_or(&serde_json::Value::Null),
+                ),
+            );
             let output = event
                 .get("result")
                 .map(|result| tool_output_parts(result, &name, args.as_ref()))
@@ -3323,13 +3355,14 @@ fn handle_event(
             }
         }
         Some("extension_error") => {
-            let message = event
+            let detail = event
                 .get("error")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("Pi Extension 执行失败");
-            let _ = event_tx.try_send(ConversationEvent::Notice(format!(
-                "Pi Extension：{message}"
-            )));
+                .unwrap_or_default()
+                .to_string();
+            let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                RuntimeNote::ExtensionFailed { detail },
+            ));
         }
         Some("auto_retry_start") => {
             let number = |key: &str| event.get(key).and_then(serde_json::Value::as_u64);
@@ -3388,9 +3421,11 @@ fn handle_event(
                 .map(str::trim)
                 .filter(|text| !text.is_empty());
             if let Some(error) = error.filter(|_| !aborted) {
-                let _ = event_tx.try_send(ConversationEvent::Notice(format!(
-                    "上下文压缩失败：{error}"
-                )));
+                let _ = event_tx.try_send(ConversationEvent::RuntimeNotice(
+                    RuntimeNote::CompactFailed {
+                        detail: error.to_string(),
+                    },
+                ));
             }
             let used = if aborted || error.is_some() {
                 None
@@ -3690,6 +3725,23 @@ fn emit_peer_send(
     }
 }
 
+/// `smelt_ask_user` 问了什么、怎么答的。`details` 为 None 是工具刚开始，先记一份空记录；
+/// 结束了就带结果的 `details`（没有时传 `Null`）。出错的结果还原不出记录，就不发，照
+/// 普通工具画。
+fn emit_ask_record(
+    event_tx: &smol::channel::Sender<ConversationEvent>,
+    id: &str,
+    name: &str,
+    details: Option<&serde_json::Value>,
+) {
+    if let Some(record) = crate::acp_chat::ask_record_from_tool(name, details) {
+        let _ = event_tx.try_send(ConversationEvent::AskRecord {
+            id: id.to_string(),
+            record,
+        });
+    }
+}
+
 fn subagent_runs_from_details(
     name: &str,
     details: &serde_json::Value,
@@ -3823,12 +3875,12 @@ fn messages_from_get_entries(data: &serde_json::Value) -> Result<Vec<serde_json:
     let entries = data
         .get("entries")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "Pi get_entries 响应缺少 entries".to_string())?;
+        .ok_or_else(|| "the Pi get_entries reply has no entries".to_string())?;
     let leaf = match data.get("leafId") {
         Some(serde_json::Value::Null) => return Ok(Vec::new()),
         Some(serde_json::Value::String(id)) if !id.is_empty() => id.as_str(),
-        Some(_) => return Err("Pi get_entries 响应的 leafId 无效".to_string()),
-        None => return Err("Pi get_entries 响应缺少 leafId".to_string()),
+        Some(_) => return Err("the Pi get_entries reply has an invalid leafId".to_string()),
+        None => return Err("the Pi get_entries reply has no leafId".to_string()),
     };
 
     let mut by_id = HashMap::with_capacity(entries.len());
@@ -3837,9 +3889,11 @@ fn messages_from_get_entries(data: &serde_json::Value) -> Result<Vec<serde_json:
             .get("id")
             .and_then(serde_json::Value::as_str)
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| "Pi get_entries 返回了没有有效 id 的 entry".to_string())?;
+            .ok_or_else(|| "Pi get_entries returned an entry without a valid id".to_string())?;
         if by_id.insert(id, entry).is_some() {
-            return Err(format!("Pi get_entries 返回了重复 entry id：{id}"));
+            return Err(format!(
+                "Pi get_entries returned a duplicate entry id: {id}"
+            ));
         }
     }
 
@@ -3848,18 +3902,18 @@ fn messages_from_get_entries(data: &serde_json::Value) -> Result<Vec<serde_json:
     let mut cursor = leaf;
     loop {
         if !visited.insert(cursor) {
-            return Err(format!("Pi 当前分支 parent 链成环：{cursor}"));
+            return Err(format!("Pi's current branch has a parent cycle: {cursor}"));
         }
         let entry = by_id
             .get(cursor)
             .copied()
-            .ok_or_else(|| format!("Pi 当前分支缺少 entry：{cursor}"))?;
+            .ok_or_else(|| format!("Pi's current branch is missing an entry: {cursor}"))?;
         branch.push(entry);
         match entry.get("parentId") {
             Some(serde_json::Value::Null) => break,
             Some(serde_json::Value::String(parent)) if !parent.is_empty() => cursor = parent,
-            Some(_) => return Err(format!("Pi entry {cursor} 的 parentId 无效")),
-            None => return Err(format!("Pi entry {cursor} 缺少 parentId")),
+            Some(_) => return Err(format!("Pi entry {cursor} has an invalid parentId")),
+            None => return Err(format!("Pi entry {cursor} has no parentId")),
         }
     }
     branch.reverse();
@@ -3963,6 +4017,12 @@ fn replay_messages(
                     args.as_ref(),
                     message.get("details"),
                     failure.as_deref(),
+                );
+                emit_ask_record(
+                    event_tx,
+                    id,
+                    &name,
+                    Some(message.get("details").unwrap_or(&serde_json::Value::Null)),
                 );
                 let _ = event_tx.try_send(ConversationEvent::ToolFinished {
                     id: id.to_string(),
@@ -4366,7 +4426,7 @@ fn handle_extension_ui(
     }
     match method {
         "select" | "confirm" | "input" | "editor" => {
-            handle_generic_elicitation(request, id, method, event_tx, outbound_tx, state)
+            handle_generic_elicitation(request, id, method, event_tx, outbound_tx)
         }
         "notify" => {
             // 扩展发给用户看的通知，走对话里的提示。Pi 的通知会带上连接错误（如 MCP
@@ -4449,12 +4509,12 @@ fn handle_permission_request(
         pub_options: vec![
             PermissionOptionView {
                 option_id: "allow_once".to_string(),
-                name: "允许一次".to_string(),
+                name: "Allow once".to_string(),
                 kind: PermissionOptionKindView::AllowOnce,
             },
             PermissionOptionView {
                 option_id: "reject_once".to_string(),
-                name: "拒绝".to_string(),
+                name: "Reject".to_string(),
                 kind: PermissionOptionKindView::RejectOnce,
             },
         ],
@@ -4469,14 +4529,14 @@ fn permission_question(tool_name: &str, input: &serde_json::Value) -> String {
         "bash" | "powershell" => input
             .get("command")
             .and_then(serde_json::Value::as_str)
-            .map(|command| format!("允许执行：{command}"))
-            .unwrap_or_else(|| "允许执行命令？".to_string()),
-        "write" => "允许写入文件？".to_string(),
-        "edit" => "允许修改文件？".to_string(),
+            .map(|command| format!("Allow running: {command}"))
+            .unwrap_or_else(|| "Allow running a command?".to_string()),
+        "write" => "Allow writing a file?".to_string(),
+        "edit" => "Allow editing a file?".to_string(),
         // 别的工具也要看得出批的是什么：网址、路径、搜索词接在工具名后面。
         _ => {
             crate::acp_conn::permission_view(
-                Some(&format!("允许 Pi 调用工具 `{tool_name}`")),
+                Some(&format!("Allow Pi to call the tool `{tool_name}`")),
                 tool_name,
                 None,
                 Some(input),
@@ -4525,59 +4585,18 @@ fn absolute_tool_path(path: &str, cwd: Option<&str>) -> String {
         .into_owned()
 }
 
-/// 与 `agent/src/elicitation.ts` 的 `MULTI_SELECT_TITLE_MARK` 同一份。
-const MULTI_SELECT_TITLE_MARK: &str = "\u{200B}\u{200C}\u{200B}";
-
-fn strip_multi_select_title(title: &str) -> (bool, String) {
-    title
-        .strip_prefix(MULTI_SELECT_TITLE_MARK)
-        .map(|rest| (true, rest.to_string()))
-        .unwrap_or_else(|| (false, title.to_string()))
-}
-
-fn question_text(record: &serde_json::Value) -> Option<&str> {
-    ["question", "header", "prompt"]
-        .iter()
-        .find_map(|key| record.get(*key).and_then(serde_json::Value::as_str))
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-}
-
-fn is_multi_select_flag(record: &serde_json::Value) -> bool {
-    record
-        .get("multiSelect")
-        .or_else(|| record.get("multi_select"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-/// 在飞的题目工具参数里找与 select 标题同题面的那一条。题目工具不限注册者
-/// （宿主四个名字、用户自装的同类扩展都算），匹配只看参数形状与题面相等。
-/// 返回的记录可直接用 [`is_multi_select_flag`] 判多选。
-fn matching_question<'a>(state: &'a PiState, title: &str) -> Option<&'a serde_json::Value> {
-    state.tool_args.values().find_map(|args| {
-        if let Some(questions) = args.get("questions").and_then(serde_json::Value::as_array) {
-            return questions
-                .iter()
-                .find(|question| question_text(question) == Some(title));
-        }
-        (question_text(args) == Some(title)).then_some(args)
-    })
-}
-
 fn handle_generic_elicitation(
     request: &serde_json::Value,
     request_id: &str,
     method: &str,
     event_tx: &smol::channel::Sender<ConversationEvent>,
     outbound_tx: &smol::channel::Sender<serde_json::Value>,
-    state: &PiState,
 ) {
-    let raw_title = request
+    let title = request
         .get("title")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Pi 需要你的输入");
-    let (marked_multi, title) = strip_multi_select_title(raw_title);
+        .unwrap_or("Pi needs your input")
+        .to_string();
     let (key, field) = match method {
         "select" => {
             let options: Vec<ElicitOption> = request
@@ -4589,29 +4608,21 @@ fn handle_generic_elicitation(
                 .map(|option| ElicitOption {
                     value: ElicitationContentValue::String(option.to_string()),
                     label: option.to_string(),
+                    description: None,
                 })
                 .collect();
             if options.is_empty() {
                 send_extension_cancel(outbound_tx, request_id);
                 return;
             }
-            // 源头是题目工具：多选按其 multiSelect 标记画勾选卡，并且一律允许
-            // 用户在选项之外自己写答案——题目的合同是答案来自人类，选项只是
-            // 便利不是约束。其他扩展的 select 不受影响。
-            let matched_question = matching_question(state, &title);
-            let kind = if marked_multi || matched_question.is_some_and(is_multi_select_flag) {
-                ElicitFieldKind::MultiSelect(options)
-            } else {
-                ElicitFieldKind::Select(options)
-            };
             (
                 "value",
                 ElicitField {
                     key: "value".to_string(),
                     title: title.clone(),
                     required: true,
-                    allow_custom_input: marked_multi || matched_question.is_some(),
-                    kind,
+                    allow_custom_input: false,
+                    kind: ElicitFieldKind::Select(options),
                 },
             )
         }
@@ -4629,11 +4640,13 @@ fn handle_generic_elicitation(
                 kind: ElicitFieldKind::Select(vec![
                     ElicitOption {
                         value: ElicitationContentValue::Boolean(true),
-                        label: "是".to_string(),
+                        label: "Yes".to_string(),
+                        description: None,
                     },
                     ElicitOption {
                         value: ElicitationContentValue::Boolean(false),
-                        label: "否".to_string(),
+                        label: "No".to_string(),
+                        description: None,
                     },
                 ]),
             },
@@ -4669,11 +4682,6 @@ fn handle_generic_elicitation(
             }),
             (_, ElicitationContentValue::String(value)) => serde_json::json!({
                 "type": "extension_ui_response", "id": response_id, "value": value,
-            }),
-            (_, ElicitationContentValue::StringArray(values)) => serde_json::json!({
-                "type": "extension_ui_response",
-                "id": response_id,
-                "value": serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string()),
             }),
             _ => serde_json::json!({
                 "type": "extension_ui_response", "id": response_id, "cancelled": true,
@@ -4712,6 +4720,7 @@ mod tests {
             fork_session_id: None,
             fork_cut: None,
             peer_handler: None,
+            disallowed_tools: Vec::new(),
         }
     }
 
@@ -5025,7 +5034,7 @@ mod tests {
     #[test]
     fn logical_launch_rejects_transport_override() {
         let error = parse_logical_launch("smelt-pi-agent --mode text").unwrap_err();
-        assert!(error.contains("传输固定为 Pi RPC"));
+        assert!(error.contains("always talks Pi RPC"));
         assert!(parse_logical_launch("smelt-pi-agent --mode rpc").is_ok());
     }
 
@@ -5049,12 +5058,14 @@ mod tests {
         let ConversationEvent::ConfigOptions(options) = event_rx.try_recv().unwrap() else {
             panic!("应刷新 Smelt 会话配置");
         };
+        assert!(options.iter().any(|option| {
+            option.config_id == "thought_level" && option.current_name == "High"
+        }));
         assert!(
-            options.iter().any(|option| {
-                option.config_id == "thought_level" && option.current_name == "高"
-            })
+            options
+                .iter()
+                .all(|option| option.config_id != SMELT_CODEMODE_CONFIG_ID)
         );
-        assert!(options.iter().all(|option| option.config_id != "codemode"));
     }
 
     fn with_codemode_command(state: &mut PiState) {
@@ -5066,7 +5077,7 @@ mod tests {
     fn codemode_option(options: &[SessionConfigState]) -> &SessionConfigState {
         options
             .iter()
-            .find(|option| option.config_id == "codemode")
+            .find(|option| option.config_id == SMELT_CODEMODE_CONFIG_ID)
             .expect("脚本工具应单独成行")
     }
 
@@ -5079,7 +5090,11 @@ mod tests {
         let ConversationEvent::ConfigOptions(options) = event_rx.try_recv().unwrap() else {
             panic!("应发布会话配置");
         };
-        assert!(options.iter().all(|option| option.config_id != "codemode"));
+        assert!(
+            options
+                .iter()
+                .all(|option| option.config_id != SMELT_CODEMODE_CONFIG_ID)
+        );
 
         with_codemode_command(&mut state);
         publish_configuration(&state, &event_tx);
@@ -5087,13 +5102,13 @@ mod tests {
             panic!("命令出现后应重新发布");
         };
         let codemode = codemode_option(&options);
-        assert_eq!(codemode.name, "脚本工具");
-        assert_eq!(codemode.current_name, "关");
+        assert_eq!(codemode.name, "Script tools");
+        assert_eq!(codemode.current_name, "Off");
         assert_eq!(
             codemode.options,
             vec![
-                ("off".to_string(), "关".to_string()),
-                ("on".to_string(), "开".to_string())
+                ("off".to_string(), "Off".to_string()),
+                ("on".to_string(), "On".to_string())
             ]
         );
         assert_eq!(
@@ -5129,7 +5144,7 @@ mod tests {
         let ConversationEvent::ConfigOptions(options) = event_rx.try_recv().unwrap() else {
             panic!("回报开之后应刷新勾选");
         };
-        assert_eq!(codemode_option(&options).current_name, "开");
+        assert_eq!(codemode_option(&options).current_name, "On");
     }
 
     #[test]
@@ -5183,11 +5198,10 @@ mod tests {
         assert!(rpc_lines(writer).is_empty());
         assert!(!state.active_turn);
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
-        let ConversationEvent::ConfigRejected(status) = event_rx.try_recv().unwrap() else {
+        let ConversationEvent::ConfigRejected(note) = event_rx.try_recv().unwrap() else {
             panic!("缺命令时应给出不支持状态");
         };
-        assert!(status.starts_with("更新会话配置失败"));
-        assert!(status.contains("没有脚本工具"));
+        assert_eq!(note, RuntimeNote::NoScriptTools);
     }
 
     #[test]
@@ -5218,10 +5232,10 @@ mod tests {
 
         assert!(!state.codemode_enabled);
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
-        let ConversationEvent::ConfigRejected(status) = event_rx.try_recv().unwrap() else {
+        let ConversationEvent::ConfigRejected(note) = event_rx.try_recv().unwrap() else {
             panic!("没有扩展回报时不能把勾选改成开");
         };
-        assert!(status.contains("没有在下一轮生效"));
+        assert_eq!(note, RuntimeNote::ScriptToolsNotApplied);
     }
 
     #[test]
@@ -5256,7 +5270,7 @@ mod tests {
         assert!(state.codemode_enabled);
         assert!(event_rx.try_recv().is_ok_and(|event| {
             matches!(event, ConversationEvent::ConfigOptions(options)
-                if codemode_option(&options).current_name == "开")
+                if codemode_option(&options).current_name == "On")
         }));
         assert!(event_rx.try_recv().is_err());
     }
@@ -5482,6 +5496,126 @@ mod tests {
         );
         assert_eq!(runs[1].id, "sa-b");
         assert_eq!(runs[1].status, crate::acp_session::SubagentStatus::Failed);
+    }
+
+    /// `smelt_ask_user`：开始时先记一份空记录（界面画「在问你」），答完带上每道题的答案，
+    /// 跳过的也列出题面；出错的不出记录，照普通工具画。
+    #[test]
+    fn ask_user_records_what_was_asked_and_answered() {
+        let launch = test_launch(SMELT_PI_AGENT_COMMAND);
+        let (event_tx, event_rx) = smol::channel::unbounded();
+        let (outbound_tx, _) = smol::channel::unbounded();
+        let mut state = PiState::new();
+        state.active_turn = true;
+        let records = |event_rx: &smol::channel::Receiver<ConversationEvent>| -> Vec<crate::acp_chat::AskRecord> {
+            std::iter::from_fn(|| event_rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    ConversationEvent::AskRecord { id, record } if id == "ask-1" => Some(record),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut run = |is_error: bool, details: serde_json::Value| {
+            handle_event(
+                serde_json::json!({
+                    "type": "tool_execution_start",
+                    "toolCallId": "ask-1",
+                    "toolName": "smelt_ask_user",
+                    "args": {"question": "按哪个方案做？", "options": ["推荐", "先不改"]}
+                }),
+                &event_tx,
+                &outbound_tx,
+                &mut state,
+                &launch,
+            );
+            handle_event(
+                serde_json::json!({
+                    "type": "tool_execution_end",
+                    "toolCallId": "ask-1",
+                    "toolName": "smelt_ask_user",
+                    "isError": is_error,
+                    "result": {"content": [{"type": "text", "text": "…"}], "details": details}
+                }),
+                &event_tx,
+                &outbound_tx,
+                &mut state,
+                &launch,
+            );
+        };
+
+        run(
+            false,
+            serde_json::json!({"answers": [{"question": "按哪个方案做？", "answer": ["推荐"]}]}),
+        );
+        assert_eq!(
+            records(&event_rx),
+            vec![
+                crate::acp_chat::AskRecord::default(),
+                crate::acp_chat::AskRecord {
+                    answers: vec![crate::acp_chat::AskAnswer {
+                        question: "按哪个方案做？".into(),
+                        answer: vec!["推荐".into()],
+                    }],
+                    skipped: false,
+                },
+            ]
+        );
+
+        run(
+            false,
+            serde_json::json!({"cancelled": true, "answers": [{"question": "按哪个方案做？", "answer": []}]}),
+        );
+        let skipped = records(&event_rx);
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped[1].skipped);
+        assert_eq!(skipped[1].answers[0].question, "按哪个方案做？");
+        assert!(skipped[1].answers[0].answer.is_empty());
+
+        run(true, serde_json::json!({"error": true}));
+        assert_eq!(
+            records(&event_rx),
+            vec![crate::acp_chat::AskRecord::default()],
+            "出错的结果不出记录"
+        );
+    }
+
+    #[test]
+    fn replayed_ask_user_result_restores_the_answers() {
+        let (event_tx, event_rx) = smol::channel::unbounded();
+        let mut state = PiState::new();
+        let messages = [
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": "ask-1",
+                    "name": "smelt_ask_user",
+                    "arguments": {"question": "带上哪些改动？", "multiSelect": true}
+                }]
+            }),
+            serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": "ask-1",
+                "toolName": "smelt_ask_user",
+                "content": [{"type": "text", "text": "[]"}],
+                "details": {"answers": [{"question": "带上哪些改动？", "answer": ["焦点修复", "弹窗定高"]}]}
+            }),
+        ];
+
+        replay_history(&messages, &event_tx, &mut state);
+
+        let restored: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                ConversationEvent::AskRecord { id, record } => Some((id, record)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].0, "ask-1");
+        assert_eq!(
+            restored[0].1.answers[0].answer,
+            vec!["焦点修复".to_string(), "弹窗定高".to_string()]
+        );
     }
 
     #[test]
@@ -6728,7 +6862,7 @@ mod tests {
     }
 
     #[test]
-    fn select_stays_single_choice_without_multiselect_tool_args() {
+    fn extension_select_is_a_plain_single_choice() {
         let launch = test_launch(SMELT_PI_AGENT_COMMAND);
         let (event_tx, event_rx) = smol::channel::unbounded();
         let (outbound_tx, outbound_rx) = smol::channel::unbounded();
@@ -6752,7 +6886,7 @@ mod tests {
         else {
             panic!("expected elicitation event");
         };
-        // 没有同题面的题目工具在飞：不开放自定义输入，普通 select 行为不变。
+        // 扩展的 select 只给这几个选项：单选、不另开自己写答案（选择题工具不走这里）。
         assert!(!fields[0].allow_custom_input);
         assert!(matches!(fields[0].kind, ElicitFieldKind::Select(_)));
         let mut content = BTreeMap::new();
@@ -6762,145 +6896,6 @@ mod tests {
         );
         responder.accept(content);
         assert_eq!(outbound_rx.try_recv().unwrap()["value"], "开放番外");
-    }
-
-    #[test]
-    fn select_from_question_tool_allows_custom_answer() {
-        let launch = test_launch(SMELT_PI_AGENT_COMMAND);
-        let (event_tx, event_rx) = smol::channel::unbounded();
-        let (outbound_tx, outbound_rx) = smol::channel::unbounded();
-        let mut state = PiState::new();
-        state.tool_args.insert(
-            "tool-q".to_string(),
-            serde_json::json!({
-                "question": "要发布到哪个环境？",
-                "options": [
-                    {"label": "测试", "description": "先验一圈"},
-                    {"label": "生产", "description": "直接上"}
-                ]
-            }),
-        );
-        handle_extension_ui(
-            &serde_json::json!({
-                "type": "extension_ui_request",
-                "id": "select-custom",
-                "method": "select",
-                "title": "要发布到哪个环境？",
-                "options": ["测试 — 先验一圈", "生产 — 直接上"]
-            }),
-            &event_tx,
-            &outbound_tx,
-            &state,
-            &launch,
-        );
-        let ConversationEvent::Elicitation {
-            fields, responder, ..
-        } = event_rx.try_recv().unwrap()
-        else {
-            panic!("expected elicitation event");
-        };
-        // 题目工具发起的 select：仍里单选，但允许用户自己写答案。
-        assert!(matches!(fields[0].kind, ElicitFieldKind::Select(_)));
-        assert!(fields[0].allow_custom_input);
-        // 用户没点选项、直接提交自己写的答案：原样透传给扩展。
-        let mut content = BTreeMap::new();
-        content.insert(
-            "value".to_string(),
-            ElicitationContentValue::String("灰度环境".to_string()),
-        );
-        responder.accept(content);
-        assert_eq!(outbound_rx.try_recv().unwrap()["value"], "灰度环境");
-    }
-
-    #[test]
-    fn select_with_multiselect_tool_args_emits_a_multi_select_card() {
-        let launch = test_launch(SMELT_PI_AGENT_COMMAND);
-        let (event_tx, event_rx) = smol::channel::unbounded();
-        let (outbound_tx, outbound_rx) = smol::channel::unbounded();
-        let mut state = PiState::new();
-        state.tool_args.insert(
-            "tool-1".to_string(),
-            serde_json::json!({
-                "questions": [{
-                    "question": "提醒走哪个渠道？",
-                    "multiSelect": true,
-                    "options": [
-                        {"label": "Gitea Issue", "description": "仓库待办"},
-                        {"label": "Bark", "description": "手机推送"}
-                    ]
-                }]
-            }),
-        );
-        handle_extension_ui(
-            &serde_json::json!({
-                "type": "extension_ui_request",
-                "id": "select-2",
-                "method": "select",
-                "title": "提醒走哪个渠道？",
-                "options": ["Gitea Issue — 仓库待办", "Bark — 手机推送"]
-            }),
-            &event_tx,
-            &outbound_tx,
-            &state,
-            &launch,
-        );
-        let ConversationEvent::Elicitation {
-            fields, responder, ..
-        } = event_rx.try_recv().unwrap()
-        else {
-            panic!("expected elicitation event");
-        };
-        let ElicitFieldKind::MultiSelect(options) = &fields[0].kind else {
-            panic!("multiSelect tool args should render a multi-select card");
-        };
-        assert_eq!(options.len(), 2);
-        // 题目卡一律允许选项之外自己写答案。
-        assert!(fields[0].allow_custom_input);
-        let mut content = BTreeMap::new();
-        content.insert(
-            "value".to_string(),
-            ElicitationContentValue::StringArray(vec![
-                "Gitea Issue — 仓库待办".to_string(),
-                "Bark — 手机推送".to_string(),
-            ]),
-        );
-        responder.accept(content);
-        assert_eq!(
-            outbound_rx.try_recv().unwrap()["value"],
-            r#"["Gitea Issue — 仓库待办","Bark — 手机推送"]"#
-        );
-    }
-
-    #[test]
-    fn select_title_mark_emits_a_multi_select_card_without_tool_args() {
-        let launch = test_launch(SMELT_PI_AGENT_COMMAND);
-        let (event_tx, event_rx) = smol::channel::unbounded();
-        let (outbound_tx, _) = smol::channel::unbounded();
-        let state = PiState::new();
-        handle_extension_ui(
-            &serde_json::json!({
-                "type": "extension_ui_request",
-                "id": "select-3",
-                "method": "select",
-                "title": format!("{MULTI_SELECT_TITLE_MARK}选几种水果看看"),
-                "options": ["苹果", "香蕉", "橙子"]
-            }),
-            &event_tx,
-            &outbound_tx,
-            &state,
-            &launch,
-        );
-        let ConversationEvent::Elicitation {
-            message, fields, ..
-        } = event_rx.try_recv().unwrap()
-        else {
-            panic!("expected elicitation event");
-        };
-        assert_eq!(message, "选几种水果看看");
-        assert!(matches!(fields[0].kind, ElicitFieldKind::MultiSelect(_)));
-        assert_eq!(fields[0].title, "选几种水果看看");
-        // 标记多选同样来自题目工具：也允许自定义答案。
-        assert!(fields[0].allow_custom_input);
     }
 
     #[test]
@@ -6947,7 +6942,7 @@ mod tests {
         assert_eq!(note.id, "bg-1");
         assert_eq!(note.exit_code, Some(1));
         assert_eq!(note.output_tail, "error: boom");
-        assert!(note.summary().contains("失败"));
+        assert!(note.summary().contains("failed"));
         assert!(background_notice_from_outbound(&serde_json::json!({"type": "other"})).is_none());
         assert!(
             background_notice_from_outbound(&serde_json::json!({
@@ -7252,7 +7247,8 @@ mod tests {
         );
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(ConversationEvent::Notice(text)) if text == "上下文压缩失败：context overflow"
+            Ok(ConversationEvent::RuntimeNotice(RuntimeNote::CompactFailed { detail }))
+                if detail == "context overflow"
         ));
         assert!(matches!(
             event_rx.try_recv(),
@@ -7509,7 +7505,7 @@ mod tests {
         );
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(ConversationEvent::TurnFailed(message)) if message.contains("no api key")
+            Ok(ConversationEvent::TurnFailed(failed)) if failed.detail.contains("no api key")
         ));
         assert!(matches!(
             event_rx.try_recv(),
@@ -7711,7 +7707,9 @@ mod tests {
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(ConversationEvent::Notice(text)) if text.contains("不支持 /reload")
+            Ok(ConversationEvent::RuntimeNotice(
+                RuntimeNote::ReloadUnsupported
+            ))
         ));
         assert!(matches!(
             event_rx.try_recv(),
@@ -7750,7 +7748,9 @@ mod tests {
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(ConversationEvent::Notice(text)) if text.contains("不支持 /reload")
+            Ok(ConversationEvent::RuntimeNotice(
+                RuntimeNote::ReloadUnsupported
+            ))
         ));
     }
 
@@ -7870,7 +7870,9 @@ mod tests {
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(ConversationEvent::Notice(text)) if text.contains("结束后再")
+            Ok(ConversationEvent::RuntimeNotice(
+                RuntimeNote::ShakeWhileBusy
+            ))
         ));
     }
 
@@ -7883,7 +7885,7 @@ mod tests {
                     images: Vec::new(),
                 },
                 None,
-                Some("不支持 /reload"),
+                Some(RuntimeNote::ReloadUnsupported),
             ),
             (
                 ConversationCommand::Steer {
@@ -7907,10 +7909,10 @@ mod tests {
                     images: Vec::new(),
                 },
                 None,
-                Some("结束后再"),
+                Some(RuntimeNote::ShakeWhileBusy),
             ),
         ];
-        for (command, wire_type, status_fragment) in cases {
+        for (command, wire_type, expected_note) in cases {
             let (event_tx, event_rx) = smol::channel::unbounded();
             let mut state = PiState::new();
             state.active_turn = true;
@@ -7937,7 +7939,7 @@ mod tests {
                 assert_eq!(in_flight.load(Ordering::SeqCst), 0);
                 assert!(matches!(
                     event_rx.try_recv(),
-                    Ok(ConversationEvent::Notice(text)) if status_fragment.is_some_and(|fragment| text.contains(fragment))
+                    Ok(ConversationEvent::RuntimeNotice(note)) if Some(&note) == expected_note.as_ref()
                 ));
             }
         }
@@ -8915,11 +8917,12 @@ mod tests {
         ))
         .unwrap();
 
-        let ConversationEvent::ConfigRejected(status) = event_rx.try_recv().unwrap() else {
+        let ConversationEvent::ConfigRejected(RuntimeNote::ConfigUpdateFailed { detail }) =
+            event_rx.try_recv().unwrap()
+        else {
             panic!("失败必须写成会话配置失败，GUI 才能清掉「下轮生效」");
         };
-        assert!(status.starts_with("更新会话配置失败"), "{status}");
-        assert!(status.contains("No API key"));
+        assert!(detail.contains("No API key"), "{detail}");
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
     }
 
@@ -8947,7 +8950,9 @@ mod tests {
         assert_eq!(writer.get_ref().len(), 0);
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(ConversationEvent::Notice(_))
+            Ok(ConversationEvent::RuntimeNotice(
+                RuntimeNote::RewindWhileBusy
+            ))
         ));
         // daemon 发命令前记的在途 RPC 拒绝时也要销账，否则热升级永远等不到它。
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
@@ -8979,7 +8984,9 @@ mod tests {
         assert_eq!(writer.get_ref().len(), 0);
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(ConversationEvent::Notice(_))
+            Ok(ConversationEvent::RuntimeNotice(
+                RuntimeNote::RewindInProgress
+            ))
         ));
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
     }
@@ -9657,7 +9664,7 @@ mod tests {
             &cut,
         ))
         .unwrap_err();
-        assert!(error.contains("找不到"), "{error}");
+        assert!(error.contains("isn't in the agent's history"), "{error}");
         // 只发出了 get_fork_messages 一行：切点配不上绝不能发 fork。
         let text = String::from_utf8(writer.get_ref().clone()).unwrap();
         assert_eq!(text.lines().count(), 1);
@@ -9693,7 +9700,7 @@ mod tests {
             &cut,
         ))
         .unwrap_err();
-        assert!(error.contains("取消"), "{error}");
+        assert!(error.contains("cancelled"), "{error}");
     }
 
     /// 重试：fork 成功后只报 `Rewound`（带着要重发的原文和附图），不把原文还回输入框；
@@ -9799,7 +9806,9 @@ mod tests {
         assert_eq!(writer.get_ref().len(), 0);
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(ConversationEvent::Notice(_))
+            Ok(ConversationEvent::RuntimeNotice(
+                RuntimeNote::RewindTargetMissing
+            ))
         ));
         assert!(state.pending_rewind.is_none());
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
@@ -9818,7 +9827,7 @@ mod permission_text_tests {
         let input = json!({"url": "https://example.com/page"});
         assert_eq!(
             permission_question("web_fetch", &input),
-            "允许 Pi 调用工具 `web_fetch`：https://example.com/page"
+            "Allow Pi to call the tool `web_fetch`: https://example.com/page"
         );
         assert!(matches!(
             permission_details("web_fetch", &input, None),
@@ -9826,7 +9835,7 @@ mod permission_text_tests {
         ));
         assert_eq!(
             permission_question("web_fetch", &json!({})),
-            "允许 Pi 调用工具 `web_fetch`"
+            "Allow Pi to call the tool `web_fetch`"
         );
     }
 }

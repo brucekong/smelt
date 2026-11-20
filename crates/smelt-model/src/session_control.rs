@@ -94,6 +94,15 @@ pub struct DaemonConversation {
     pub option: AcpAgentOption,
     /// 接着哪段 provider 对话聊。
     pub resume_id: Option<String>,
+    /// 建它的一方给它起的名字，记成用户起的名字（`custom_title`）。没给就按智能体名、agent
+    /// 显示，之后跟着 agent 报的标题走。
+    pub title: Option<String>,
+    /// agent 不许用的工具（`session.create` 的 `disallowed_tools`）。只交给这次拉起的 runtime，
+    /// 不进工作区目录。
+    pub disallowed_tools: Vec<String>,
+    /// 拉起后、第一轮之前要设好的会话选项（权限、模型等），跟桌面开对话定下的一样。
+    /// 交给这次拉起，也记进目录那一条：之后闲置唤醒、桌面接上都以它为准。
+    pub initial_config: Vec<(String, String)>,
 }
 
 impl DaemonConversation {
@@ -105,13 +114,16 @@ impl DaemonConversation {
             "launch": self.option.launch,
             "agent": self.option.kind,
             "resume_id": self.resume_id,
+            "disallowed_tools": self.disallowed_tools,
+            "initial_config": self.initial_config,
         })
     }
 
-    /// 进工作区目录的那一条。不存名字：没人起过名的对话按智能体名、agent 显示。
+    /// 进工作区目录的那一条。没人起过名的对话不存名字，按智能体名、agent 显示。
     pub fn directory_entry(&self, conversation_id: String) -> WorkspaceConversation {
         WorkspaceConversation {
             id: conversation_id,
+            custom_title: self.title.clone(),
             acp: Some(WorkspaceAcp {
                 cwd: Some(self.cwd.clone()),
                 sid: self.sid.clone(),
@@ -120,6 +132,7 @@ impl DaemonConversation {
                 history_session_id: self.resume_id.clone(),
                 launch: self.option.launch.clone(),
                 agent_definition_id: self.option.agent_definition_id().map(str::to_string),
+                config_values: self.initial_config.clone(),
                 ..WorkspaceAcp::default()
             }),
             ..WorkspaceConversation::default()
@@ -140,8 +153,7 @@ pub fn is_background_acp_session_id(id: &str) -> bool {
 /// `agent_definition_id` 只在还没有 cwd 时当归属（冷恢复占位、测试夹具）。
 /// 有 cwd 时，托管目录本身就是判据：归属字段缺失（旧库没落盘）也不会掉进「项目」。
 ///
-/// 托管目录按本机的 `SMELT_HOME` 算，只用来判断本机运行时上的会话；别的机器上的会话用
-/// [`is_agent_conversation_on`]。
+/// 托管目录按本机的 `SMELT_HOME` 算，只用来判断本机运行时上的会话（运行时判断自己的会话）。
 pub fn is_agent_conversation(
     automation_id: Option<&str>,
     agent_definition_id: Option<&str>,
@@ -156,10 +168,9 @@ pub fn is_agent_conversation(
     )
 }
 
-/// 同 [`is_agent_conversation`]，托管目录按 `smelt_home`（会话所在那台机器的
-/// `SMELT_HOME`）算。那台机器的 `SMELT_HOME` 还不知道（运行时早于上报它、从没连上过）
-/// 时，有 cwd 的一律算项目：宁可放进项目列表，也不把项目对话藏进「最近对话」。
-pub fn is_agent_conversation_on(
+/// 同 [`is_agent_conversation`]，托管目录按给定的 `SMELT_HOME` 算。主目录不知道时有 cwd
+/// 的一律算项目：宁可放进项目列表，也不把项目对话藏进「最近对话」。
+fn is_agent_conversation_on(
     smelt_home: Option<&str>,
     automation_id: Option<&str>,
     agent_definition_id: Option<&str>,
@@ -184,14 +195,14 @@ pub fn is_agent_conversation_cwd(cwd: &str) -> bool {
     })
 }
 
-/// 同 [`is_agent_conversation_cwd`]，按 cwd 所在那台机器的 `SMELT_HOME` 算。
-pub fn is_agent_conversation_cwd_in(smelt_home: &str, cwd: &str) -> bool {
+/// 同 [`is_agent_conversation_cwd`]，按给定的 `SMELT_HOME` 算。
+fn is_agent_conversation_cwd_in(smelt_home: &str, cwd: &str) -> bool {
     crate::agent_paths::is_agent_space_in(smelt_home, cwd)
         || crate::agent_paths::is_workbench_conversation_workspace_in(smelt_home, cwd)
 }
 
 /// 不进项目会话列表：智能体对话、自动化 Run，以及旧档里的后台自动化 session。按本机的
-/// `SMELT_HOME` 算，别的机器上的会话用 [`is_product_conversation_on`]。
+/// `SMELT_HOME` 算。
 pub fn is_product_conversation(
     automation_id: Option<&str>,
     agent_definition_id: Option<&str>,
@@ -208,8 +219,8 @@ pub fn is_product_conversation(
     )
 }
 
-/// 同 [`is_product_conversation`]，按会话所在那台机器的 `SMELT_HOME` 算。
-pub fn is_product_conversation_on(
+/// 同 [`is_product_conversation`]，按给定的 `SMELT_HOME` 算。
+fn is_product_conversation_on(
     smelt_home: Option<&str>,
     automation_id: Option<&str>,
     agent_definition_id: Option<&str>,
@@ -293,7 +304,7 @@ pub fn directory_session_kind(
 mod machine_home_tests {
     use super::*;
 
-    /// 远程机器上的 space 按那台机器的 SMELT_HOME 认，跟本机的主目录无关。
+    /// space 按给定的 SMELT_HOME 认，换一个主目录就不是它的。
     #[test]
     fn agent_conversations_are_recognised_by_their_own_machine_home() {
         let remote = "/home/someone/.smelt";
@@ -374,6 +385,9 @@ mod daemon_conversation_tests {
                 history_dir: None,
             },
             resume_id: Some("r1".to_string()),
+            title: None,
+            disallowed_tools: Vec::new(),
+            initial_config: vec![("mode".to_string(), "bypassPermissions".to_string())],
         };
         let entry = conversation.directory_entry("conv-1".to_string());
         assert_eq!(entry.id, "conv-1");
@@ -386,6 +400,15 @@ mod daemon_conversation_tests {
         assert_eq!(acp.agent_definition_id.as_deref(), Some("writer"));
         assert_eq!(acp.launch.command, "smelt-pi");
         assert_eq!(acp.session_title, None);
-        assert_eq!(conversation.open_request()["id"], "acp-1");
+        assert_eq!(
+            acp.config_values,
+            vec![("mode".to_string(), "bypassPermissions".to_string())]
+        );
+        let request = conversation.open_request();
+        assert_eq!(request["id"], "acp-1");
+        assert_eq!(
+            request["initial_config"],
+            serde_json::json!([["mode", "bypassPermissions"]])
+        );
     }
 }

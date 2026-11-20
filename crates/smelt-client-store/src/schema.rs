@@ -10,22 +10,19 @@ use std::path::Path;
 
 use rusqlite::{Connection, Transaction};
 
-pub(crate) const SCHEMA_VERSION: u32 = 10;
+pub(crate) const SCHEMA_VERSION: u32 = 15;
 
 pub(crate) const CREATE_SCHEMA: &str = "
 CREATE TABLE appearance (
   id INTEGER PRIMARY KEY CHECK (id = 1),
-  bg_color INTEGER NOT NULL,
   bg_image TEXT,
   bg_image_opacity REAL NOT NULL,
-  opacity REAL NOT NULL,
-  blur INTEGER NOT NULL CHECK (blur IN (0, 1)),
-  glass_style TEXT NOT NULL,
+  bg_opacity REAL NOT NULL CHECK (bg_opacity BETWEEN 0 AND 1),
+  material TEXT NOT NULL,
   theme_mode TEXT NOT NULL,
   theme_name TEXT NOT NULL,
   ui_font_px INTEGER NOT NULL,
   ui_font_family TEXT NOT NULL,
-  font_px INTEGER NOT NULL,
   font_family TEXT NOT NULL,
   layout_id TEXT
 );
@@ -34,65 +31,13 @@ CREATE TABLE update_settings (
   channel TEXT NOT NULL,
   auto_install INTEGER NOT NULL CHECK (auto_install IN (0, 1))
 );
-CREATE TABLE notify_prefs (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  approval INTEGER NOT NULL CHECK (approval IN (0, 1)),
-  input INTEGER NOT NULL CHECK (input IN (0, 1)),
-  success INTEGER NOT NULL CHECK (success IN (0, 1)),
-  failure INTEGER NOT NULL CHECK (failure IN (0, 1)),
-  terminal_bell INTEGER NOT NULL CHECK (terminal_bell IN (0, 1))
-);
 CREATE TABLE workspace_ui (
   id INTEGER PRIMARY KEY CHECK (id = 1),
-  active_session INTEGER NOT NULL CHECK (active_session >= 0),
-  active_session_id TEXT,
-  route TEXT NOT NULL,
-  selected_agent_id TEXT,
-  sidebar_grouping TEXT NOT NULL,
-  sidebar_hide_empty_projects INTEGER NOT NULL CHECK (sidebar_hide_empty_projects IN (0, 1)),
-  archive_expanded INTEGER NOT NULL DEFAULT 0 CHECK (archive_expanded IN (0, 1))
+  outlet TEXT NOT NULL
 );
 CREATE TABLE workspace_layout_state (
   layout_id TEXT PRIMARY KEY,
   state TEXT NOT NULL CHECK (json_valid(state))
-) WITHOUT ROWID;
-CREATE TABLE collapsed_project (
-  runtime_id TEXT NOT NULL,
-  root TEXT NOT NULL,
-  position INTEGER NOT NULL,
-  PRIMARY KEY (runtime_id, root)
-) WITHOUT ROWID;
-CREATE TABLE collapsed_agent (
-  agent_id TEXT PRIMARY KEY,
-  position INTEGER NOT NULL
-) WITHOUT ROWID;
-CREATE TABLE pinned_project (
-  runtime_id TEXT NOT NULL,
-  root TEXT NOT NULL,
-  position INTEGER NOT NULL,
-  PRIMARY KEY (runtime_id, root)
-) WITHOUT ROWID;
-CREATE TABLE conversation_route (
-  runtime_id TEXT NOT NULL,
-  conversation_id TEXT NOT NULL,
-  active_terminal_id TEXT,
-  dock_layout TEXT CHECK (dock_layout IS NULL OR json_valid(dock_layout)),
-  file_tree_selected TEXT,
-  open_file_path TEXT,
-  file_tree_w REAL NOT NULL,
-  file_tree_open INTEGER NOT NULL CHECK (file_tree_open IN (0, 1)),
-  git_tab TEXT NOT NULL,
-  diff_split INTEGER NOT NULL CHECK (diff_split IN (0, 1)),
-  diff_scope TEXT NOT NULL,
-  PRIMARY KEY (runtime_id, conversation_id)
-) WITHOUT ROWID;
-CREATE TABLE conversation_route_path (
-  runtime_id TEXT NOT NULL,
-  conversation_id TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('expanded', 'pinned_root', 'collapsed_root', 'git_tree_collapsed')),
-  path TEXT NOT NULL,
-  position INTEGER NOT NULL,
-  PRIMARY KEY (runtime_id, conversation_id, kind, path)
 ) WITHOUT ROWID;
 CREATE TABLE update_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -128,20 +73,7 @@ CREATE TABLE runtime_connection (
   relay_url TEXT,
   position INTEGER NOT NULL,
   added_at_ms INTEGER NOT NULL,
-  smelt_home TEXT,
   os TEXT
-) WITHOUT ROWID;
-CREATE TABLE sidebar_project_order (
-  runtime_id TEXT NOT NULL,
-  root TEXT NOT NULL,
-  position INTEGER NOT NULL,
-  PRIMARY KEY (runtime_id, root)
-) WITHOUT ROWID;
-CREATE TABLE sidebar_conversation_order (
-  runtime_id TEXT NOT NULL,
-  conversation_id TEXT NOT NULL,
-  position INTEGER NOT NULL,
-  PRIMARY KEY (runtime_id, conversation_id)
 ) WITHOUT ROWID;
 CREATE TABLE key_binding (
   command TEXT PRIMARY KEY,
@@ -318,6 +250,93 @@ UPDATE key_binding SET command = CASE command
 END;
 ";
 
+/// v11：文件树和变更页拆成了插件，各自的界面状态存在插件自己的库里。对话界面状态只剩
+/// 终端的分屏和当前终端；文件树、Git 页的列和路径表删掉，旧的选中、展开不搬。
+const MIGRATE_V10_TO_V11: &str = "
+ALTER TABLE conversation_route DROP COLUMN file_tree_selected;
+ALTER TABLE conversation_route DROP COLUMN open_file_path;
+ALTER TABLE conversation_route DROP COLUMN file_tree_w;
+ALTER TABLE conversation_route DROP COLUMN file_tree_open;
+ALTER TABLE conversation_route DROP COLUMN git_tab;
+ALTER TABLE conversation_route DROP COLUMN diff_split;
+ALTER TABLE conversation_route DROP COLUMN diff_scope;
+DROP TABLE conversation_route_path;
+";
+
+/// 通知偏好归通知插件（存在它自己的库里），客户端库不再留一份。旧值不搬：宿主不认识插件
+/// 的表，插件的开关默认都开。
+const MIGRATE_V11_TO_V12: &str = "
+DROP TABLE notify_prefs;
+";
+
+/// v13：侧栏里固定的工作树，按运行时分开记。
+const MIGRATE_V12_TO_V13: &str = "
+CREATE TABLE pinned_workset (
+  runtime_id TEXT NOT NULL,
+  workset_id TEXT NOT NULL,
+  PRIMARY KEY (runtime_id, workset_id)
+) WITHOUT ROWID;
+";
+
+/// v14：智能体页拆成了插件，选中哪个智能体由插件自己记，客户端库不留。「新对话」命令跟着
+/// 归了智能体插件，改过的快捷键搬到新 id 上。
+const MIGRATE_V13_TO_V14: &str = "
+ALTER TABLE workspace_ui DROP COLUMN selected_agent_id;
+UPDATE key_binding SET command = 'smelt.agents/new-conversation'
+  WHERE command = 'smelt.sessions/new-conversation';
+";
+
+/// 迁移进来的库没有底色不透明度，给出厂值（界面的 `DEFAULT_BG_OPACITY`）。
+/// [`MIGRATE_V14_TO_V15`] 里的 `DEFAULT 0.8` 是同一个数。
+const MIGRATED_BG_OPACITY: f32 = 0.8;
+
+/// v15：会话列表、分屏拆成了会话插件，置顶、排序、折叠、选中和分屏布局都存在插件自己的
+/// 库里；终端字号归了终端插件。客户端库里这些表和列删掉，旧数据不搬，插件从默认开始。
+/// `workspace_ui` 只剩宿主自己的页面路由，列名跟宿主的说法改成 `outlet`。
+///
+/// 外观里早已没人读的 `bg_color`、`opacity`、`blur` 删掉；`glass_style` 存的其实是材质，
+/// 改名 `material`。新加 `bg_opacity`：毛玻璃时主题底色铺在材质上的不透明度；旧的
+/// `opacity` 是整扇窗口的不透明度，意思不一样，不搬。远程机器的 `smelt_home` 删掉：智能体
+/// space 在哪改由运行时随智能体配置推来，客户端不再记。
+///
+/// 分屏命令跟着从 `smelt.stage` 搬到会话插件，名字不变，改过的键搬到新 id 上；新 id 已经
+/// 有记录的（用户在新版里改过）以新的为准。别的 `smelt.stage/*` 和按侧栏顺序跳的
+/// `smelt.sessions/activate-<N>` 已经没有对应命令，删掉。
+const MIGRATE_V14_TO_V15: &str = "
+DROP TABLE pinned_project;
+DROP TABLE pinned_workset;
+DROP TABLE collapsed_project;
+DROP TABLE collapsed_agent;
+DROP TABLE conversation_route;
+DROP TABLE sidebar_project_order;
+DROP TABLE sidebar_conversation_order;
+ALTER TABLE workspace_ui DROP COLUMN active_session;
+ALTER TABLE workspace_ui DROP COLUMN active_session_id;
+ALTER TABLE workspace_ui DROP COLUMN sidebar_grouping;
+ALTER TABLE workspace_ui DROP COLUMN sidebar_hide_empty_projects;
+ALTER TABLE workspace_ui DROP COLUMN archive_expanded;
+ALTER TABLE workspace_ui RENAME COLUMN route TO outlet;
+ALTER TABLE appearance DROP COLUMN font_px;
+ALTER TABLE appearance DROP COLUMN bg_color;
+ALTER TABLE appearance DROP COLUMN opacity;
+ALTER TABLE appearance DROP COLUMN blur;
+ALTER TABLE appearance RENAME COLUMN glass_style TO material;
+ALTER TABLE appearance ADD COLUMN bg_opacity REAL NOT NULL DEFAULT 0.8
+  CHECK (bg_opacity BETWEEN 0 AND 1);
+ALTER TABLE runtime_connection DROP COLUMN smelt_home;
+UPDATE OR IGNORE key_binding SET command = CASE command
+  WHEN 'smelt.stage/prev-pane' THEN 'smelt.sessions/prev-pane'
+  WHEN 'smelt.stage/next-pane' THEN 'smelt.sessions/next-pane'
+  WHEN 'smelt.stage/split-right' THEN 'smelt.sessions/split-right'
+  WHEN 'smelt.stage/split-down' THEN 'smelt.sessions/split-down'
+  WHEN 'smelt.stage/close-pane' THEN 'smelt.sessions/close-pane'
+END
+  WHERE command IN ('smelt.stage/prev-pane', 'smelt.stage/next-pane', 'smelt.stage/split-right',
+    'smelt.stage/split-down', 'smelt.stage/close-pane');
+DELETE FROM key_binding
+  WHERE command GLOB 'smelt.stage/*' OR command GLOB 'smelt.sessions/activate-[1-9]';
+";
+
 /// 打开时把库带到当前版本。从旧版本迁移前先留一份备份，见 [`backup_before_migration`]。
 pub(crate) fn migrate(connection: &mut Connection, path: &Path) -> Result<(), String> {
     let observed: u32 = connection
@@ -371,8 +390,8 @@ pub(crate) fn migrate(connection: &mut Connection, path: &Path) -> Result<(), St
         6 => transaction
             .execute_batch(MIGRATE_V6_TO_V7)
             .map_err(|error| error.to_string())?,
-        7..=9 => {}
-        newer => return Err(format!("客户端库版本 {newer} 比这个程序新，不认识")),
+        7..=14 => {}
+        newer => return Err(format!("client database version {newer} is newer than this app and isn't recognized")),
     }
     if (1..=7).contains(&version) {
         transaction
@@ -387,6 +406,31 @@ pub(crate) fn migrate(connection: &mut Connection, path: &Path) -> Result<(), St
     if (1..=9).contains(&version) {
         transaction
             .execute_batch(MIGRATE_V9_TO_V10)
+            .map_err(|error| error.to_string())?;
+    }
+    if (1..=10).contains(&version) {
+        transaction
+            .execute_batch(MIGRATE_V10_TO_V11)
+            .map_err(|error| error.to_string())?;
+    }
+    if (1..=11).contains(&version) {
+        transaction
+            .execute_batch(MIGRATE_V11_TO_V12)
+            .map_err(|error| error.to_string())?;
+    }
+    if (1..=12).contains(&version) {
+        transaction
+            .execute_batch(MIGRATE_V12_TO_V13)
+            .map_err(|error| error.to_string())?;
+    }
+    if (1..=13).contains(&version) {
+        transaction
+            .execute_batch(MIGRATE_V13_TO_V14)
+            .map_err(|error| error.to_string())?;
+    }
+    if (1..=14).contains(&version) {
+        transaction
+            .execute_batch(MIGRATE_V14_TO_V15)
             .map_err(|error| error.to_string())?;
     }
     transaction
@@ -409,11 +453,21 @@ fn backup_before_migration(
     match std::fs::remove_file(&backup) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("删除旧备份 {}：{error}", backup.display())),
+        Err(error) => {
+            return Err(format!(
+                "couldn't delete the old backup {}: {error}",
+                backup.display()
+            ));
+        }
     }
     connection
         .execute("VACUUM INTO ?1", [backup.to_string_lossy()])
-        .map_err(|error| format!("迁移前备份到 {}：{error}", backup.display()))?;
+        .map_err(|error| {
+            format!(
+                "couldn't back up to {} before migrating: {error}",
+                backup.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -428,26 +482,22 @@ fn has_table(connection: &Connection, name: &str) -> Result<bool, String> {
 }
 
 /// 第一版客户端库是一张「作用域 + 键 → JSON 值」的偏好表。打开时一次性搬进正式的表，
-/// 然后删掉它。字段缺省按当时的出厂值补；某一项解析不了就丢掉这一项，用出厂值重来。
+/// 然后删掉它。字段缺省按当时的出厂值补；某一项解析不了就丢掉这一项，用出厂值重来。通知
+/// 偏好、终端字号和侧栏状态不搬：它们归了各自的插件。
 mod legacy {
     use serde::Deserialize;
 
     use super::Transaction;
     use crate::{
-        AppearanceRecord, InstallerAttemptRecord, NotifyPrefsRecord, StagedUpdateRecord,
-        UpdateSettingsRecord, UpdateStateRecord, WorkspaceUiRecord,
+        AppearanceRecord, InstallerAttemptRecord, StagedUpdateRecord, UpdateSettingsRecord,
+        UpdateStateRecord, WorkspaceUiRecord,
     };
 
     #[derive(Deserialize)]
     struct Appearance {
-        bg_color: u32,
         bg_image: Option<String>,
         #[serde(default = "default_bg_image_opacity")]
         bg_image_opacity: f32,
-        opacity: f32,
-        blur: bool,
-        #[serde(default = "default_glass_style")]
-        glass_style: String,
         #[serde(default = "default_theme_mode")]
         theme_mode: String,
         #[serde(default = "default_theme_name")]
@@ -456,17 +506,12 @@ mod legacy {
         ui_font_px: u32,
         #[serde(default)]
         ui_font_family: String,
-        #[serde(default = "default_font_px")]
-        font_px: u32,
         #[serde(default)]
         font_family: String,
     }
 
     fn default_bg_image_opacity() -> f32 {
         0.25
-    }
-    fn default_glass_style() -> String {
-        "regular".to_string()
     }
     fn default_theme_mode() -> String {
         "dark".to_string()
@@ -476,9 +521,6 @@ mod legacy {
     }
     fn default_ui_font_px() -> u32 {
         16
-    }
-    fn default_font_px() -> u32 {
-        13
     }
     fn default_true() -> bool {
         true
@@ -497,41 +539,13 @@ mod legacy {
     }
 
     #[derive(Deserialize)]
-    struct NotifyPrefs {
-        approval: bool,
-        input: bool,
-        success: bool,
-        failure: bool,
-        terminal_bell: bool,
-    }
-
-    #[derive(Deserialize)]
     struct WorkspaceUi {
-        #[serde(default)]
-        active_session: usize,
-        #[serde(default)]
-        active_session_id: Option<String>,
         #[serde(default = "default_route")]
         route: String,
-        #[serde(default)]
-        selected_agent_id: Option<String>,
-        #[serde(default)]
-        collapsed_projects: Vec<String>,
-        #[serde(default)]
-        collapsed_agents: Vec<String>,
-        #[serde(default = "default_grouping")]
-        sidebar_grouping: String,
-        #[serde(default)]
-        pinned_projects: Vec<String>,
-        #[serde(default)]
-        sidebar_hide_empty_projects: bool,
     }
 
     fn default_route() -> String {
         "session".to_string()
-    }
-    fn default_grouping() -> String {
-        "project".to_string()
     }
 
     #[derive(Deserialize)]
@@ -600,19 +614,16 @@ mod legacy {
             crate::write_appearance(
                 transaction,
                 &AppearanceRecord {
-                    bg_color: old.bg_color,
                     bg_image: old.bg_image,
                     bg_image_opacity: old.bg_image_opacity,
-                    opacity: old.opacity,
-                    blur: old.blur,
-                    glass_style: old.glass_style,
                     theme_mode: old.theme_mode,
                     theme_name: old.theme_name,
                     ui_font_px: old.ui_font_px,
                     ui_font_family: old.ui_font_family,
-                    font_px: old.font_px,
                     font_family: old.font_family,
                     layout_id: None,
+                    material: String::new(),
+                    bg_opacity: super::MIGRATED_BG_OPACITY,
                 },
             )?;
         }
@@ -625,42 +636,8 @@ mod legacy {
                 },
             )?;
         }
-        if let Some(old) = value::<NotifyPrefs>(transaction, "notify", "prefs")? {
-            crate::write_notify_prefs(
-                transaction,
-                &NotifyPrefsRecord {
-                    approval: old.approval,
-                    input: old.input,
-                    success: old.success,
-                    failure: old.failure,
-                    terminal_bell: old.terminal_bell,
-                },
-            )?;
-        }
         if let Some(old) = value::<WorkspaceUi>(transaction, "workspace", "ui")? {
-            crate::write_workspace_ui(
-                transaction,
-                &WorkspaceUiRecord {
-                    active_session: old.active_session,
-                    active_session_id: old.active_session_id,
-                    route: old.route,
-                    selected_agent_id: old.selected_agent_id,
-                    collapsed_projects: old
-                        .collapsed_projects
-                        .into_iter()
-                        .map(crate::ProjectKey::local)
-                        .collect(),
-                    collapsed_agents: old.collapsed_agents,
-                    sidebar_grouping: old.sidebar_grouping,
-                    pinned_projects: old
-                        .pinned_projects
-                        .into_iter()
-                        .map(crate::ProjectKey::local)
-                        .collect(),
-                    sidebar_hide_empty_projects: old.sidebar_hide_empty_projects,
-                    archive_expanded: false,
-                },
-            )?;
+            crate::write_workspace_ui(transaction, &WorkspaceUiRecord { outlet: old.route })?;
         }
         if value::<bool>(transaction, "meta", "runtime_migrated")? == Some(true) {
             crate::write_runtime_migrated(transaction)?;

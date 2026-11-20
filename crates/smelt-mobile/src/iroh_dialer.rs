@@ -10,6 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use iroh::SecretKey;
+use rust_i18n::t;
 use smelt_iroh::runtime::IrohClient;
 use smelt_iroh::{EndpointId, PathKind, PathStatus, RelaySettings};
 use smelt_runtime_client::{Connector as _, RuntimeClient};
@@ -75,8 +76,12 @@ impl IrohDialer {
             Shape::Preset => None,
             Shape::Relay(relay) => Some(relay),
         };
-        let client = IrohClient::new(self.secret.clone(), relay)
-            .map_err(|e| error(SmeltErrorKind::Other, format!("起不了 iroh：{e:#}")))?;
+        let client = IrohClient::new(self.secret.clone(), relay).map_err(|e| {
+            error(
+                SmeltErrorKind::Other,
+                t!("error.iroh_failed", error = format!("{e:#}")),
+            )
+        })?;
         state.client = Some(Arc::clone(&client));
         Ok(client)
     }
@@ -119,17 +124,22 @@ impl Transport for IrohDialer {
         Ok(true)
     }
 
-    fn network_change(&self) {
-        // 还没建 endpoint 就没有要迁移的路径，下次拨号时自然按新网络来。
-        let client = self
+    fn network_change(&self) -> bool {
+        // 不指望旧 endpoint 自己迁到新网络：在家 Wi-Fi 下用过、出门换蜂窝后，旧 endpoint
+        // 常常再也连不上 relay，每次拨号都等满超时，杀掉 App 重开（新 endpoint）立刻就通。
+        // 桌面长睡醒来是同一个毛病（见 smelt 的 `reset_iroh_after_wake`）。所以网络一变就
+        // 丢掉它，下次拨号按新网络重建。还没建过就什么都不用做。
+        let old = self
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .client
-            .clone();
-        if let Some(client) = client {
-            client.network_change();
+            .take();
+        if old.is_some() {
+            log::info!("网络变了，换掉旧的 iroh endpoint");
         }
+        // 各节点的旧会话还拿着它，调用方让节点重新 connect，旧会话退出时释放。
+        old.is_some()
     }
 }
 
@@ -146,6 +156,7 @@ impl Route for IrohRoute {
         let connector = Arc::new(self.client.connector(self.endpoint, self.relay.as_ref()));
         let for_client = Arc::clone(&connector);
         let for_watch = Arc::clone(&connector);
+        let for_close = Arc::clone(&connector);
         Link {
             client: RuntimeClient::new(move || for_client.connect()),
             metrics: Arc::new(move || link_metrics(connector.path_status())),
@@ -157,6 +168,7 @@ impl Route for IrohRoute {
                     })
                 }))
             }),
+            close: Arc::new(move || for_close.close()),
         }
     }
 }
@@ -169,7 +181,7 @@ pub(crate) fn validate(
     let endpoint = endpoint_id.trim().parse::<EndpointId>().map_err(|_| {
         error(
             SmeltErrorKind::InvalidPairing,
-            format!("运行时的 endpoint id 不合法：{endpoint_id}"),
+            t!("error.endpoint_invalid", id = endpoint_id),
         )
     })?;
     let relay = relay_url

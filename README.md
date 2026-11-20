@@ -58,14 +58,14 @@ curl -fsSL https://github.com/smelt-ai/smelt/releases/latest/download/install.sh
 
 Or download `smeltd-<version>-linux-<arch>.tar.gz` and run `./install.sh`. `--with-desktop` also installs TigerVNC, XFCE, and a resident Chrome, then runs `smeltd mcp add playwright`. `--relay=<url>` sets the initial iroh relay. `--apt-mirror=<mirror>` selects an apt mirror for this install.
 
-Run as root, the installer creates a `smelt` user for the runtime and adds `/usr/local/bin/smeltd`, which switches to that user. Run as a normal user, it links `~/.local/bin/smeltd` and tells you if that directory isn't on `PATH`. There is no `smelt` command on Linux; that's the desktop app. Running the installer again upgrades.
+Run as root, the runtime runs as root and `smeltd` / `smelt` are linked into `/usr/local/bin`; Claude Code is told it is in a sandbox (`IS_SANDBOX=1`) so it still skips permission prompts. Agents then can modify the whole machine: to keep them under a normal user, set `SMELT_USER=<name>` and the installer creates that user and adds `/usr/local/bin/smeltd` and `/usr/local/bin/smelt`, which switch to it. An existing install under `smelt` keeps using it. Run as a normal user, it links `~/.local/bin/smeltd` and `~/.local/bin/smelt` and tells you if that directory isn't on `PATH`. Running the installer again upgrades.
 
 ```sh
 smeltd status
 smeltd pair
 smeltd devices
 smeltd relay [<url>|off]     # show, set, or clear the custom iroh relay
-smeltd mcp add <id>          # playwright, figma, rea, browser-mcp
+smeltd mcp add <id>          # playwright, figma, rea, browser-mcp, chrome-devtools
 ```
 
 ## Features
@@ -78,7 +78,7 @@ smeltd mcp add <id>          # playwright, figma, rea, browser-mcp
 - **Usage and history**: Account usage is queried per provider (Claude, Copilot, Codex, Cursor, Grok) and is not read from transcripts. Historical sessions read each agent's local transcripts; Claude Code is not the only source
 - **Remote access** (off by default): Pair another Smelt desktop or the Smelt mobile app to this machine's runtime over iroh. Peers on the same network connect directly; otherwise the connection hole-punches and then uses a relay. Leave the relay blank to use n0's public relay, or fill in your own. The pairing string is `smelt+iroh://<endpoint_id>/?code=<one-time code>` and works once, within 10 minutes. There is no long-lived shared token and no separate "allow write" switch: pairing hands this user's shell to that device. Revoke a device from Settings, or with `smeltd devices revoke`. The app does not open a regular LAN listener.
   **The pairing code grants access. Read the [relay notes](docs/iroh-relay-deployment.md) before turning it on.**
-- **More**: Terminal sessions survive GUI exits and crashes and reattach on restart. Upgrading or restarting the local `smeltd` stops it on every platform: running terminal sessions close and in-progress turns are interrupted; conversation history is kept. A terminal cell can stack several terminals (a dock) as well as split. An idle structured conversation suspends its in-process runtime after 30 minutes and wakes with the previous model, permission mode, and reasoning effort. One window can attach several runtimes, including a headless Linux machine, and open that machine's desktop through noVNC. Details are in [`docs/workspace.md`](docs/workspace.md).
+- **More**: Terminal sessions survive GUI exits and crashes and reattach on restart. Upgrading or restarting the local `smeltd` stops it on every platform: running terminal sessions close and in-progress turns are interrupted; conversation history is kept. A terminal cell can stack several terminals (a dock) as well as split. An idle structured conversation suspends its in-process runtime after 20 minutes and wakes with the previous model, permission mode, and reasoning effort. One window can attach several runtimes, including a headless Linux machine, and open that machine's desktop through noVNC. Details are in [`docs/workspace.md`](docs/workspace.md).
 
 See [`docs/workspace.md`](docs/workspace.md) for the complete feature list, keyboard shortcuts, and architecture details.
 See [`docs/product-roadmap.md`](docs/product-roadmap.md) for the product direction.
@@ -107,7 +107,7 @@ make test                   # cargo nextest（与 CI 同一运行器）
 
 ## Architecture
 
-Rust 2024 + [GPUI](https://github.com/zed-industries/zed) (`gpui-pre` 0.3.11) / [gpui-kit](https://github.com/longbridge/gpui-kit) for the GUI, portable-pty + alacritty_terminal for embedded terminals, tokio, and iroh for remote connections. axum for the automation webhook server (loopback only). Structured state is SQLite under `~/.smelt/` (on Windows, `%USERPROFILE%\.smelt`): `smelt.sqlite3` for the runtime and `client.sqlite3` for this desktop. See [`docs/local-storage.md`](docs/local-storage.md).
+Rust 2024 + [GPUI](https://github.com/zed-industries/zed) (`gpui-pre` 0.3.12) / [gpui-kit](https://github.com/longbridge/gpui-kit) for the GUI, portable-pty + alacritty_terminal for embedded terminals, tokio, and iroh for remote connections. axum for the automation webhook server (loopback only). Structured state is SQLite under `~/.smelt/` (on Windows, `%USERPROFILE%\.smelt`): `smelt.sqlite3` for the runtime and `client.sqlite3` for this desktop. See [`docs/local-storage.md`](docs/local-storage.md).
 
 The workspace contains `smelt` (the main GUI), `smeltd` (the runtime daemon: PTY sessions, in-process ACP drivers, and automations; the macOS and Windows desktops launch it on demand, and on Linux it can be installed as a systemd user service), `smelt-agent` (the Pi runtime binary), `smelt-notify` (status reports from agent hooks), and `smelt-installer` (the helper that swaps the macOS app in after quit). `smelt-iroh-connect` debugs the runtime's iroh path. Most users only interact with `smelt`; the GUI manages the local `smeltd`.
 On Windows, Rust clients (the desktop, `smelt-notify`, and the runtime client) connect to `%USERPROFILE%\.smelt\smeltd.sock` (AF_UNIX, a non-blocking socket wrapped in `smelt-runtime-client/src/stream/windows.rs`). Bun and Pi use the current user's named pipe. Child processes sit in a Job Object (`KILL_ON_JOB_CLOSE`). Managed Bun is downloaded as `bun-windows-x64.zip` into `%USERPROFILE%\.smelt\runtime`.
@@ -122,8 +122,8 @@ Start at [`docs/README.md`](docs/README.md). Current guides: [`workspace`](docs/
 
 ## Contributing
 
-Issues and pull requests are welcome. Before submitting, please make sure `make check-all` passes, and follow [Conventional Commits](https://www.conventionalcommits.org/) for commit messages.
+Issues and pull requests are welcome. Before submitting, please make sure `make check-all` passes, and follow [Conventional Commits](https://www.conventionalcommits.org/) for commit messages. Unless you state otherwise, contributions you submit are licensed under the Apache License 2.0 (section 5).
 
 ## License
 
-[Apache License 2.0](LICENSE)
+Copyright 2026 NIO. Licensed under the [Apache License 2.0](LICENSE); see [NOTICE](NOTICE).

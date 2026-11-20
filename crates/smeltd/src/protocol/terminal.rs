@@ -90,7 +90,7 @@ fn stop_terminal_session(
                 }
                 if !s.child.terminate_and_wait(TERMINAL_CHILD_REAP_TIMEOUT) {
                     return Err(format!(
-                        "无法确认终端进程 pid={} 已退出，请重试",
+                        "Couldn't confirm terminal process pid={} exited; try again",
                         s.child.pid()
                     ));
                 }
@@ -123,7 +123,12 @@ fn stop_terminal_session(
     Ok(())
 }
 
-pub(super) fn handle_action<C: ClientSocket>(conn: C, v: &serde_json::Value, sessions: &Sessions) {
+pub(super) fn handle_action<C: ClientSocket>(
+    conn: C,
+    v: &serde_json::Value,
+    sessions: &Sessions,
+    event_hub: &EventHubHandle,
+) {
     let id = v["id"].as_str().unwrap_or_default();
     let mut c = conn;
     let payload = match action_payload(v["kind"].as_str(), v["text"].as_str()) {
@@ -141,13 +146,17 @@ pub(super) fn handle_action<C: ClientSocket>(conn: C, v: &serde_json::Value, ses
             // Phase 检查和 PTY 写入必须属于同一个实例租约。
             let phase = sess.state.lock().unwrap().phase;
             if !matches!(phase, Phase::AwaitingApproval | Phase::WaitingForUser) {
-                return Err("agent 现在不是在等你，稍后再试".to_string());
+                return Err(
+                    "The agent isn't waiting for you right now; try again later".to_string()
+                );
             }
             write_session_input(sess, &payload).map_err(|error| error.to_string())
         })
-        .unwrap_or_else(|| Err("会话不存在".to_string()));
+        .unwrap_or_else(|| Err("No such session".to_string()));
     match write_result {
         Ok(()) => {
+            // 手机上批准、回复就是看过了。
+            event_hub.mark_attention_read(id);
             let _ = smelt_runtime_client::protocol::write_json_line(
                 &mut c,
                 &serde_json::json!({ "ok": true }),
@@ -162,7 +171,12 @@ pub(super) fn handle_action<C: ClientSocket>(conn: C, v: &serde_json::Value, ses
     }
 }
 
-pub(super) fn handle_raw_input<C: ClientSocket>(conn: C, v: &serde_json::Value, sessions: &Sessions) {
+pub(super) fn handle_raw_input<C: ClientSocket>(
+    conn: C,
+    v: &serde_json::Value,
+    sessions: &Sessions,
+    event_hub: &EventHubHandle,
+) {
     // 原始输入：工作延续，无 phase 门闩。权限在连接身份（未配对的设备进不来），这里
     // 只做「会话在不在 + 载荷非空 + 写进 master」。
     let id = v["id"].as_str().unwrap_or_default();
@@ -170,7 +184,7 @@ pub(super) fn handle_raw_input<C: ClientSocket>(conn: C, v: &serde_json::Value, 
     let Some(payload) = input_payload(v) else {
         let _ = smelt_runtime_client::protocol::write_json_line(
             &mut c,
-            &serde_json::json!({ "ok": false, "err": "需要非空 data" }),
+            &serde_json::json!({ "ok": false, "err": "data can't be empty" }),
         );
         return;
     };
@@ -178,9 +192,11 @@ pub(super) fn handle_raw_input<C: ClientSocket>(conn: C, v: &serde_json::Value, 
         .with_live(id, |sess| {
             write_session_input(sess, &payload).map_err(|error| error.to_string())
         })
-        .unwrap_or_else(|| Err("会话不存在".to_string()));
+        .unwrap_or_else(|| Err("No such session".to_string()));
     match write_result {
         Ok(()) => {
+            // 手机上批准、回复就是看过了。
+            event_hub.mark_attention_read(id);
             let _ = smelt_runtime_client::protocol::write_json_line(
                 &mut c,
                 &serde_json::json!({ "ok": true }),
@@ -207,7 +223,7 @@ pub(super) fn handle_resize<C: ClientSocket>(conn: C, v: &serde_json::Value, ses
     if cols == 0 || rows == 0 {
         let _ = smelt_runtime_client::protocol::write_json_line(
             &mut c,
-            &serde_json::json!({ "ok": false, "err": "cols/rows 必须 > 0" }),
+            &serde_json::json!({ "ok": false, "err": "cols/rows must be > 0" }),
         );
         return;
     }
@@ -218,7 +234,7 @@ pub(super) fn handle_resize<C: ClientSocket>(conn: C, v: &serde_json::Value, ses
     if resized.is_none() {
         let _ = smelt_runtime_client::protocol::write_json_line(
             &mut c,
-            &serde_json::json!({ "ok": false, "err": "会话不存在" }),
+            &serde_json::json!({ "ok": false, "err": "No such session" }),
         );
         return;
     }
@@ -369,12 +385,16 @@ pub(crate) fn open_terminal_runtime<R>(
     }
     let lifecycle = slot.lifecycle.lock().unwrap();
     if !sessions.is_current(&id, &slot) {
-        return Err("终端会话正在收尾，请重试".to_string().into());
+        return Err("The terminal session is shutting down; try again"
+            .to_string()
+            .into());
     }
 
     let existing = sessions.live_in_slot(&slot);
     if !created && existing.is_none() {
-        return Err("终端会话正在收尾，请重试".to_string().into());
+        return Err("The terminal session is shutting down; try again"
+            .to_string()
+            .into());
     }
     let mut pty_pump = None;
 
@@ -383,7 +403,7 @@ pub(crate) fn open_terminal_runtime<R>(
         Some(s) => s,
         None if !create_if_missing => {
             let _ = sessions.remove_if_same(&id, &slot);
-            return Err("终端会话不存在".to_string().into());
+            return Err("No such terminal session".to_string().into());
         }
         None => {
             let instance = next_session_instance();
@@ -408,7 +428,6 @@ pub(crate) fn open_terminal_runtime<R>(
                 cols,
                 cwd.as_deref(),
                 terminal_launch,
-                event_hub,
             );
             let (sess, pty_reader) = match result {
                 Ok(result) => result,
@@ -418,7 +437,7 @@ pub(crate) fn open_terminal_runtime<R>(
                         "session",
                         &format!("会话 {id} 启动失败：{error:#}"),
                     );
-                    return Err(format!("终端启动失败：{error:#}").into());
+                    return Err(format!("Couldn't start the terminal: {error:#}").into());
                 }
             };
             smelt_core::app_log::info(
@@ -451,7 +470,9 @@ pub(crate) fn open_terminal_runtime<R>(
                         sess.child.pid()
                     ));
                 }
-                return Err("终端会话创建已取消".to_string().into());
+                return Err("Creating the terminal session was cancelled"
+                    .to_string()
+                    .into());
             }
             let opened_state = {
                 let mut state = sess.state.lock().unwrap();
@@ -567,9 +588,6 @@ pub(crate) fn handle_open<C: ClientSocket>(
             return;
         }
     };
-    // 终端控制连接活着：headless 自升级让路，交给 GUI 空闲门控。
-    let _viewer = super::auth::ViewerLease::acquire();
-
     // reattach jolt：只挂旗，不定时补枪。
     // 客户端首帧 type-1 resize（含真实 cell 像素）进 `resize_session` 即消费 jolt；
     // 同尺寸无 resize 即无 SIGWINCH（tmux 同款：尺寸没变就不重画，快照本身准确）。
@@ -604,6 +622,8 @@ pub(crate) fn handle_open<C: ClientSocket>(
                 {
                     break;
                 }
+                // 在终端里打字就是看过了。
+                event_hub.mark_attention_read(&id);
             }
             1 if len == 8 || len == 16 => {
                 let cols = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as u16;
@@ -769,9 +789,6 @@ pub(crate) fn handle_watch<C: ClientSocket>(
         id: id.clone(),
         slot: Arc::clone(&slot),
     });
-    // 旁观连接活着：headless 自升级让路。
-    let _viewer = super::auth::ViewerLease::acquire();
-
     // 几何变化的那一次 SIGWINCH 已在 `begin_remote_viewport` 内打过（仅变才打，
     // 同尺寸续租一次不抖）。watcher 挂载后不再补抖：快照即准确画面，重绘画
     // 面随实时流自然到达。

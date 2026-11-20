@@ -3,15 +3,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// smelt-agent 启动名的 `~/` 写法。MCP 预设写进 Pi `mcp.json` 的 `command` 就是它，配上
-/// [`BUN_BE_BUN`] 把 smelt-agent 当 Bun 用（`smelt-agent x --bun 包@版本`）：Bun 编在
-/// smelt-agent 里，不用另装一份。Unix 上它是指向当前版本的链接，Pi CLI 自己也执行得了；
+/// smelt-agent 启动名的 `~/` 写法。MCP 预设写进 Pi `mcp.json` 的 `command` 就是它：编进来的
+/// 服务器走 [`SMELT_AGENT_MCP_SERVER`] 子命令；其余的配上 [`BUN_BE_BUN`] 把 smelt-agent 当
+/// Bun 用（`smelt-agent x --bun 包@版本`），Bun 编在 smelt-agent 里，不用另装一份。Unix 上
+/// 它是指向当前版本的链接，Pi CLI 自己也执行得了；
 /// Windows 上是指针文件，smelt-agent 起 MCP 时认出这条路径、换成它自己
 /// （`agent/src/pi-mcp-runtime.ts`）。Pi 会展开开头的 `~/`。
 pub const SMELT_AGENT_LAUNCHER_HOME_PATH: &str = "~/.smelt/bin/smelt-agent";
 
 /// Bun 编译出的程序带上这个环境变量就当 Bun 命令行用。
 pub const BUN_BE_BUN: (&str, &str) = ("BUN_BE_BUN", "1");
+
+/// smelt-agent 起编进来的 MCP 服务器的子命令：`smelt-agent mcp-server <预设 id> <参数…>`
+/// （`agent/src/compiled-command.ts`）。不能带 [`BUN_BE_BUN`]，带上就成了 Bun 命令行。
+pub const SMELT_AGENT_MCP_SERVER: &str = "mcp-server";
 
 /// 智能体自己的 space 根目录：`~/.smelt/agents/<id>`。
 ///
@@ -45,7 +50,9 @@ pub fn user_memory_dir() -> Option<PathBuf> {
     smelt_paths::smelt_home().map(|home| home.join("memory"))
 }
 
-fn agent_spaces_root() -> Option<PathBuf> {
+/// 所有智能体 space 的根：`~/.smelt/agents`。运行时把它随智能体配置推给客户端
+/// （`AgentHostSettings::agent_spaces_root`），客户端据此认出别的机器上的 space。
+pub fn agent_spaces_root() -> Option<PathBuf> {
     smelt_paths::smelt_home().map(|home| home.join("agents"))
 }
 
@@ -58,10 +65,9 @@ pub fn is_agent_space(path: &Path) -> bool {
         .is_some_and(|path| is_agent_space_in(&home, path))
 }
 
-/// 同 [`is_agent_space`]，`smelt_home` 是路径所在那台机器的 `SMELT_HOME`。客户端判断别的
-/// 机器上的路径时用它：拿自己的主目录去比，远程机器上的 space 永远对不上。
-/// 两条都是运行时路径，按 `/` 和 `\` 切开比较，不经过 `std::path`。
-pub fn is_agent_space_in(smelt_home: &str, path: &str) -> bool {
+/// 同 [`is_agent_space`]，按给定的 `SMELT_HOME` 算。两条都是运行时路径，按 `/` 和 `\`
+/// 切开比较，不经过 `std::path`。
+pub(crate) fn is_agent_space_in(smelt_home: &str, path: &str) -> bool {
     under(&format!("{}/agents", trim_slash(smelt_home)), path)
 }
 
@@ -96,18 +102,19 @@ pub fn is_workbench_conversation_workspace(path: &Path) -> bool {
         .is_some_and(|path| is_workbench_conversation_workspace_in(&home, path))
 }
 
-/// 同 [`is_workbench_conversation_workspace`]，按路径所在那台机器的 `SMELT_HOME` 算。
-pub fn is_workbench_conversation_workspace_in(smelt_home: &str, path: &str) -> bool {
+/// 同 [`is_workbench_conversation_workspace`]，按给定的 `SMELT_HOME` 算。
+pub(crate) fn is_workbench_conversation_workspace_in(smelt_home: &str, path: &str) -> bool {
     under(
         &format!("{}/workspaces/conversations", trim_slash(smelt_home)),
         path,
     )
 }
 
-/// 同 [`agent_definition_id_for_space`]，`smelt_home` 是路径所在那台机器的 `SMELT_HOME`。
-/// 远程机器上的 cwd 要拿那台机器的主目录去比；两条都是运行时路径，不经过 `std::path`。
-pub fn agent_definition_id_for_space_in(smelt_home: &str, path: &str) -> Option<String> {
-    let root = format!("{}/agents/", slash_form(smelt_home));
+/// 同 [`agent_definition_id_for_space`]，`spaces_root` 是路径所在那台机器上 space 的根
+/// （[`agent_spaces_root`]，那台机器的运行时报的）。远程机器上的 cwd 要拿那台机器的根去比；
+/// 两条都是运行时路径，按 `/` 和 `\` 切开比较，不经过 `std::path`。
+pub fn agent_definition_id_in_spaces(spaces_root: &str, path: &str) -> Option<String> {
+    let root = format!("{}/", slash_form(spaces_root));
     let id = slash_form(path).strip_prefix(&root)?.to_string();
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
@@ -153,7 +160,7 @@ pub fn subagent_session_file_in(dir: &Path, subagent_id: &str) -> Option<PathBuf
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_definition_id_for_space_in, is_agent_space_in, is_workbench_conversation_workspace_in,
+        agent_definition_id_in_spaces, is_agent_space_in, is_workbench_conversation_workspace_in,
     };
 
     #[test]
@@ -182,22 +189,35 @@ mod tests {
     }
 
     #[test]
-    fn space_agent_id_on_another_machine_uses_that_machines_home() {
-        let home = "/home/u/.smelt";
+    fn space_agent_id_on_another_machine_uses_that_machines_spaces_root() {
+        let root = "/home/u/.smelt/agents";
         assert_eq!(
-            agent_definition_id_for_space_in(home, "/home/u/.smelt/agents/writer/").as_deref(),
+            agent_definition_id_in_spaces(root, "/home/u/.smelt/agents/writer/").as_deref(),
             Some("writer")
         );
         // 子目录是智能体的工作产物，不是另一个智能体。
         assert_eq!(
-            agent_definition_id_for_space_in(home, "/home/u/.smelt/agents/writer/notes"),
+            agent_definition_id_in_spaces(root, "/home/u/.smelt/agents/writer/notes"),
             None
         );
-        assert_eq!(agent_definition_id_for_space_in(home, "/home/u/.smelt/agents"), None);
-        assert_eq!(agent_definition_id_for_space_in(home, "/home/u/code/app"), None);
         assert_eq!(
-            agent_definition_id_for_space_in(r"C:\Users\me\.smelt", r"C:\Users\me\.smelt\agents\a")
-                .as_deref(),
+            agent_definition_id_in_spaces(root, "/home/u/.smelt/agents"),
+            None
+        );
+        assert_eq!(
+            agent_definition_id_in_spaces(root, "/home/u/.smelt/agents-x/a"),
+            None
+        );
+        assert_eq!(
+            agent_definition_id_in_spaces(root, "/home/u/code/app"),
+            None
+        );
+        assert_eq!(
+            agent_definition_id_in_spaces(
+                r"C:\Users\me\.smelt\agents\",
+                r"C:\Users\me\.smelt\agents\a"
+            )
+            .as_deref(),
             Some("a")
         );
     }
