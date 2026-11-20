@@ -1,7 +1,8 @@
 use crate::session_list::{
-    SashSpec, SectionFlexPolicy, SectionKind, SectionLayoutSpec, compute_conversation_freed_height,
-    compute_effective_machine_base_h, compute_section_flex_policy, compute_sidebar_sashes,
-    select_flex_master_indices, sidebar_bottom_sections_start_index,
+    SashSpec, SectionFlexPolicy, SectionKind, SectionLayoutSpec, clamp_split_drag_pair,
+    compute_conversation_freed_height, compute_effective_machine_base_h,
+    compute_section_flex_policy, compute_sidebar_sashes, fit_bottom_section_heights,
+    section_min_body_h, select_flex_master_indices, sidebar_bottom_sections_start_index,
 };
 use crate::RuntimeKey;
 
@@ -504,6 +505,7 @@ fn section_flex_policy_conversations_is_locked_to_prevent_header_jump() {
         0.0,
         1.0,
         60.0,
+        60.0,
     );
     assert_eq!(policy, SectionFlexPolicy::LockedHeight { h: 60.0 });
 }
@@ -521,6 +523,7 @@ fn section_flex_policy_local_custom_height_yields_space_for_bottom_dock() {
         0.0,
         1.0,
         500.0,
+        640.0,
     );
     assert_eq!(
         policy,
@@ -530,7 +533,7 @@ fn section_flex_policy_local_custom_height_yields_space_for_bottom_dock() {
 
 #[test]
 fn section_flex_policy_local_master_fills_and_shrinks() {
-    // 本机未定高时作为 master，撑满剩余空间并将下方贴底，展开底部板块时也能响应式缩减
+    // 本机未定高时作为 master，在内容高度上限内撑满剩余空间并将下方贴底，展开底部板块时也能响应式缩减
     let policy = compute_section_flex_policy(
         1,
         2,
@@ -540,8 +543,15 @@ fn section_flex_policy_local_master_fills_and_shrinks() {
         1.0,
         1.0,
         400.0,
+        640.0,
     );
-    assert_eq!(policy, SectionFlexPolicy::Master { grow_weight: 1.0 });
+    assert_eq!(
+        policy,
+        SectionFlexPolicy::Master {
+            grow_weight: 1.0,
+            max_h: 640.0,
+        }
+    );
 }
 
 #[test]
@@ -556,6 +566,7 @@ fn section_flex_policy_bottom_dock_sections_are_locked_to_grow_upwards() {
         0.0,
         1.0,
         150.0,
+        150.0,
     );
     assert_eq!(remote_policy, SectionFlexPolicy::LockedHeight { h: 150.0 });
 
@@ -568,6 +579,7 @@ fn section_flex_policy_bottom_dock_sections_are_locked_to_grow_upwards() {
         false,
         0.0,
         1.0,
+        120.0,
         120.0,
     );
     assert_eq!(archive_policy, SectionFlexPolicy::LockedHeight { h: 120.0 });
@@ -583,6 +595,7 @@ fn section_flex_policy_compact_empty_is_compact() {
         false,
         0.0,
         1.0,
+        28.0,
         28.0,
     );
     assert_eq!(policy, SectionFlexPolicy::CompactEmpty);
@@ -616,4 +629,57 @@ fn local_machine_with_few_items_does_not_overstretch_when_conversation_collapsed
     // 本机内容已完全展示，不再多占空间撑大空白，避免内部出现无意义空高
     let h = compute_effective_machine_base_h(80.0, 80.0, 150.0);
     assert_eq!(h, 80.0);
+}
+
+#[test]
+fn section_min_body_height_keeps_three_items_when_available() {
+    assert_eq!(section_min_body_h("archive", 200.0), 151.0);
+    assert_eq!(section_min_body_h("archive", 106.0), 106.0);
+    assert_eq!(section_min_body_h("archive", 61.0), 61.0);
+    assert_eq!(section_min_body_h("conversations", 148.0), 115.0);
+    assert_eq!(section_min_body_h("conversations", 49.0), 49.0);
+    assert_eq!(section_min_body_h("runtime-Local", 200.0), 115.0);
+    assert_eq!(section_min_body_h("runtime-Local", 28.0), 32.0);
+}
+
+#[test]
+fn split_drag_pair_allows_expanding_conversations_over_natural_height_and_caps_bottom_sections() {
+    // 对话（natural_h=148）与本机（elastic master）之间拖拉时：
+    // 1. 向下拖可突破对话 natural_h 限制以拉高对话、让本机往下变矮（本机保底 min_b）
+    let (a, b) = clamp_split_drag_pair(148.0, 400.0, 120.0, 115.0, 148.0, 115.0, 643.0, true)
+        .unwrap();
+    assert_eq!(a, 268.0);
+    assert_eq!(b, 280.0);
+
+    // 2. 向下拖到极限时，本机仍保留 min_b（115）
+    let (a, b) = clamp_split_drag_pair(148.0, 400.0, 500.0, 115.0, 148.0, 115.0, 643.0, true)
+        .unwrap();
+    assert_eq!(a, 433.0);
+    assert_eq!(b, 115.0);
+
+    // 3. 向上拖时对话最低保留 min_a，增加本机高度
+    let (a, b) = clamp_split_drag_pair(148.0, 400.0, -80.0, 115.0, 148.0, 115.0, 643.0, true)
+        .unwrap();
+    assert_eq!(a, 115.0);
+    assert_eq!(b, 433.0);
+
+    // 非弹性底部板块之间互相拖拽时，双方都不超出各自 natural_h 且不低于最小高度
+    let (a, b) = clamp_split_drag_pair(150.0, 160.0, 80.0, 115.0, 180.0, 151.0, 200.0, false)
+        .unwrap();
+    assert_eq!(a, 159.0);
+    assert_eq!(b, 151.0);
+}
+
+#[test]
+fn fit_bottom_section_heights_scales_only_when_exceeding_available_height() {
+    // 总高度未超出可用空间时，原样保留
+    let mut fits = vec![(220.0, 115.0), (160.0, 151.0)];
+    fit_bottom_section_heights(&mut fits, 400.0);
+    assert_eq!(fits, vec![(220.0, 115.0), (160.0, 151.0)]);
+
+    // 多台云主机 + 归档超出可用空间时，按超出最小高度的比例缩减并保底 min_h
+    let mut overflow = vec![(315.0, 115.0), (315.0, 115.0), (251.0, 151.0)];
+    // total=881, min=381, excess=500; available=631 -> target_excess=250 -> scale=0.5
+    fit_bottom_section_heights(&mut overflow, 631.0);
+    assert_eq!(overflow, vec![(215.0, 115.0), (215.0, 115.0), (201.0, 151.0)]);
 }
