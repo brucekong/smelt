@@ -15,7 +15,7 @@ use super::{Buddy, Portrait, fnv};
 use crate::cast::ConversationKey;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Act {
+pub(crate) enum Act {
     /// 站着，不动。
     Rest,
     /// 干活，一直演到状态变。
@@ -87,6 +87,18 @@ impl Playing {
             Act::Cheer if moving && t < moves::CHEER => (moves::cheer(role, temper, seed, t), true),
             Act::Greet if moving && t < moves::GREET => (moves::greet(role, seed, t), true),
             Act::Rest | Act::Cheer | Act::Greet => (Look::rest(role, seed), false),
+        }
+    }
+
+    /// 此刻在演哪一出，以及这出戏本身是否仍在动。
+    fn act(&self, now: Instant, moving: bool) -> (Act, bool) {
+        let t = elapsed(self.since, now);
+        match self.act {
+            Act::Work => (Act::Work, moving),
+            Act::Call => (Act::Call, moving),
+            Act::Cheer if t < moves::CHEER => (Act::Cheer, moving),
+            Act::Greet if t < moves::GREET => (Act::Greet, moving),
+            Act::Rest | Act::Cheer | Act::Greet => (Act::Rest, false),
         }
     }
 }
@@ -200,6 +212,14 @@ impl Stage {
         let (look, animating) = self.look(key, buddy, now, moving);
         let (figure, swinging) = portrait.show(buddy, look, now, moving, window);
         (figure, animating || swinging)
+    }
+
+    /// `key` 那段会话此刻在演哪一出，以及是否仍在演（给 NOMI 等备选头像读状态）。
+    pub(crate) fn act_of(&self, key: &ConversationKey, now: Instant, moving: bool) -> (Act, bool) {
+        match self.actors.get(key) {
+            Some(actor) => actor.playing.act(now, moving),
+            None => (Act::Rest, false),
+        }
     }
 
     /// `key` 那段会话此刻的样子，和还要不要下一帧。`moving` 为假（看不见、减弱动态效果）

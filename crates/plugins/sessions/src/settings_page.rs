@@ -11,10 +11,11 @@ use gpui::{
 use rust_i18n::t;
 use smelt_plugin_api::ui::{Select, SettingsPage, SettingsRow, SettingsSection};
 use smelt_plugin_api::{
-    self as api, HostEvent, PluginView, SettingsEntry, SettingsGroup, ViewHandle, ViewSpec, text,
+    self as api, HostEvent, PluginView, SettingsEntry, SettingsGroup, ViewHandle, ViewInstance,
+    ViewSpec, text,
 };
 
-use crate::contract::SESSION_AVATAR;
+use crate::contract::{SESSION_AVATAR, SESSION_AVATAR_SETTINGS, SessionAvatarSettingsArgs};
 use crate::model::{AvatarChoice, Sessions};
 
 pub(crate) fn spec() -> ViewSpec {
@@ -37,20 +38,53 @@ pub(crate) fn spec() -> ViewSpec {
     }
 }
 
-struct SessionsSettings;
+struct SessionsSettings {
+    extra_for: Option<String>,
+    extra_views: Vec<ViewInstance>,
+}
 
 impl SessionsSettings {
     fn new(cx: &mut Context<Self>) -> Self {
         // 选择改了在 `Sessions` 上通知；填插槽的插件来了、走了发 `ViewsChanged`。
-        cx.observe(&Sessions::global(cx), |_, _, cx| cx.notify())
-            .detach();
-        cx.subscribe(&api::events(cx), |_, _, event: &HostEvent, cx| {
+        cx.observe(&Sessions::global(cx), |this, _, cx| {
+            this.extra_for = None;
+            this.extra_views.clear();
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&api::events(cx), |this, _, event: &HostEvent, cx| {
             if matches!(event, HostEvent::ViewsChanged) {
+                this.extra_for = None;
+                this.extra_views.clear();
                 cx.notify();
             }
         })
         .detach();
-        Self
+        Self {
+            extra_for: None,
+            extra_views: Vec::new(),
+        }
+    }
+
+    fn sync_extra_views(&mut self, active_avatar: Option<&str>, window: &mut Window, cx: &mut App) {
+        let target = active_avatar.map(str::to_string);
+        if self.extra_for == target {
+            return;
+        }
+        self.extra_for = target.clone();
+        self.extra_views.clear();
+        let Some(avatar_view) = target else {
+            return;
+        };
+        let args = SessionAvatarSettingsArgs { avatar_view };
+        let Ok(value) = api::serde_json::to_value(&args) else {
+            return;
+        };
+        for spec in api::slot_views(SESSION_AVATAR_SETTINGS, cx) {
+            if let Ok(instance) = api::create_view(&spec.id, &value, window, cx) {
+                self.extra_views.push(instance);
+            }
+        }
     }
 }
 
@@ -59,12 +93,18 @@ impl PluginView for SessionsSettings {
 }
 
 impl Render for SessionsSettings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let filled = api::slot_views(SESSION_AVATAR, cx);
         let ids: Vec<SharedString> = filled.iter().map(|view| view.id.clone()).collect();
         // 下拉里显示的是眼下实际用的那个：没选过、选的卸了时是第一个。
-        let current = match Sessions::global(cx).read(cx).avatar.pick(&ids) {
-            Some(id) => AvatarChoice::View(id.to_string()),
+        let picked_id = Sessions::global(cx)
+            .read(cx)
+            .avatar
+            .pick(&ids)
+            .map(|id| id.to_string());
+        self.sync_extra_views(picked_id.as_deref(), window, cx);
+        let current = match picked_id {
+            Some(id) => AvatarChoice::View(id),
             None => AvatarChoice::Icon,
         };
         let options = filled
@@ -78,7 +118,7 @@ impl Render for SessionsSettings {
                 let choice = choice.clone();
                 Sessions::global(cx).update(cx, |sessions, cx| sessions.set_avatar(choice, cx));
             });
-        SettingsPage::new("sessions-settings").child(
+        let mut page = SettingsPage::new("sessions-settings").child(
             SettingsSection::new()
                 .title(t!("settings.section_list"))
                 .child(
@@ -86,6 +126,10 @@ impl Render for SessionsSettings {
                         .description(t!("settings.avatar_description"))
                         .child(select),
                 ),
-        )
+        );
+        for extra in &self.extra_views {
+            page = page.child(extra.view());
+        }
+        page
     }
 }

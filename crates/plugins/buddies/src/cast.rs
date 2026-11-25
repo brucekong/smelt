@@ -13,9 +13,10 @@ use smelt_plugin_api::{self as api, HostEvent, RuntimeKey};
 
 use crate::buddy::{Buddy, Stage};
 use crate::frames::Clock;
+use crate::nomi::genome::{NomiGenome, NomiPrefs, NomiRoster};
 
 /// 哪台机器上的哪段会话（工作区目录里的 id）。
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ConversationKey {
     pub(crate) machine: RuntimeKey,
     pub(crate) id: String,
@@ -27,6 +28,8 @@ pub(crate) struct Cast {
     /// 露着的那段会话。
     viewed: Option<ConversationKey>,
     stage: Stage,
+    /// 全局 NOMI 花名册（保证所有会话表情唯一与松散组合）。
+    nomi: NomiRoster<ConversationKey>,
     /// 所有小人共用的出帧格。
     clock: Clock,
     /// 收到过目录的机器。之后它的目录里新冒出来的会话是刚建的。
@@ -54,6 +57,29 @@ impl Cast {
 
     pub(crate) fn clock(&self) -> Clock {
         self.clock
+    }
+
+    /// 读取会话 `key` 当前分配到的唯一 NOMI 外观。
+    pub(crate) fn nomi_of(&self, key: &ConversationKey) -> NomiGenome {
+        self.nomi.get(key, &key.id)
+    }
+
+    /// 读取全局 NOMI 外观与交互偏好。
+    pub(crate) fn nomi_prefs(&self) -> NomiPrefs {
+        self.nomi.prefs()
+    }
+
+    /// 更新全局 NOMI 外观与交互偏好，并立即刷新所有左侧会话 NOMI 头像。
+    pub(crate) fn set_nomi_prefs(&mut self, prefs: NomiPrefs, cx: &mut Context<Self>) {
+        if self.nomi.set_prefs(prefs) {
+            cx.notify();
+        }
+    }
+
+    /// 双击切换当前会话 NOMI：重抽不撞款的松散组合并通知列表刷新。
+    pub(crate) fn reroll_nomi(&mut self, key: &ConversationKey, cx: &mut Context<Self>) {
+        self.nomi.reroll(key, &key.id);
+        cx.notify();
     }
 
     /// 按宿主眼下的目录、会话状态和露着的会话重算。没变就不通知，头像不重画。
@@ -109,6 +135,7 @@ impl Cast {
         }
         self.seats = seats;
         self.viewed = viewed;
+        self.nomi.sync(self.seats.keys().cloned(), |k| &k.id);
         self.prepare();
         cx.notify();
     }
@@ -141,6 +168,7 @@ pub(crate) fn install(cx: &mut App) {
             seats: HashMap::new(),
             viewed: None,
             stage: Stage::new(std::iter::empty(), None, now),
+            nomi: NomiRoster::load_default(),
             clock: Clock::new(now),
             known: HashSet::new(),
             _subscriptions: vec![subscription],

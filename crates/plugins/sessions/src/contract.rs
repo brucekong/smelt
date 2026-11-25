@@ -84,6 +84,18 @@ pub(crate) struct SessionAvatarArgs {
     pub conversation: String,
 }
 
+/// 头像扩展设置插槽：在「设置 → 会话列表 → 行首头像」下方渲染，供头像提供方挂自己的全局选项。
+///
+/// 填它的是按实例建的视图；每次用户选中的行首头像视图变化时，宿主按 [`SessionAvatarSettingsArgs`]
+/// 传入当前选中的头像视图 id（如 `"smelt.buddies/nomi"`），非自己所属方案时可画空容器。
+pub(crate) const SESSION_AVATAR_SETTINGS: &str = "smelt.sessions/session-avatar-settings";
+
+/// [`SESSION_AVATAR_SETTINGS`] 的参数。线上是 `{"avatar_view": "<view-id>"}`。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionAvatarSettingsArgs {
+    pub avatar_view: String,
+}
+
 // ---- 右键菜单 ----
 
 /// 会话列表里项目行的右键菜单（见 `smelt_plugin_api::register_context_menu_items`）。点了
@@ -333,6 +345,19 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SessionAvatarArgs>(value).unwrap(),
             args
+        );
+
+        let settings_args = SessionAvatarSettingsArgs {
+            avatar_view: "smelt.buddies/nomi".into(),
+        };
+        let settings_value = serde_json::to_value(&settings_args).unwrap();
+        assert_eq!(
+            settings_value,
+            serde_json::json!({ "avatar_view": "smelt.buddies/nomi" })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionAvatarSettingsArgs>(settings_value).unwrap(),
+            settings_args
         );
     }
 

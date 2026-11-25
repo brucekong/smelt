@@ -18,6 +18,16 @@ pub(crate) mod sessions {
         /// 工作区目录里那段会话的 id。
         pub conversation: String,
     }
+
+    // 约定：smelt.sessions 的 SESSION_AVATAR_SETTINGS。
+    /// 选中行首头像方案后，在「设置 → 会话列表」下方渲染的专属扩展设置插槽。
+    pub(crate) const SESSION_AVATAR_SETTINGS: &str = "smelt.sessions/session-avatar-settings";
+
+    /// [`SESSION_AVATAR_SETTINGS`] 的参数。
+    #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+    pub(crate) struct SessionAvatarSettingsArgs {
+        pub avatar_view: String,
+    }
 }
 
 #[cfg(test)]
@@ -32,5 +42,10 @@ mod tests {
                 .unwrap();
         assert_eq!(avatar.machine, RuntimeKey::Local);
         assert_eq!(avatar.conversation, "c");
+
+        let settings: sessions::SessionAvatarSettingsArgs =
+            serde_json::from_value(serde_json::json!({ "avatar_view": "smelt.buddies/nomi" }))
+                .unwrap();
+        assert_eq!(settings.avatar_view, "smelt.buddies/nomi");
     }
 }

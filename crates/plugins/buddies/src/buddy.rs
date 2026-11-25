@@ -26,7 +26,7 @@ use gpui::{
     Window, img, px,
 };
 
-pub(crate) use stage::Stage;
+pub(crate) use stage::{Act, Stage};
 
 use moves::{Dice, Look, Role, Temper};
 use paint::{Canvas, MARGIN, Paint, TURN, TURNS, Tint, centroid};

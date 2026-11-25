@@ -2,3 +2,91 @@ _version: 2
 avatar:
   en: Buddy Avatar
   zh-CN: 小人头像
+nomi:
+  en: NOMI Companion
+  zh-CN: NOMI 伴侣
+nomi_settings:
+  section:
+    en: NOMI Appearance & Gaze
+    zh-CN: NOMI 外观与交互
+  look_mode:
+    en: Cursor Tracking
+    zh-CN: 鼠标跟随方式
+  look_mode_desc:
+    en: Choose whether the entire 3D head turns toward the pointer or only the 2D expression shifts. Applies to all sidebar NOMI avatars.
+    zh-CN: 选择整个头部 3D 注视鼠标，或仅屏幕内 2D 表情跟随；生效于左侧所有会话的 NOMI 头像。
+  look_3d:
+    en: 3D Head Gaze
+    zh-CN: 3D 头部注视
+  look_2d:
+    en: 2D Face Follow
+    zh-CN: 2D 表情跟随
+  work_anim:
+    en: Running Animation
+    zh-CN: 进行中动效
+  work_anim_desc:
+    en: Choose the animation style while a conversation is running; works with both 3D Head Gaze and 2D Face Follow.
+    zh-CN: 选择对话进行中时的动态效果，可自由搭配 3D 头部注视或 2D 表情跟随使用。
+  work_anim_face_change:
+    en: Face Change
+    zh-CN: 川剧变脸
+  work_anim_disco_hop:
+    en: Bouncy Hop
+    zh-CN: 节拍蹦跳
+  bezel:
+    en: Outer Bezel Craft
+    zh-CN: 外圈金属边框工艺
+  bezel_desc:
+    en: Metallic bezel finish shared across all sidebar NOMI avatars.
+    zh-CN: 设置左侧所有 NOMI 头像外圈的金属材质工艺。
+  bezel_titanium:
+    en: Titanium Matte
+    zh-CN: 原厂钛灰金属
+  bezel_silver:
+    en: Mirror Silver
+    zh-CN: 高光镜面铝银
+  bezel_space_black:
+    en: Space Black
+    zh-CN: 深空曜黑金属
+  bezel_rose_gold:
+    en: Rose Gold
+    zh-CN: 晨曦玫瑰流金
+  bezel_cybertron_red:
+    en: Autobot Crimson
+    zh-CN: 汽车人炽红烤漆
+  bezel_cybertron_gold:
+    en: Matrix Gold
+    zh-CN: 赛博坦火种鎏金
+  bezel_decepticon_purple:
+    en: Decepticon Violet
+    zh-CN: 霸天虎枪铁暗紫
+  cyber_optics:
+    en: Cybertronian Optics
+    zh-CN: 赛博坦机械光学眼
+  cyber_optics_desc:
+    en: Control when NOMI switches to character-specific mechanical optic eyes (or stays pure monochrome).
+    zh-CN: 控制 NOMI 何时启用角色专属赛博机械眼眸，或保留原厂纯色极简线条眼。
+  cyber_optics_auto:
+    en: Auto
+    zh-CN: 智能联动
+  cyber_optics_on:
+    en: Always On
+    zh-CN: 全员开启
+  cyber_optics_off:
+    en: Factory Pure
+    zh-CN: 原厂纯色
+  glow:
+    en: AMOLED Eye Glow
+    zh-CN: AMOLED 眼神光晕
+  glow_desc:
+    en: Luminous tint of the AMOLED display eyes across all sidebar NOMI avatars.
+    zh-CN: 设置左侧所有 NOMI 头像屏幕内眼神的发光色彩。
+  glow_white:
+    en: Factory White
+    zh-CN: 原厂冷白
+  glow_amber:
+    en: Amber Gold
+    zh-CN: 暖阳琉金
+  glow_sakura:
+    en: Sakura Pink
+    zh-CN: 浪漫落樱粉

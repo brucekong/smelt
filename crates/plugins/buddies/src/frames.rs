@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use gpui::{App, Bounds, Pixels, WeakEntity, Window};
 
 /// 小人每秒几帧。
-const FPS: f64 = 30.;
+const FPS: f64 = 60.;
 
 /// 出帧的格：从 `epoch` 起每 1/[`FPS`] 秒一格。
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +36,11 @@ impl Clock {
     /// 第 `tick` 格开始的时刻：画这一格时按它取样。
     pub(crate) fn at(self, tick: u64) -> Instant {
         self.epoch + Duration::from_secs_f64(tick as f64 / FPS)
+    }
+
+    /// 距 `epoch` 过了多少秒。
+    pub(crate) fn elapsed(self, now: Instant) -> f32 {
+        now.saturating_duration_since(self.epoch).as_secs_f32()
     }
 }
 
@@ -95,9 +100,9 @@ mod tests {
         let epoch = Instant::now();
         let clock = Clock::new(epoch);
         assert_eq!(clock.tick(epoch), 0);
-        assert_eq!(clock.tick(epoch + Duration::from_millis(30)), 0);
-        assert_eq!(clock.tick(epoch + Duration::from_millis(34)), 1);
-        assert_eq!(clock.tick(epoch + Duration::from_secs(2)), 60);
+        assert_eq!(clock.tick(epoch + Duration::from_millis(15)), 0);
+        assert_eq!(clock.tick(epoch + Duration::from_millis(18)), 1);
+        assert_eq!(clock.tick(epoch + Duration::from_secs(2)), 120);
         // 早于起点的算第 0 格，不回绕。
         if let Some(before) = epoch.checked_sub(Duration::from_secs(1)) {
             assert_eq!(clock.tick(before), 0);
@@ -108,7 +113,7 @@ mod tests {
     fn a_tick_samples_at_its_start() {
         let epoch = Instant::now();
         let clock = Clock::new(epoch);
-        for tick in [0, 1, 29, 30, 12_345] {
+        for tick in [0, 1, 59, 60, 12_345] {
             let at = clock.at(tick);
             assert!(at >= epoch);
             assert_eq!(clock.tick(at + Duration::from_micros(10)), tick);

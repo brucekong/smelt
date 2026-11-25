@@ -17,6 +17,7 @@ mod avatar;
 mod buddy;
 mod cast;
 mod frames;
+mod nomi;
 mod peers;
 
 use smelt_plugin_api as api;
@@ -32,7 +33,11 @@ const ICON: &str = api::ui::IconName::Sparkles.asset_path();
 /// 宿主启动时调一次。
 pub fn register(cx: &mut gpui::App) {
     cast::install(cx);
-    if let Err(error) = api::register_views(OWNER, vec![avatar::spec()], cx) {
+    if let Err(error) = api::register_views(
+        OWNER,
+        vec![avatar::spec(), nomi::spec(), nomi::settings_spec()],
+        cx,
+    ) {
         eprintln!("[buddies] 视图登记失败：{error}");
     }
 }
